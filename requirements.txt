@@ -1,0 +1,2 @@
+# Project JARVIS v0.2.0 has no mandatory third-party runtime dependencies.
+# Python standard library is enough for the Core, SQLite, tools, tests and Ollama HTTP client.

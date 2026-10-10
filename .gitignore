@@ -1,0 +1,32 @@
+# Python caches / local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+.venv-alex-study/
+venv/
+
+# JARVIS runtime state: sessions, memory, exports, benchmarks, logs
+data/
+logs/
+dist/
+runtime/
+jarvis.local.json
+ollama-release.json
+
+# Local secrets / credentials
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+secrets.json
+secrets.toml
+id_rsa
+id_ed25519
+
+# Generated reviewer packet
+REVIEW_PACKET.md

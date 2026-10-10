@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "project-jarvis-local"
+version = "0.3.0"
+description = "Local-first personal AI local beta"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+jarvis-local = "jarvis.app:main"
+jarvis-web = "jarvis.web:main"
+jarvis-desktop = "jarvis.launcher:main"
+
+[tool.setuptools.packages.find]
+include = ["jarvis*"]
+
+[tool.setuptools.package-data]
+jarvis = ["static/*.html", "static/*.css", "static/*.js"]
