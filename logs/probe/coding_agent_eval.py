@@ -308,8 +308,16 @@ def main() -> int:
                 print(f"{task['id']}: skipped (acceptance baseline failed)", flush=True)
                 continue
             mutated = source
-            for find, replace in task.get("edits") or [[task["find"], task["replace"]]]:  # 어려운 과제는 버그 여러 곳
-                assert mutated.count(find) == 1, task["id"]
+            edits = task.get("edits") or [[task["find"], task["replace"]]]  # 어려운 과제는 버그 여러 곳
+            # 과제를 만든 뒤 코드가 바뀌어 버그를 심을 자리가 없으면 건너뛴다(2026-10-10: 전에는 assert 로 평가 전체가 멈췄다)
+            if any(mutated.count(find) != 1 for find, _ in edits):
+                row.update(bug_detected=False, note="변이 자리 없음: 과제를 만든 뒤 코드가 바뀜")
+                results.append(row)
+                if args.out:
+                    Path(args.out).write_text(json.dumps(results, ensure_ascii=False, indent=1), encoding="utf-8")
+                print(f"{task['id']}: skipped (mutation anchor missing)", flush=True)
+                continue
+            for find, replace in edits:
                 mutated = mutated.replace(find, replace, 1)
             target.write_text(mutated, encoding="utf-8")
             code, failed = unittest_failures(project, task["test"])
