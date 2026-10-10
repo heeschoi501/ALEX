@@ -1659,3 +1659,10 @@ RTX 5070 12GB 실측 IQ3_S 53 tok/s·프롬프트 1,620 tok/s. API 는 OpenAI �
 
 **검증(코드):** 가짜 Strata 서버로 16개 검사(SSE·생각 숨김·생각 상한·조각난 도구 호출·문맥 초과·503·끊김·/unload JSON·409·
 설정 loopback·strata 모드 조립·오픈코드 연결·런처). 전체 1164개 RELEASE PASS. 실모델 측정은 아래 보충에 적는다.
+
+**ADR-086 보충 (2026-10-10 11:05, claude) — 이 PC 실측과 전환:** 설치 0.1.41, IQ3_S 84GB(두 번째 파일은 setup 단일 연결이 2~7MB/s 라 huggingface_hub(hf_xet)로 40MB/s
+받아 넣고 SHA-256 을 Hugging Face 값과 대조 — 일치). 설정 `strata-iq3_s.json` 에 `--vram-reserve-mib 2048` 추가(설치 안내: 이 카드가 화면도 맡음, #779;
+원본 `.orig-20261010`). 첫 적재 약 30초, GPU 15.0~15.2GB. 짧은 답 59~76 tok/s(첫 글자 0.3~0.6초), 16,706토큰 입력 5.2초(3,192 tok/s),
+최고 294W·57도(전력 제한은 사용자 결정으로 기본 360W). ALEX 를 `local_backend: strata` 로 전환(`jarvis.local.json`, 백업 `.bak-20261010-strata`),
+웹 /api/state 에서 대화·코딩 모두 `strata:qwen3.8-flash-next`(num_ctx 65536) 확인, 실제 대화 4건 정상(자기소개 8.2초, 코드 3.7초).
+증거 `logs/claude-strata-20261010/`. v3 11과제 /dev-auto(회귀 검사 켬) 측정은 진행 중(`devauto-v3-strata.log`).

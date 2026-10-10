@@ -1,5 +1,20 @@
 # Changelog
 
+## 2026-10-10 12:34 KST — Strata 후속 보완·전체 회귀 검사 활성화 및 평가 의미 검토 (Codex)
+
+- Strata 시작에서 Ollama설치/모델준비를 분리하고, loaded의 불명확한 상태를 반환 성공으로 인정하지 않으며, 명시적 Strata 설정 선택을 우선 처리.
+- 전체 회귀검사를 실사용에 활성화. 모델·문맥·GPU예약/전력 유지. Strata 계약6개 및 개발 중단/미디어 종료/영상 라우팅 계약각2개 추가. Ollama 시작 검사가 실제 사용자 설정에 의존하던 부분은 명시적 Ollama Settings로 분리.
+- Claude 평가 인수: 유효6개 기존엄격통과, 그중3개 후보는 추가검사로 보호/동작 누락을 확인해 의미상 거절. 원본평가 유지 및 전체후보/재현로그 보존; 운영 developer/imagegen/router 유지.
+- 전체1176개(5SKIP) RELEASE PASS, 정상재시작 후 실행/디스크코드a0f1e305065ef27a 일치. 기존 Strata서버/모델적재 유지. 콜드시작·새GPU평가는 미실시.
+- docs/ALEX_STRATA_EVALUATION_20261010.md 및 docs/CODEX_STRATA_REVIEW_20261010.md, 증거/백업 logs/codex-strata-review-20261010/. 실제운영반영8파일, 두NEXT최상단 최종인계.
+
+## 2026-10-10 11:22 KST — Strata 후속 검토 및 적용 대기 수정안 (Codex)
+
+- Claude GPU 평가에 개입하지 않고 별도 사본에서 Strata 시작의 Ollama 의존과 불명확한 loaded 상태의 반환 오판을 수정. **운영 적용은 아직 하지 않음.**
+- 원본/수정 사본·SHA-256·diff·검사 로그 보존. 관련 검사 28개 통과, 전체 릴리스/실제 콜드 스타트는 미검증.
+- 기존 평가 사전 검사 재사용: 원래 과제6/11 유효, Claude 재개 과제5/5 유효. 첫 과제1개 엄격 성공809초를 전체 성능과 구별해 기록.
+- 상세 `docs/CODEX_STRATA_REVIEW_20261010.md`, 증거 `logs/codex-strata-review-20261010/`, 두 NEXT 맨 위에 평가 종료 후 적용 절차 인계.
+
 ## 2026-10-10 — Strata 로 Qwen3.8-Flash-Next(125B MoE) 연결 준비 (ADR-086, claude)
 
 - `StrataProvider`(OpenAI 호환 SSE, 생각 상한·도구 호출·중단·문맥 초과 처리) + 설정 `local_backend`(기본 ollama)·`strata_*`(이 PC 주소만).

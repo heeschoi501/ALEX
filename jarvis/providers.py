@@ -773,9 +773,9 @@ class StrataProvider(OllamaProvider):
 
     def loaded_models(self, timeout: float = 10) -> list[str]:
         health = self._health(timeout)
-        if health is None:
+        if health is None or health.get("error") or type(health.get("loaded")) is not bool:
             raise ProviderError(f"Strata 상태를 확인하지 못했습니다: {self.host}")
-        return [self.model] if health.get("loaded") else []
+        return [self.model] if health["loaded"] else []
 
     def unload(self, timeout: float = 15) -> list[str]:
         """그래픽카드를 지금 돌려준다(`POST /unload`). 다음 요청 때 Strata 가 다시 올린다(첫 답이 늦어진다)."""

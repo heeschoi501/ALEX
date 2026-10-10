@@ -97,13 +97,23 @@ def strata_dir() -> Path:
 def strata_command(folder: Path, port: int) -> list[str]:
     """Strata 서버를 띄우는 명령 — Strata 설치가 만든 run-<모델>.bat 과 같은 것(설정 파일 strata-<모델>.json, ADR-086)."""
     python = folder / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-    configs = sorted(folder.glob("strata-*.json"))
-    if not python.is_file() or not configs:
+    if not python.is_file():
         raise RuntimeError(f"Strata 가 설치되어 있지 않습니다({folder}). START-HERE.bat 으로 먼저 설치하세요.")
-    if len(configs) > 1:
-        raise RuntimeError("Strata 모델이 여러 개 설치되어 있습니다: " + ", ".join(c.name for c in configs)
-                           + " — JARVIS_STRATA_CONFIG 로 하나를 고르세요.")
-    config = Path(os.getenv("JARVIS_STRATA_CONFIG") or configs[0])
+    selected = os.getenv("JARVIS_STRATA_CONFIG", "").strip()
+    if selected:
+        config = Path(selected)
+        if not config.is_absolute():
+            config = folder / config
+        if not config.is_file():
+            raise RuntimeError(f"지정한 Strata 설정 파일이 없습니다: {config}")
+    else:
+        configs = sorted(folder.glob("strata-*.json"))
+        if not configs:
+            raise RuntimeError(f"Strata 가 설치되어 있지 않습니다({folder}). START-HERE.bat 으로 먼저 설치하세요.")
+        if len(configs) > 1:
+            raise RuntimeError("Strata 모델이 여러 개 설치되어 있습니다: " + ", ".join(c.name for c in configs)
+                               + " — JARVIS_STRATA_CONFIG 로 하나를 고르세요.")
+        config = configs[0]
     return [str(python), str(folder / "serve" / "server.py"), "--engine", "strata", "--config", str(config),
             "--port", str(port)]
 
@@ -170,62 +180,64 @@ def launch(allow_download: bool = False, report=print) -> str:
     flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     log_dir = ROOT / "logs"
     log_dir.mkdir(exist_ok=True)
-    # 프로필은 Ollama 를 띄우기 전에 정한다 — Ollama 환경이 프로필에 따라 다르다(ADR-054).
-    hardware = detect_hardware()
-    if settings.force_profile:
-        hardware.profile = PerformanceProfile(settings.force_profile)
-    # 모델도 Ollama 를 띄우기 전에 정한다 — FA 를 끌지는 기본 모델에 달렸다(ADR-064).
-    general, coder = effective_local_models(settings, hardware.profile)
-    report("로컬 모델 서버 확인 중…")
-    try:
-        tags = get_json(OLLAMA + "/api/tags")
-    except (OSError, ValueError):
-        executable = ROOT / "runtime" / "ollama" / "ollama.exe"
-        if not executable.exists():
-            if not allow_download:
-                raise NeedsDownload("첫 실행 준비가 필요합니다. Ollama 실행 파일과 공개 모델을 다운로드합니다.\n노트북은 약 6.5GB 다운로드, 설치 공간 약 10GB가 필요합니다. 데스크톱 모델은 더 큽니다.")
-            install(report=lambda text, **_: report(text))
-        environment = ollama_environment(hardware.profile, (general, coder))
-        with (log_dir / "ollama-server.log").open("a", encoding="utf-8") as log:
-            process = subprocess.Popen([str(executable), "serve"], cwd=ROOT, env=environment, stdout=log, stderr=log, creationflags=flags)
-        (ROOT / "runtime" / "ollama.pid").write_text(str(process.pid))
-        for _ in range(80):
-            try:
-                tags = get_json(OLLAMA + "/api/tags")
-                break
-            except (OSError, ValueError):
-                if process.poll() is not None:
-                    raise RuntimeError("Ollama가 시작되지 않았습니다. logs/ollama-server.log를 확인하세요.")
-                time.sleep(.25)
-        else:
-            raise RuntimeError("Ollama 시작 시간이 초과되었습니다. 잠시 후 다시 실행하세요.")
-        os.environ["JARVIS_OLLAMA_MODELS"] = environment["OLLAMA_MODELS"]
-    models = [general] if hardware.profile != PerformanceProfile.DESKTOP and settings.single_model_on_laptop else list(dict.fromkeys([general, coder]))
-    installed = {m.get("name") for m in tags.get("models", []) if isinstance(m, dict)}
-    missing = [m for m in models if m not in installed and (":" in m or m + ":latest" not in installed)]
-    if missing and not allow_download:
-        raise NeedsDownload("이 장비의 모델을 준비해야 합니다:\n" + "\n".join(missing) + "\n최초 다운로드 후에는 오프라인으로 사용할 수 있습니다.")
-    for model in missing:
-        report(f"모델 다운로드: {model}")
-        request = urllib.request.Request(OLLAMA + "/api/pull", data=json.dumps({"model": model, "stream": True}).encode(), headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(request, timeout=600) as response:
-            last = ""
-            succeeded = False
-            for raw in response:
-                item = json.loads(raw)
-                if item.get("error"):
-                    raise RuntimeError(item["error"])
-                text = item.get("status", "")
-                if item.get("total"):
-                    text += f" {100 * item.get('completed', 0) // item['total']}%"
-                if text != last:
-                    report(f"{model}\n{text}")
-                    last = text
-                succeeded = item.get("status") == "success"
-            if not succeeded:
-                raise RuntimeError("모델 다운로드가 완료되지 않았습니다. 다시 실행하면 이어받습니다.")
     if settings.local_backend == "strata":
+        report("로컬 모델 서버(Strata) 확인 중…")
         ensure_strata(settings.strata_host, report, log_dir, flags)
+    else:
+        # 프로필은 Ollama 를 띄우기 전에 정한다 — Ollama 환경이 프로필에 따라 다르다(ADR-054).
+        hardware = detect_hardware()
+        if settings.force_profile:
+            hardware.profile = PerformanceProfile(settings.force_profile)
+        # 모델도 Ollama 를 띄우기 전에 정한다 — FA 를 끌지는 기본 모델에 달렸다(ADR-064).
+        general, coder = effective_local_models(settings, hardware.profile)
+        report("로컬 모델 서버 확인 중…")
+        try:
+            tags = get_json(OLLAMA + "/api/tags")
+        except (OSError, ValueError):
+            executable = ROOT / "runtime" / "ollama" / "ollama.exe"
+            if not executable.exists():
+                if not allow_download:
+                    raise NeedsDownload("첫 실행 준비가 필요합니다. Ollama 실행 파일과 공개 모델을 다운로드합니다.\n노트북은 약 6.5GB 다운로드, 설치 공간 약 10GB가 필요합니다. 데스크톱 모델은 더 큽니다.")
+                install(report=lambda text, **_: report(text))
+            environment = ollama_environment(hardware.profile, (general, coder))
+            with (log_dir / "ollama-server.log").open("a", encoding="utf-8") as log:
+                process = subprocess.Popen([str(executable), "serve"], cwd=ROOT, env=environment, stdout=log, stderr=log, creationflags=flags)
+            (ROOT / "runtime" / "ollama.pid").write_text(str(process.pid))
+            for _ in range(80):
+                try:
+                    tags = get_json(OLLAMA + "/api/tags")
+                    break
+                except (OSError, ValueError):
+                    if process.poll() is not None:
+                        raise RuntimeError("Ollama가 시작되지 않았습니다. logs/ollama-server.log를 확인하세요.")
+                    time.sleep(.25)
+            else:
+                raise RuntimeError("Ollama 시작 시간이 초과되었습니다. 잠시 후 다시 실행하세요.")
+            os.environ["JARVIS_OLLAMA_MODELS"] = environment["OLLAMA_MODELS"]
+        models = [general] if hardware.profile != PerformanceProfile.DESKTOP and settings.single_model_on_laptop else list(dict.fromkeys([general, coder]))
+        installed = {m.get("name") for m in tags.get("models", []) if isinstance(m, dict)}
+        missing = [m for m in models if m not in installed and (":" in m or m + ":latest" not in installed)]
+        if missing and not allow_download:
+            raise NeedsDownload("이 장비의 모델을 준비해야 합니다:\n" + "\n".join(missing) + "\n최초 다운로드 후에는 오프라인으로 사용할 수 있습니다.")
+        for model in missing:
+            report(f"모델 다운로드: {model}")
+            request = urllib.request.Request(OLLAMA + "/api/pull", data=json.dumps({"model": model, "stream": True}).encode(), headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(request, timeout=600) as response:
+                last = ""
+                succeeded = False
+                for raw in response:
+                    item = json.loads(raw)
+                    if item.get("error"):
+                        raise RuntimeError(item["error"])
+                    text = item.get("status", "")
+                    if item.get("total"):
+                        text += f" {100 * item.get('completed', 0) // item['total']}%"
+                    if text != last:
+                        report(f"{model}\n{text}")
+                        last = text
+                    succeeded = item.get("status") == "success"
+                if not succeeded:
+                    raise RuntimeError("모델 다운로드가 완료되지 않았습니다. 다시 실행하면 이어받습니다.")
     report("채팅창을 시작합니다…")
     with (log_dir / "web-server.log").open("a", encoding="utf-8") as log:
         web_process = subprocess.Popen([sys.executable, "-m", "jarvis.web", "--port", "8765"], cwd=ROOT, env=os.environ.copy(), stdout=log, stderr=log, creationflags=flags)

@@ -8,12 +8,11 @@ qwen3.5 를 고른 데스크톱에서도 기본값으로 떠서 같은 크래시
 import os
 import tempfile
 import unittest
-from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
 from jarvis import launcher
-from jarvis.config import load_settings
+from jarvis.config import Settings
 from jarvis.hardware import HardwareInfo, PerformanceProfile
 
 
@@ -93,7 +92,8 @@ class LaunchWiringTests(unittest.TestCase):
             raise Started
 
         hardware = HardwareInfo("Windows-10", "cpu", 95.6, "NVIDIA GeForce RTX 5080", 15.9, detected)
-        settings = replace(load_settings(), force_profile=force_profile, auto_profile_models=True,
+        # Ollama 연결 계약은 실제 사용자 설정(예: Strata)에 영향을 받지 않아야 한다.
+        settings = Settings(local_backend="ollama", force_profile=force_profile, auto_profile_models=True,
                            general_model="gpt-oss:20b", coder_model="gpt-oss:20b",
                            desktop_general_model=desktop_model, desktop_coder_model=desktop_model)
         with patch.object(launcher, "ROOT", self.root), \
