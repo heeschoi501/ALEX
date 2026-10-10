@@ -30,3 +30,6 @@ id_ed25519
 
 # Generated reviewer packet
 REVIEW_PACKET.md
+
+# 에이전트 첨부 사본(작업 도구가 만든 것)
+.codex-remote-attachments/
