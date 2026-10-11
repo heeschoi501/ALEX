@@ -40,7 +40,7 @@ class StreamLifecycleTests(unittest.TestCase):
         self.state.core.local_summarizer = summarizer
         observed = []
 
-        def process(_message, attachments=None):
+        def process(_message, attachments=None, **_kwargs):
             observed.append((self.state.active_kind, summarizer.cancel_event is self.state.cancel_event,
                              self.state.core.command_cancel_event is self.state.cancel_event))
             return {"response": "done", "session_id": self.state.session_id}

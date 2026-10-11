@@ -119,6 +119,60 @@ class WebHTTPTests(unittest.TestCase):
         body = ctx.exception.read().decode("utf-8")
         self.assertNotIn("test-token", body)
 
+    # ── 휴대폰·노트북에서 앱처럼(2026-10-11): Tailscale Serve 주소 + 허용 로그인만 ──────────────────────
+    def _get(self, path, headers):
+        request = urllib.request.Request(self.base + path, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=2) as response:
+                return response.status, response.read().decode("utf-8", "replace"), response.headers
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read().decode("utf-8", "replace"), exc.headers
+
+    def test_remote_app_host_needs_the_configured_tailscale_login(self):
+        from jarvis.config import Settings
+
+        host = "my-pc.tail1234.ts.net"
+        self.assertEqual(self._get("/", {"Host": host, "Tailscale-User-Login": "owner@example.com"})[0], 403)  # 꺼져 있음
+        self.state.settings = Settings(remote_web_host=host, remote_web_users="owner@example.com, Second@Example.com")
+        status, body, _ = self._get("/", {"Host": host, "Tailscale-User-Login": "owner@example.com"})
+        self.assertEqual(status, 200)
+        self.assertIn("test-token", body)
+        self.assertEqual(self._get("/", {"Host": host, "Tailscale-User-Login": "second@example.com"})[0], 200)
+        for headers in ({"Host": host}, {"Host": host, "Tailscale-User-Login": "stranger@example.com"},
+                        {"Host": "other.tail1234.ts.net", "Tailscale-User-Login": "owner@example.com"},
+                        {"Host": "evil.example", "Tailscale-User-Login": "owner@example.com"}):
+            status, body, _ = self._get("/", headers)
+            self.assertEqual(status, 403, headers)
+            self.assertNotIn("test-token", body)
+
+    def test_app_install_files_are_served_with_csp(self):
+        status, body, headers = self._get("/manifest.webmanifest", {})
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "application/manifest+json")
+        manifest = json.loads(body)
+        self.assertEqual((manifest["name"], manifest["display"], manifest["start_url"]), ("ALEX", "standalone", "/"))
+        self.assertEqual({icon["sizes"] for icon in manifest["icons"]}, {"192x192", "512x512"})
+        status, body, headers = self._get("/sw.js", {})
+        self.assertEqual(status, 200)
+        self.assertIn("navigate", body)
+        self.assertNotIn("caches.open", body)  # 토큰이 든 페이지·API 를 저장하지 않는다
+        with urllib.request.urlopen(self.base + "/icon-192.png", timeout=2) as response:
+            self.assertTrue(response.read().startswith(b"\x89PNG"))
+            csp = response.headers["Content-Security-Policy"]
+        self.assertIn("manifest-src 'self'", csp)
+        self.assertIn("worker-src 'self'", csp)
+        page = self._get("/", {})[1]
+        self.assertIn('rel="manifest"', page)
+
+    def test_remote_app_settings_are_validated(self):
+        from jarvis.config import ConfigError, Settings, validate
+
+        with self.assertRaises(ConfigError):
+            validate(Settings(remote_web_host="evil.example", remote_web_users="a@b.c"))
+        with self.assertRaises(ConfigError):
+            validate(Settings(remote_web_host="my-pc.tail1234.ts.net", remote_web_users=" , "))
+        validate(Settings(remote_web_host="my-pc.tail1234.ts.net", remote_web_users="a@b.c"))
+
     def test_api_rejects_missing_token(self):
         request = urllib.request.Request(self.base + "/api/state")
         with self.assertRaises(urllib.error.HTTPError) as ctx:

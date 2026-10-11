@@ -32,7 +32,7 @@ from .providers import (
     StrataProvider,
     OpenAIResponsesProvider,
 )
-from .storage import Storage, StorageError
+from .storage import OWNER, Storage, StorageError
 from .tools import SafeFileReadTool, SafeFileSearchTool, SafeProjectContextTool, SafeProjectTreeTool, ToolError
 from .webread import WebReader
 from .workspace import SafeWorkspaceEditor
@@ -887,7 +887,7 @@ def handle_command(core: JarvisCore, session_id: str, text: str) -> tuple[str, b
             return str(exc), True, session_id
 
     if text == "/new":
-        session_id = core.get_or_create_session(resume=False)
+        session_id = core.get_or_create_session(resume=False, owner=core.storage.session_owner(session_id) or OWNER)
         core.last_route_event_id = None
         return f"새 세션: {session_id}", True, session_id
 
@@ -923,7 +923,7 @@ def handle_command(core: JarvisCore, session_id: str, text: str) -> tuple[str, b
     if text == "/status":
         title = core.storage.session_title(session_id)
         project = core.current_project_root()
-        tasks = core.storage.list_tasks(limit=20)
+        tasks = core.storage.list_tasks(limit=20, owner=core.storage.session_owner(session_id) or OWNER)
         high = sum(1 for item in tasks if item.priority == 1)
         # 실제로 무엇이 대답하고 있는지. 2026-09-21: 설정의 coder_model 이 laptop
         # single-model 모드에서 조용히 무시되는데 어느 화면에도 안 나와서, ADR-047 이
@@ -1135,7 +1135,8 @@ def handle_command(core: JarvisCore, session_id: str, text: str) -> tuple[str, b
 
     if text.startswith("/use "):
         target = text.removeprefix("/use ").strip()
-        if not core.storage.session_exists(target):
+        # 다른 사용자의 대화는 없는 것과 같다(여러 사람이 쓰기, 2026-10-11)
+        if core.storage.session_owner(target) != (core.storage.session_owner(session_id) or OWNER):
             return f"세션을 찾을 수 없습니다: {target}", True, session_id
         core.last_route_event_id = None
         return f"세션 전환: {target}", True, target
@@ -1157,14 +1158,15 @@ def handle_command(core: JarvisCore, session_id: str, text: str) -> tuple[str, b
             target = session_id
         if not target:
             return "삭제할 세션 ID가 필요합니다.", True, session_id
+        owner = core.storage.session_owner(session_id) or OWNER
         try:
-            removed = core.storage.delete_session(target)
+            removed = core.storage.session_owner(target) == owner and core.storage.delete_session(target)
         except StorageError as exc:
             return str(exc), True, session_id
         if not removed:
             return f"세션을 찾을 수 없습니다: {target}", True, session_id
         if target == session_id:
-            session_id = core.get_or_create_session(resume=False)
+            session_id = core.get_or_create_session(resume=False, owner=owner)
             core.last_route_event_id = None
             return f"현재 세션을 삭제하고 새 세션을 만들었습니다: {session_id}", True, session_id
         return f"세션 삭제 완료: {target}", True, session_id
@@ -1181,7 +1183,7 @@ def handle_command(core: JarvisCore, session_id: str, text: str) -> tuple[str, b
         return output, True, session_id
 
     if text == "/sessions":
-        sessions = core.storage.list_sessions()
+        sessions = core.storage.list_sessions(owner=core.storage.session_owner(session_id) or OWNER)
         if not sessions:
             return "저장된 세션이 없습니다.", True, session_id
         lines = [
@@ -1192,7 +1194,7 @@ def handle_command(core: JarvisCore, session_id: str, text: str) -> tuple[str, b
         return "\n".join(lines), True, session_id
 
     if text == "/memories":
-        memories = core.storage.list_memories()
+        memories = core.storage.list_memories(owner=core.storage.session_owner(session_id) or OWNER)
         if not memories:
             return "저장된 메모가 없습니다.", True, session_id
         return "\n".join(f"{k} = {v}" for k, v in memories.items()), True, session_id
@@ -1203,17 +1205,17 @@ def handle_command(core: JarvisCore, session_id: str, text: str) -> tuple[str, b
             return "사용법: /remember key=value", True, session_id
         key, value = payload.split("=", maxsplit=1)
         try:
-            core.storage.remember(key, value)
+            core.storage.remember(key, value, owner=core.storage.session_owner(session_id) or OWNER)
         except StorageError as exc:
             return str(exc), True, session_id
         return "기억했습니다.", True, session_id
 
     if text.startswith("/recall "):
-        value = core.storage.recall(text.removeprefix("/recall "))
+        value = core.storage.recall(text.removeprefix("/recall "), owner=core.storage.session_owner(session_id) or OWNER)
         return (value if value is not None else "저장된 값이 없습니다."), True, session_id
 
     if text.startswith("/forget "):
-        removed = core.storage.forget(text.removeprefix("/forget "))
+        removed = core.storage.forget(text.removeprefix("/forget "), owner=core.storage.session_owner(session_id) or OWNER)
         return ("삭제했습니다." if removed else "해당 key 가 없습니다."), True, session_id
 
     if text.startswith("/task-add "):
@@ -1225,13 +1227,13 @@ def handle_command(core: JarvisCore, session_id: str, text: str) -> tuple[str, b
             priority = int(parts[0])
             task_text = parts[1] if len(parts) > 1 else ""
         try:
-            task_id = core.storage.add_task(task_text, priority)
+            task_id = core.storage.add_task(task_text, priority, owner=core.storage.session_owner(session_id) or OWNER)
         except StorageError as exc:
             return str(exc), True, session_id
         return f"할 일 추가: #{task_id} (priority={priority}) {task_text}", True, session_id
 
     if text == "/tasks" or text == "/tasks all":
-        items = core.storage.list_tasks(include_done=text.endswith(" all"))
+        items = core.storage.list_tasks(include_done=text.endswith(" all"), owner=core.storage.session_owner(session_id) or OWNER)
         if not items:
             return "할 일이 없습니다.", True, session_id
         labels = {1: "HIGH", 2: "NORMAL", 3: "LOW"}
@@ -1245,7 +1247,7 @@ def handle_command(core: JarvisCore, session_id: str, text: str) -> tuple[str, b
         raw = text.removeprefix("/task-open " if reopen else "/task-done ").strip()
         try:
             task_id = int(raw)
-            changed = core.storage.set_task_status(task_id, "open" if reopen else "done")
+            changed = core.storage.set_task_status(task_id, "open" if reopen else "done", owner=core.storage.session_owner(session_id) or OWNER)
         except (ValueError, StorageError) as exc:
             return f"Task 처리 오류: {exc}", True, session_id
         return (f"Task #{task_id} {'다시 열기' if reopen else '완료'}" if changed else f"Task #{task_id} 를 찾을 수 없습니다."), True, session_id
@@ -1256,7 +1258,7 @@ def handle_command(core: JarvisCore, session_id: str, text: str) -> tuple[str, b
             return "삭제 확인이 필요합니다. 사용법: /task-delete ID --yes", True, session_id
         try:
             task_id = int(payload[:-6].strip())
-            changed = core.storage.delete_task(task_id)
+            changed = core.storage.delete_task(task_id, owner=core.storage.session_owner(session_id) or OWNER)
         except (ValueError, StorageError) as exc:
             return f"Task 삭제 오류: {exc}", True, session_id
         return (f"Task #{task_id} 삭제" if changed else f"Task #{task_id} 를 찾을 수 없습니다."), True, session_id

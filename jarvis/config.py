@@ -48,6 +48,11 @@ class Settings:
     remote_user: str = ""
     remote_local_port: int = 8766
     remote_alex_port: int = 8765
+    # 휴대폰·밖에서 앱처럼 쓰기(2026-10-11, ADR-052 보충): Tailscale Serve 가 이 PC 의 127.0.0.1:8765 를 내 사설망(tailnet)
+    # 안에서만 HTTPS 로 연다. ALEX 는 여전히 127.0.0.1 에서만 듣고, 이 주소(…ts.net)로 들어온 요청은 Tailscale 이 붙여 주는
+    # 로그인 머리글(Tailscale-User-Login)이 아래 계정일 때만 받는다. 비우면 꺼짐(예전과 같다).
+    remote_web_host: str = ""
+    remote_web_users: str = ""     # 허용할 Tailscale 로그인, 쉼표로 여러 개
     ollama_host: str = "http://127.0.0.1:11434"
     allow_remote_ollama: bool = False
     general_model: str = "qwen3:8b-q4_K_M"
@@ -283,6 +288,11 @@ def validate(settings: Settings) -> Settings:
         raise ConfigError("strata_num_ctx 는 4096~1048576 사이여야 합니다.")
     if settings.strata_reasoning_effort not in ("low", "medium", "high"):
         raise ConfigError("strata_reasoning_effort 는 low, medium, high 중 하나여야 합니다.")
+    if settings.remote_web_host:
+        if not re.fullmatch(r"[a-z0-9-]+(?:\.[a-z0-9-]+)*\.ts\.net", settings.remote_web_host):
+            raise ConfigError("remote_web_host 는 Tailscale 주소(…ts.net)만 허용합니다. 예: my-pc.tail1234.ts.net")
+        if not [u for u in settings.remote_web_users.split(",") if u.strip()]:
+            raise ConfigError("remote_web_host 를 쓰려면 remote_web_users 에 허용할 Tailscale 로그인을 적어야 합니다.")
     if not 64 <= settings.strata_max_output_tokens <= settings.strata_num_ctx // 2:
         raise ConfigError("strata_max_output_tokens 는 64 이상, 문맥 창(strata_num_ctx)의 절반 이하여야 합니다.")
     if settings.strata_context_char_budget != 0 and not 1000 <= settings.strata_context_char_budget <= 500_000:
@@ -394,6 +404,7 @@ LOCAL_FIELDS = {
     "ram_offload_budget_gb": float, "num_gpu_layers": int, "num_gpu_layers_model": str,
     "context_char_budget": int, "force_profile": str, "web_enabled": bool,
     "remote_host": str, "remote_user": str, "remote_local_port": int, "remote_alex_port": int,
+    "remote_web_host": str, "remote_web_users": str,
     "lesson_context_limit": int, "web_tool_enabled": bool, "auto_lessons_enabled": bool, "coding_insights_enabled": bool, "fact_reminder_enabled": bool, "coding_api_map_enabled": bool,
     "coding_num_ctx": int, "coding_num_gpu_layers": int, "coding_context_char_budget": int, "coding_auto_attempts": int, "coding_regression_check": bool, "coding_diagnostic_context": bool, "coding_build_loop_enabled": bool, "coding_code_check_enabled": bool, "coding_worker": str, "opencode_dir": str, "opencode_model": str, "opencode_context": int, "opencode_timeout": int,
     "local_backend": str, "strata_host": str, "strata_model": str, "strata_num_ctx": int, "strata_reasoning_effort": str,

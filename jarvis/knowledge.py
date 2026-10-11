@@ -175,7 +175,16 @@ class KnowledgeStore:
                     page INTEGER NOT NULL, text TEXT NOT NULL
                 );
                 CREATE VIRTUAL TABLE IF NOT EXISTS chunk_search USING fts5(terms);
+                -- 자료가 쓰이는 곳(2026-10-11 프로젝트): '' = 모두가 쓰는 학습 자료, 'project:ID' = 그 프로젝트 안에서만.
+                -- 같은 파일이 여러 곳에 올라가도 본문은 한 번만 저장한다. 쓰이는 곳이 하나도 없으면 자료를 지운다.
+                CREATE TABLE IF NOT EXISTS scopes (
+                    document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                    scope TEXT NOT NULL, PRIMARY KEY(document_id, scope)
+                );
             """)
+            if conn.execute("SELECT COUNT(*) FROM scopes").fetchone()[0] == 0:  # 처음 한 번: 있던 자료는 모두 함께 쓰는 자료
+                with conn:
+                    conn.execute("INSERT INTO scopes(document_id, scope) SELECT id, '' FROM documents")
 
     def _remove_stale_files(self, older_than: float = 600.0) -> None:
         """중간에 멈춘 등록(.part)·삭제(.deleting) 파일을 치운다(2026-10-11 K04). 다른 프로세스가 지금 쓰는 파일을
@@ -238,13 +247,15 @@ class KnowledgeStore:
             raise KnowledgeError("파일을 읽지 못했습니다. 경로와 접근 권한을 확인하세요.") from exc
         return self.import_bytes(data, path.name, source_path=str(path))
 
-    def import_bytes(self, data: bytes, name: str, *, source_path: str = "웹 파일 업로드") -> dict:
+    def import_bytes(self, data: bytes, name: str, *, source_path: str = "웹 파일 업로드", scope: str = "") -> dict:
         name = self._validate_name(name)
         if not data or len(data) > MAX_DOCUMENT_BYTES:
             raise KnowledgeError("자료는 빈 파일이 아니어야 하고 20MB 이하여야 합니다.")
         digest = hashlib.sha256(data).hexdigest()
-        with self._connection() as conn:
+        with self._connection() as conn, conn:
             existing = conn.execute("SELECT * FROM documents WHERE sha256=?", (digest,)).fetchone()
+            if existing:
+                conn.execute("INSERT OR IGNORE INTO scopes(document_id, scope) VALUES (?, ?)", (existing["id"], scope))
         if existing:
             return {**dict(existing), "duplicate": True}
         extension = Path(name).suffix.lower()
@@ -293,6 +304,7 @@ class KnowledgeStore:
                 # The web serializes imports. This also handles separate CLI imports racing with the UI.
                 inserted = conn.execute("INSERT OR IGNORE INTO documents VALUES (?,?,?,?,?,?,?,?,?)",
                                         tuple(record.values())).rowcount
+                conn.execute("INSERT OR IGNORE INTO scopes(document_id, scope) VALUES (?, ?)", (document_id, scope))
                 if inserted:
                     for page, text in chunks:
                         cid = conn.execute("INSERT INTO chunks(document_id,page,text) VALUES (?,?,?)",
@@ -314,26 +326,33 @@ class KnowledgeStore:
             pending.unlink(missing_ok=True)
         return {**record, "duplicate": not bool(inserted), "chunks": len(chunks)}
 
-    def documents(self) -> list[dict]:
+    def documents(self, scope: str = "") -> list[dict]:
         with self._connection() as conn:
-            return [dict(row) for row in conn.execute("SELECT * FROM documents ORDER BY created_at DESC LIMIT 200")]
+            return [dict(row) for row in conn.execute(
+                "SELECT d.* FROM documents d JOIN scopes s ON s.document_id = d.id WHERE s.scope = ? "
+                "ORDER BY d.created_at DESC LIMIT 200", (scope,))]
 
-    def resolve_id(self, prefix: str) -> str:
+    def resolve_id(self, prefix: str, scopes: tuple[str, ...] = ("",)) -> str:
         if not re.fullmatch(r"[a-f0-9]{8,24}", prefix):
             raise KnowledgeError("/knowledge에서 자료 ID를 확인하세요(앞 8자 이상).")
+        marks = ",".join("?" * len(scopes))
         with self._connection() as conn:
-            rows = conn.execute("SELECT id FROM documents WHERE id LIKE ?", (prefix + "%",)).fetchall()
+            rows = conn.execute(f"SELECT DISTINCT d.id FROM documents d JOIN scopes s ON s.document_id = d.id "
+                                f"WHERE d.id LIKE ? AND s.scope IN ({marks})", (prefix + "%", *scopes)).fetchall()
         if len(rows) != 1:
             raise KnowledgeError("자료를 찾지 못했거나 ID가 여러 자료와 겹칩니다.")
         return rows[0][0]
 
-    def search(self, query: str, *, document_id: str = "", limit: int = 4) -> list[Passage]:
+    def search(self, query: str, *, document_id: str = "", limit: int = 4,
+               scopes: tuple[str, ...] = ("",)) -> list[Passage]:
         """질문과 관련된 조각. 후보는 FTS(용어 사전으로 넓힌 낱말)로 고르고, 개념이 맞는 정도로 거르고 다시 순위를 매긴다
         (query_concepts). 맞는 조각이 없으면 빈 목록 — 엉뚱한 자료를 근거로 쓰지 않는다."""
         limit = min(6, max(0, limit))
         if not limit:
             return []
-        selected_id = self.resolve_id(document_id) if document_id else ""
+        selected_id = self.resolve_id(document_id, scopes) if document_id else ""
+        allowed = ("EXISTS (SELECT 1 FROM scopes sc WHERE sc.document_id = c.document_id AND sc.scope IN ("
+                   + ",".join("?" * len(scopes)) + "))")
         core, general = query_concepts(query[:3000])
         candidates = {piece for group in core for phrase in group
                       for word in re.findall(r"[가-힣]{2,}|[0-9a-z_]{2,}", phrase.lower()) for piece in _word_pieces(word)}
@@ -345,9 +364,9 @@ class KnowledgeStore:
                 expression = " OR ".join('"' + term.replace('"', '""') + '"' for term in terms)
                 found = conn.execute("""SELECT c.*, d.title, s.terms AS terms FROM chunk_search s
                     JOIN chunks c ON c.id=s.rowid JOIN documents d ON d.id=c.document_id
-                    WHERE chunk_search MATCH ? AND (?='' OR c.document_id=?)
+                    WHERE chunk_search MATCH ? AND (?='' OR c.document_id=?) AND """ + allowed + """
                     ORDER BY bm25(chunk_search), c.id LIMIT 40""",
-                    (expression, selected_id, selected_id)).fetchall()
+                    (expression, selected_id, selected_id, *scopes)).fetchall()
                 scored = []
                 for rank, row in enumerate(found):
                     chunk_terms = set(row["terms"].split())
@@ -363,10 +382,15 @@ class KnowledgeStore:
                     WHERE c.document_id=? ORDER BY c.page,c.id LIMIT ?""", (selected_id, limit)).fetchall()
         return [Passage(row["document_id"], row["title"], row["page"], row["text"], row["id"]) for row in rows]
 
-    def forget(self, prefix: str) -> bool:
-        """K04: 사본을 먼저 옆으로 옮겨 두고 DB 에서 지운다. DB 가 실패하면 사본을 되돌려 목록과 파일이 어긋나지 않게 한다."""
-        selected = self.resolve_id(prefix)
+    def forget(self, prefix: str, scope: str = "") -> bool:
+        """K04: 사본을 먼저 옆으로 옮겨 두고 DB 에서 지운다. DB 가 실패하면 사본을 되돌려 목록과 파일이 어긋나지 않게 한다.
+        다른 곳(프로젝트)에서도 쓰는 자료면 이곳에서만 뺀다."""
+        selected = self.resolve_id(prefix, (scope,))
         with self._connection() as conn:
+            if conn.execute("SELECT 1 FROM scopes WHERE document_id=? AND scope!=?", (selected, scope)).fetchone():
+                with conn:
+                    conn.execute("DELETE FROM scopes WHERE document_id=? AND scope=?", (selected, scope))
+                return True
             row = conn.execute("SELECT snapshot FROM documents WHERE id=?", (selected,)).fetchone()
             source = self.sources / row["snapshot"]
             parked = self.sources / f"{row['snapshot']}.{secrets.token_hex(4)}.deleting"

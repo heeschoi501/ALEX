@@ -19,6 +19,7 @@ from jarvis.model_registry import (
 )
 from jarvis.providers import OllamaProvider
 from jarvis.router import Destination
+from jarvis.storage import OWNER, UserAccount
 from jarvis.web import WebAppState, make_server
 
 
@@ -96,7 +97,8 @@ class PullHTTPTests(unittest.TestCase):
         core = SimpleNamespace(
             providers={Destination.LOCAL_GENERAL: provider, Destination.LOCAL_CODER: provider},
             hardware=DESKTOP, require_cloud_approval=True, approval_callback=None,
-            storage=SimpleNamespace(db_path=Path(self.temp.name) / "jarvis.db"),
+            storage=SimpleNamespace(db_path=Path(self.temp.name) / "jarvis.db",
+                                    get_user=lambda user_id: UserAccount(OWNER, "관리자", "admin", "admin", "", "", False, "")),
         )
         self.state = WebAppState(core=core, session_id="test-session", token="test-token")
         self.server = make_server(self.state, 0)

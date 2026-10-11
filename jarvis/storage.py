@@ -19,7 +19,9 @@ from typing import Iterator
 import uuid
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
+# 여러 사람이 쓰기(2026-10-11): 대화·기억·할 일에 주인을 단다. 예전 데이터와 CLI 는 모두 이 PC 주인(관리자) 것이다.
+OWNER = "owner"
 
 
 class StorageError(RuntimeError):
@@ -47,6 +49,7 @@ class SessionSummary:
     updated_at: str
     has_summary: bool = False
     title: str = ""
+    project_id: str = ""
 
 
 @dataclass(slots=True)
@@ -95,6 +98,18 @@ class TaskItem:
     updated_at: str
 
 
+@dataclass(slots=True)
+class UserAccount:
+    user_id: str
+    name: str
+    login: str
+    role: str  # admin | member
+    password_hash: str
+    tailscale_login: str
+    disabled: bool
+    created_at: str
+
+
 class Storage:
     """One small SQLite database keeps persistence understandable.
 
@@ -139,7 +154,9 @@ class Storage:
                 agent_tables = {row[0] for row in probe.execute(
                     "SELECT name FROM sqlite_master WHERE type='table' "
                     "AND name IN ('developer_runs', 'edit_proposals')")}
-                if required.issubset(columns) and len(agent_tables) == 2:
+                owned = all("owner" in {str(row[1]) for row in probe.execute(f"PRAGMA table_info({name})")}
+                            for name in ("sessions", "tasks", "memories")) and "project_id" in columns
+                if required.issubset(columns) and owned and len(agent_tables) == 2:
                     return None
 
                 stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
@@ -203,7 +220,9 @@ class Storage:
                         updated_at TEXT NOT NULL,
                         summary TEXT NOT NULL DEFAULT '',
                         summary_through_id INTEGER NOT NULL DEFAULT 0,
-                        title TEXT NOT NULL DEFAULT ''
+                        title TEXT NOT NULL DEFAULT '',
+                        owner TEXT NOT NULL DEFAULT 'owner',
+                        project_id TEXT NOT NULL DEFAULT ''
                     );
 
                     CREATE TABLE IF NOT EXISTS messages (
@@ -219,9 +238,11 @@ class Storage:
                         ON messages(session_id, id);
 
                     CREATE TABLE IF NOT EXISTS memories (
-                        key TEXT PRIMARY KEY,
+                        owner TEXT NOT NULL DEFAULT 'owner',
+                        key TEXT NOT NULL,
                         value TEXT NOT NULL,
-                        updated_at TEXT NOT NULL
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY(owner, key)
                     );
 
                     CREATE TABLE IF NOT EXISTS route_events (
@@ -245,7 +266,8 @@ class Storage:
                         status TEXT NOT NULL DEFAULT 'open',
                         priority INTEGER NOT NULL DEFAULT 2,
                         created_at TEXT NOT NULL,
-                        updated_at TEXT NOT NULL
+                        updated_at TEXT NOT NULL,
+                        owner TEXT NOT NULL DEFAULT 'owner'
                     );
 
                     CREATE INDEX IF NOT EXISTS idx_tasks_status_priority
@@ -322,9 +344,44 @@ class Storage:
                     CREATE VIEW IF NOT EXISTS training_pool AS
                         SELECT * FROM experiences
                         WHERE stage = 'approved' AND split = 'train';
+
+                    -- 여러 사람이 쓰기(2026-10-11). 비밀번호는 해시만, 로그인 쿠키도 해시만 저장한다.
+                    CREATE TABLE IF NOT EXISTS users (
+                        id TEXT PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        login TEXT NOT NULL UNIQUE,
+                        role TEXT NOT NULL DEFAULT 'member',
+                        password_hash TEXT NOT NULL DEFAULT '',
+                        tailscale_login TEXT NOT NULL DEFAULT '',
+                        disabled INTEGER NOT NULL DEFAULT 0,
+                        created_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS auth_sessions (
+                        token_hash TEXT PRIMARY KEY,
+                        user_id TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        expires_at TEXT NOT NULL,
+                        FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                    );
+                    -- 프로젝트(2026-10-11, Gemini Gems·Claude Projects 처럼): 이름 + 지침 + 자료 + 그 안의 대화.
+                    CREATE TABLE IF NOT EXISTS projects (
+                        id TEXT PRIMARY KEY,
+                        owner TEXT NOT NULL,
+                        name TEXT NOT NULL,
+                        instructions TEXT NOT NULL DEFAULT '',
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+                    -- 앱이 만든 그림·영상·문서의 주인. 기록이 없는 예전 파일은 이 PC 주인 것으로 본다.
+                    CREATE TABLE IF NOT EXISTS artifacts (
+                        name TEXT PRIMARY KEY,
+                        owner TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    );
                     """
                 )
                 self._migrate_sessions(conn)
+                self._migrate_owners(conn)
                 conn.execute(
                     "INSERT INTO schema_meta(key, value) VALUES ('schema_version', ?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -347,23 +404,45 @@ class Storage:
             conn.execute("ALTER TABLE sessions ADD COLUMN title TEXT NOT NULL DEFAULT ''")
 
     @staticmethod
+    def _migrate_owners(conn: sqlite3.Connection) -> None:
+        """v7: 대화·할 일·기억에 주인을 단다. 있던 것은 모두 이 PC 주인 것이 된다(지우는 것 없음)."""
+        for table in ("sessions", "tasks"):
+            if "owner" not in {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})")}:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN owner TEXT NOT NULL DEFAULT '{OWNER}'")
+        if "project_id" not in {str(row["name"]) for row in conn.execute("PRAGMA table_info(sessions)")}:
+            conn.execute("ALTER TABLE sessions ADD COLUMN project_id TEXT NOT NULL DEFAULT ''")
+        if "owner" not in {str(row["name"]) for row in conn.execute("PRAGMA table_info(memories)")}:
+            # 기억은 이름(key)이 주인마다 따로여야 해서 기본 키가 바뀐다 — 새 표로 옮겨 담는다.
+            conn.execute("ALTER TABLE memories RENAME TO memories_v6")
+            conn.execute("CREATE TABLE memories (owner TEXT NOT NULL DEFAULT 'owner', key TEXT NOT NULL, "
+                         "value TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(owner, key))")
+            conn.execute("INSERT INTO memories(owner, key, value, updated_at) "
+                         f"SELECT '{OWNER}', key, value, updated_at FROM memories_v6")
+            conn.execute("DROP TABLE memories_v6")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_owner ON sessions(owner, updated_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_owner ON tasks(owner, status)")
+        if conn.execute("SELECT 1 FROM users WHERE id = ?", (OWNER,)).fetchone() is None:
+            conn.execute("INSERT INTO users(id, name, login, role, created_at) VALUES (?, '관리자', 'admin', 'admin', ?)",
+                         (OWNER, datetime.now(timezone.utc).isoformat()))
+
+    @staticmethod
     def _now() -> str:
         return datetime.now(timezone.utc).isoformat()
 
-    def create_session(self) -> str:
+    def create_session(self, owner: str = OWNER, project_id: str = "") -> str:
         session_id = uuid.uuid4().hex[:12]
         now = self._now()
         try:
             with self._connection() as conn:
                 conn.execute(
-                    "INSERT INTO sessions(id, created_at, updated_at) VALUES (?, ?, ?)",
-                    (session_id, now, now),
+                    "INSERT INTO sessions(id, created_at, updated_at, owner, project_id) VALUES (?, ?, ?, ?, ?)",
+                    (session_id, now, now, owner, project_id),
                 )
         except sqlite3.DatabaseError as exc:
             raise StorageError(self._db_help(exc)) from exc
         return session_id
 
-    def latest_session_id(self) -> str | None:
+    def latest_session_id(self, owner: str = OWNER) -> str | None:
         try:
             with self._connection() as conn:
                 # rowid 로 동점을 깬다. Windows 시계 해상도가 약 15ms 라서 연달아 만든
@@ -371,7 +450,7 @@ class Storage:
                 # 이 함수로 대화를 이어가므로 엉뚱한 대화가 열릴 수 있다.
                 # 메모는 _next_memory_timestamp 로 같은 문제를 이미 고쳤고 여기가 남아 있었다.
                 row = conn.execute(
-                    "SELECT id FROM sessions ORDER BY updated_at DESC, rowid DESC LIMIT 1"
+                    "SELECT id FROM sessions WHERE owner = ? ORDER BY updated_at DESC, rowid DESC LIMIT 1", (owner,)
                 ).fetchone()
         except sqlite3.DatabaseError as exc:
             raise StorageError(self._db_help(exc)) from exc
@@ -522,7 +601,7 @@ class Storage:
             return (datetime.fromisoformat(str(newest)) + timedelta(microseconds=1)).isoformat()
         return now
 
-    def remember(self, key: str, value: str) -> None:
+    def remember(self, key: str, value: str, owner: str = OWNER) -> None:
         clean_key = key.strip()
         clean_value = value.strip()
         if not clean_key:
@@ -537,39 +616,39 @@ class Storage:
             with self._connection() as conn:
                 conn.execute(
                     """
-                    INSERT INTO memories(key, value, updated_at) VALUES (?, ?, ?)
-                    ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+                    INSERT INTO memories(owner, key, value, updated_at) VALUES (?, ?, ?, ?)
+                    ON CONFLICT(owner, key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
                     """,
-                    (clean_key, clean_value, self._next_memory_timestamp(conn)),
+                    (owner, clean_key, clean_value, self._next_memory_timestamp(conn)),
                 )
         except sqlite3.DatabaseError as exc:
             raise StorageError(self._db_help(exc)) from exc
 
-    def recall(self, key: str) -> str | None:
+    def recall(self, key: str, owner: str = OWNER) -> str | None:
         try:
             with self._connection() as conn:
                 row = conn.execute(
-                    "SELECT value FROM memories WHERE key = ?", (key.strip(),)
+                    "SELECT value FROM memories WHERE owner = ? AND key = ?", (owner, key.strip())
                 ).fetchone()
         except sqlite3.DatabaseError as exc:
             raise StorageError(self._db_help(exc)) from exc
         return str(row["value"]) if row else None
 
-    def forget(self, key: str) -> bool:
+    def forget(self, key: str, owner: str = OWNER) -> bool:
         """메모를 지운다. 지워졌으면 True."""
         try:
             with self._connection() as conn:
-                cursor = conn.execute("DELETE FROM memories WHERE key = ?", (key.strip(),))
+                cursor = conn.execute("DELETE FROM memories WHERE owner = ? AND key = ?", (owner, key.strip()))
                 return cursor.rowcount > 0
         except sqlite3.DatabaseError as exc:
             raise StorageError(self._db_help(exc)) from exc
 
-    def list_memories(self, limit: int | None = None) -> dict[str, str]:
-        query = "SELECT key, value FROM memories ORDER BY updated_at DESC"
-        params: tuple[object, ...] = ()
+    def list_memories(self, limit: int | None = None, owner: str = OWNER) -> dict[str, str]:
+        query = "SELECT key, value FROM memories WHERE owner = ? ORDER BY updated_at DESC"
+        params: tuple[object, ...] = (owner,)
         if limit is not None:
             query += " LIMIT ?"
-            params = (max(0, limit),)
+            params = (owner, max(0, limit))
         try:
             with self._connection() as conn:
                 rows = conn.execute(query, params).fetchall()
@@ -844,6 +923,14 @@ class Storage:
         except sqlite3.DatabaseError as exc:
             raise StorageError(self._db_help(exc)) from exc
         return row is not None
+
+    def session_owner(self, session_id: str) -> str | None:
+        try:
+            with self._connection() as conn:
+                row = conn.execute("SELECT owner FROM sessions WHERE id = ?", (session_id,)).fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise StorageError(self._db_help(exc)) from exc
+        return str(row["owner"]) if row else None
 
     def rename_session(self, session_id: str, title: str) -> None:
         clean = " ".join(title.strip().split())
@@ -1176,7 +1263,7 @@ class Storage:
         except sqlite3.DatabaseError as exc:
             raise StorageError(self._db_help(exc)) from exc
 
-    def add_task(self, text: str, priority: int = 2) -> int:
+    def add_task(self, text: str, priority: int = 2, owner: str = OWNER) -> int:
         value = text.strip()
         if not value:
             raise StorageError("할 일 내용은 비어 있을 수 없습니다.")
@@ -1188,49 +1275,49 @@ class Storage:
         try:
             with self._connection() as conn:
                 cur = conn.execute(
-                    "INSERT INTO tasks(text, status, priority, created_at, updated_at) VALUES (?, 'open', ?, ?, ?)",
-                    (value, priority, now, now),
+                    "INSERT INTO tasks(text, status, priority, created_at, updated_at, owner) VALUES (?, 'open', ?, ?, ?, ?)",
+                    (value, priority, now, now, owner),
                 )
                 return int(cur.lastrowid)
         except sqlite3.DatabaseError as exc:
             raise StorageError(self._db_help(exc)) from exc
 
-    def list_tasks(self, *, include_done: bool = False, limit: int = 100) -> list[TaskItem]:
-        where = "" if include_done else "WHERE status = 'open'"
+    def list_tasks(self, *, include_done: bool = False, limit: int = 100, owner: str = OWNER) -> list[TaskItem]:
+        where = "WHERE owner = ?" if include_done else "WHERE owner = ? AND status = 'open'"
         try:
             with self._connection() as conn:
                 rows = conn.execute(
                     f"SELECT id, text, status, priority, created_at, updated_at FROM tasks {where} "
                     "ORDER BY CASE status WHEN 'open' THEN 0 ELSE 1 END, priority ASC, id ASC LIMIT ?",
-                    (max(1, min(int(limit), 500)),),
+                    (owner, max(1, min(int(limit), 500))),
                 ).fetchall()
         except sqlite3.DatabaseError as exc:
             raise StorageError(self._db_help(exc)) from exc
         return [TaskItem(int(r['id']), str(r['text']), str(r['status']), int(r['priority']), str(r['created_at']), str(r['updated_at'])) for r in rows]
 
-    def set_task_status(self, task_id: int, status: str) -> bool:
+    def set_task_status(self, task_id: int, status: str, owner: str = OWNER) -> bool:
         if status not in {"open", "done"}:
             raise StorageError("Task 상태는 open 또는 done 이어야 합니다.")
         try:
             with self._connection() as conn:
                 cur = conn.execute(
-                    "UPDATE tasks SET status=?, updated_at=? WHERE id=?",
-                    (status, self._now(), int(task_id)),
+                    "UPDATE tasks SET status=?, updated_at=? WHERE id=? AND owner=?",
+                    (status, self._now(), int(task_id), owner),
                 )
                 return cur.rowcount > 0
         except sqlite3.DatabaseError as exc:
             raise StorageError(self._db_help(exc)) from exc
 
-    def delete_task(self, task_id: int) -> bool:
+    def delete_task(self, task_id: int, owner: str = OWNER) -> bool:
         try:
             with self._connection() as conn:
-                cur = conn.execute("DELETE FROM tasks WHERE id=?", (int(task_id),))
+                cur = conn.execute("DELETE FROM tasks WHERE id=? AND owner=?", (int(task_id), owner))
                 return cur.rowcount > 0
         except sqlite3.DatabaseError as exc:
             raise StorageError(self._db_help(exc)) from exc
 
-    def list_sessions(self, limit: int = 10) -> list[SessionSummary]:
-        """최근 세션 요약. CLI `/sessions` 에서 사용한다."""
+    def list_sessions(self, limit: int = 10, owner: str = OWNER, project_id: str | None = None) -> list[SessionSummary]:
+        """최근 세션 요약. CLI `/sessions` 에서 사용한다. project_id 가 None 이면 프로젝트 대화도 함께, ''이면 프로젝트 밖 대화만."""
         try:
             with self._connection() as conn:
                 rows = conn.execute(
@@ -1239,14 +1326,16 @@ class Storage:
                            s.updated_at AS updated_at,
                            s.summary AS summary,
                            s.title AS title,
+                           s.project_id AS project_id,
                            COUNT(m.id) AS message_count
                     FROM sessions s
                     LEFT JOIN messages m ON m.session_id = s.id
+                    WHERE s.owner = ? AND (? IS NULL OR s.project_id = ?)
                     GROUP BY s.id
                     ORDER BY s.updated_at DESC, s.rowid DESC
                     LIMIT ?
                     """,
-                    (max(1, limit),),
+                    (owner, project_id, project_id, max(1, limit)),
                 ).fetchall()
         except sqlite3.DatabaseError as exc:
             raise StorageError(self._db_help(exc)) from exc
@@ -1257,6 +1346,221 @@ class Storage:
                 str(row["updated_at"]),
                 bool(str(row["summary"] or "").strip()),
                 str(row["title"] or ""),
+                str(row["project_id"] or ""),
             )
             for row in rows
         ]
+
+    # --------------------------------------------------------- 여러 사람이 쓰기: 계정·로그인·만든 파일의 주인
+
+    @staticmethod
+    def _user(row: sqlite3.Row) -> UserAccount:
+        return UserAccount(str(row["id"]), str(row["name"]), str(row["login"]), str(row["role"]),
+                           str(row["password_hash"]), str(row["tailscale_login"]), bool(row["disabled"]),
+                           str(row["created_at"]))
+
+    def _user_where(self, where: str, value: str) -> UserAccount | None:
+        try:
+            with self._connection() as conn:
+                row = conn.execute(f"SELECT * FROM users WHERE {where} = ?", (value,)).fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise StorageError(self._db_help(exc)) from exc
+        return self._user(row) if row else None
+
+    def get_user(self, user_id: str) -> UserAccount | None:
+        return self._user_where("id", user_id)
+
+    def user_by_login(self, login: str) -> UserAccount | None:
+        return self._user_where("login", login.strip().lower())
+
+    def user_by_tailscale(self, login: str) -> UserAccount | None:
+        clean = login.strip().lower()
+        return self._user_where("tailscale_login", clean) if clean else None
+
+    def list_users(self) -> list[UserAccount]:
+        try:
+            with self._connection() as conn:
+                rows = conn.execute("SELECT * FROM users ORDER BY CASE id WHEN ? THEN 0 ELSE 1 END, created_at",
+                                    (OWNER,)).fetchall()
+        except sqlite3.DatabaseError as exc:
+            raise StorageError(self._db_help(exc)) from exc
+        return [self._user(row) for row in rows]
+
+    def create_user(self, name: str, login: str, password_hash: str, role: str = "member",
+                    tailscale_login: str = "") -> UserAccount:
+        user_id = uuid.uuid4().hex[:12]
+        try:
+            with self._connection() as conn:
+                conn.execute("INSERT INTO users(id, name, login, role, password_hash, tailscale_login, created_at) "
+                             "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                             (user_id, name, login.strip().lower(), role, password_hash,
+                              tailscale_login.strip().lower(), self._now()))
+        except sqlite3.IntegrityError as exc:
+            raise StorageError("이미 있는 아이디입니다.") from exc
+        except sqlite3.DatabaseError as exc:
+            raise StorageError(self._db_help(exc)) from exc
+        return self.get_user(user_id)  # type: ignore[return-value]
+
+    def update_user(self, user_id: str, **fields: object) -> bool:
+        allowed = {"name", "role", "password_hash", "tailscale_login", "disabled"}
+        if not fields or set(fields) - allowed:
+            raise StorageError("바꿀 수 없는 계정 항목입니다.")
+        if "tailscale_login" in fields:
+            fields["tailscale_login"] = str(fields["tailscale_login"]).strip().lower()
+        assignments = ", ".join(f"{key} = ?" for key in fields)
+        try:
+            with self._connection() as conn:
+                if fields.get("tailscale_login") and conn.execute(
+                        "SELECT 1 FROM users WHERE tailscale_login = ? AND id != ?",
+                        (fields["tailscale_login"], user_id)).fetchone():
+                    raise StorageError("이 Tailscale 계정은 이미 다른 사용자에게 연결되어 있습니다.")
+                changed = conn.execute(f"UPDATE users SET {assignments} WHERE id = ?",
+                                       (*fields.values(), user_id)).rowcount > 0
+                if changed and ("password_hash" in fields or fields.get("disabled")):
+                    conn.execute("DELETE FROM auth_sessions WHERE user_id = ?", (user_id,))  # 다른 기기의 로그인도 끝낸다
+                return changed
+        except sqlite3.DatabaseError as exc:
+            raise StorageError(self._db_help(exc)) from exc
+
+    def create_auth_session(self, token_hash: str, user_id: str, expires_at: str) -> None:
+        try:
+            with self._connection() as conn:
+                conn.execute("DELETE FROM auth_sessions WHERE expires_at < ?", (self._now(),))
+                conn.execute("INSERT INTO auth_sessions(token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+                             (token_hash, user_id, self._now(), expires_at))
+        except sqlite3.DatabaseError as exc:
+            raise StorageError(self._db_help(exc)) from exc
+
+    def auth_session_user(self, token_hash: str) -> str | None:
+        try:
+            with self._connection() as conn:
+                row = conn.execute("SELECT user_id FROM auth_sessions WHERE token_hash = ? AND expires_at > ?",
+                                   (token_hash, self._now())).fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise StorageError(self._db_help(exc)) from exc
+        return str(row["user_id"]) if row else None
+
+    def delete_auth_session(self, token_hash: str) -> None:
+        try:
+            with self._connection() as conn:
+                conn.execute("DELETE FROM auth_sessions WHERE token_hash = ?", (token_hash,))
+        except sqlite3.DatabaseError as exc:
+            raise StorageError(self._db_help(exc)) from exc
+
+    def record_artifacts(self, names: Sequence[str], owner: str) -> None:
+        if not names:
+            return
+        try:
+            with self._connection() as conn:
+                conn.executemany("INSERT OR IGNORE INTO artifacts(name, owner, created_at) VALUES (?, ?, ?)",
+                                 [(name, owner, self._now()) for name in names])
+        except sqlite3.DatabaseError as exc:
+            raise StorageError(self._db_help(exc)) from exc
+
+    def artifact_owner(self, name: str) -> str:
+        try:
+            with self._connection() as conn:
+                row = conn.execute("SELECT owner FROM artifacts WHERE name = ?", (name,)).fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise StorageError(self._db_help(exc)) from exc
+        return str(row["owner"]) if row else OWNER
+
+    # --------------------------------------------------------- 프로젝트(이름 + 지침 + 자료 + 그 안의 대화)
+
+    PROJECT_INSTRUCTIONS_LIMIT = 8000
+
+    @classmethod
+    def _clean_project(cls, name: object = None, instructions: object = None) -> dict[str, str]:
+        fields: dict[str, str] = {}
+        if name is not None:
+            clean = " ".join(str(name).split())
+            if not clean or len(clean) > 60:
+                raise StorageError("프로젝트 이름은 1~60자로 적어 주세요.")
+            fields["name"] = clean
+        if instructions is not None:
+            text = str(instructions).strip()
+            if len(text) > cls.PROJECT_INSTRUCTIONS_LIMIT:
+                raise StorageError(f"지침은 {cls.PROJECT_INSTRUCTIONS_LIMIT}자 이하로 적어 주세요.")
+            fields["instructions"] = text
+        return fields
+
+    def create_project(self, owner: str, name: str, instructions: str = "") -> str:
+        fields = self._clean_project(name, instructions)
+        project_id = uuid.uuid4().hex[:12]
+        now = self._now()
+        try:
+            with self._connection() as conn:
+                conn.execute("INSERT INTO projects(id, owner, name, instructions, created_at, updated_at) "
+                             "VALUES (?, ?, ?, ?, ?, ?)", (project_id, owner, fields["name"], fields["instructions"], now, now))
+        except sqlite3.DatabaseError as exc:
+            raise StorageError(self._db_help(exc)) from exc
+        return project_id
+
+    def get_project(self, project_id: str, owner: str | None = None) -> dict | None:
+        """프로젝트 하나. owner 를 주면 그 사람 것일 때만."""
+        try:
+            with self._connection() as conn:
+                row = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise StorageError(self._db_help(exc)) from exc
+        if row is None or (owner is not None and row["owner"] != owner):
+            return None
+        return dict(row)
+
+    def list_projects(self, owner: str) -> list[dict]:
+        try:
+            with self._connection() as conn:
+                rows = conn.execute(
+                    "SELECT p.*, (SELECT COUNT(*) FROM sessions s WHERE s.project_id = p.id) AS session_count "
+                    "FROM projects p WHERE p.owner = ? ORDER BY p.updated_at DESC, p.rowid DESC", (owner,)).fetchall()
+        except sqlite3.DatabaseError as exc:
+            raise StorageError(self._db_help(exc)) from exc
+        return [dict(row) for row in rows]
+
+    def update_project(self, project_id: str, owner: str, name: object = None, instructions: object = None) -> bool:
+        fields = self._clean_project(name, instructions)
+        if not fields:
+            raise StorageError("바꿀 내용이 없습니다.")
+        assignments = ", ".join(f"{key} = ?" for key in fields)
+        try:
+            with self._connection() as conn:
+                return conn.execute(f"UPDATE projects SET {assignments}, updated_at = ? WHERE id = ? AND owner = ?",
+                                    (*fields.values(), self._now(), project_id, owner)).rowcount > 0
+        except sqlite3.DatabaseError as exc:
+            raise StorageError(self._db_help(exc)) from exc
+
+    def delete_project(self, project_id: str, owner: str) -> list[str]:
+        """프로젝트와 그 안의 대화를 지운다. 지운 대화 ID 목록을 돌려준다(없는 프로젝트면 StorageError)."""
+        try:
+            with self._connection() as conn:
+                if conn.execute("SELECT 1 FROM projects WHERE id = ? AND owner = ?", (project_id, owner)).fetchone() is None:
+                    raise StorageError("프로젝트를 찾을 수 없습니다.")
+                sessions = [str(row["id"]) for row in conn.execute(
+                    "SELECT id FROM sessions WHERE project_id = ? AND owner = ?", (project_id, owner))]
+                conn.execute("DELETE FROM sessions WHERE project_id = ? AND owner = ?", (project_id, owner))
+                conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+                return sessions
+        except sqlite3.DatabaseError as exc:
+            raise StorageError(self._db_help(exc)) from exc
+
+    def session_project(self, session_id: str) -> dict | None:
+        """이 대화가 속한 프로젝트(없으면 None)."""
+        try:
+            with self._connection() as conn:
+                row = conn.execute("SELECT p.* FROM sessions s JOIN projects p ON p.id = s.project_id "
+                                   "WHERE s.id = ? AND p.owner = s.owner", (session_id,)).fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise StorageError(self._db_help(exc)) from exc
+        return dict(row) if row else None
+
+    def empty_session(self, owner: str, project_id: str = "") -> str | None:
+        """아직 아무 말도 없는 대화 — '새 대화'를 여러 번 눌러도 빈 대화가 쌓이지 않게 다시 쓴다."""
+        try:
+            with self._connection() as conn:
+                row = conn.execute(
+                    "SELECT s.id FROM sessions s WHERE s.owner = ? AND s.project_id = ? AND NOT EXISTS "
+                    "(SELECT 1 FROM messages m WHERE m.session_id = s.id) ORDER BY s.updated_at DESC, s.rowid DESC LIMIT 1",
+                    (owner, project_id)).fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise StorageError(self._db_help(exc)) from exc
+        return str(row["id"]) if row else None

@@ -223,12 +223,46 @@ class StorageV013Tests(unittest.TestCase):
                 conn.execute("UPDATE schema_meta SET value='5' WHERE key='schema_version'")
             upgraded = Storage(path)
             self.assertEqual(upgraded.get_state('developer.active'), '{"goal":"legacy"}')
-            backups = list((Path(td) / 'backups').glob('pre-migration-v6-*'))
+            backups = list((Path(td) / 'backups').glob('pre-migration-v*'))
             self.assertEqual(len(backups), 1)
             with closing(sqlite3.connect(backups[0])) as conn:
                 self.assertEqual(conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0], '5')
             Storage(path)
-            self.assertEqual(len(list((Path(td) / 'backups').glob('pre-migration-v6-*'))), 1)
+            self.assertEqual(len(list((Path(td) / 'backups').glob('pre-migration-v*'))), 1)
+
+    def test_v6_migration_gives_existing_data_to_the_owner(self):
+        """여러 사람이 쓰기(2026-10-11): 있던 대화·기억·할 일은 지우지 않고 모두 이 PC 주인 것이 된다. 바꾸기 전에 한 번 백업한다."""
+        import sqlite3
+        from contextlib import closing
+        from jarvis.storage import OWNER
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'v6.db'
+            with closing(sqlite3.connect(path)) as conn, conn:
+                conn.executescript("""
+                    CREATE TABLE sessions (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                        summary TEXT NOT NULL DEFAULT '', summary_through_id INTEGER NOT NULL DEFAULT 0, title TEXT NOT NULL DEFAULT '');
+                    CREATE TABLE memories (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
+                    CREATE TABLE tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open',
+                        priority INTEGER NOT NULL DEFAULT 2, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+                    CREATE TABLE developer_runs (id TEXT PRIMARY KEY, workspace TEXT NOT NULL, payload TEXT NOT NULL, updated_at TEXT NOT NULL);
+                    CREATE TABLE edit_proposals (workspace TEXT NOT NULL, id TEXT NOT NULL, payload TEXT NOT NULL,
+                        updated_at TEXT NOT NULL, PRIMARY KEY(workspace, id));
+                    INSERT INTO sessions(id, created_at, updated_at, title) VALUES ('s1', '2026-10-01T00:00:00+00:00', '2026-10-01T00:00:00+00:00', '옛 대화');
+                    INSERT INTO memories VALUES ('선호언어', '한국어', '2026-10-01T00:00:00+00:00');
+                    INSERT INTO tasks(text, created_at, updated_at) VALUES ('옛 할 일', '2026-10-01T00:00:00+00:00', '2026-10-01T00:00:00+00:00');
+                """)
+            store = Storage(path)
+            self.assertEqual(store.session_owner('s1'), OWNER)
+            self.assertEqual(store.list_memories(), {'선호언어': '한국어'})
+            self.assertEqual([t.text for t in store.list_tasks()], ['옛 할 일'])
+            self.assertEqual(store.list_memories(owner='someone'), {})
+            self.assertEqual(store.list_tasks(owner='someone'), [])
+            self.assertEqual(store.get_user(OWNER).role, 'admin')
+            store.remember('선호언어', 'English', owner='someone')  # 같은 이름의 기억도 사람마다 따로
+            self.assertEqual(store.recall('선호언어'), '한국어')
+            self.assertEqual(len(list((Path(td) / 'backups').glob('pre-migration-v*'))), 1)
+            Storage(path)
+            self.assertEqual(len(list((Path(td) / 'backups').glob('pre-migration-v*'))), 1)
 
     def test_schema_meta_wal_and_stats(self):
         with tempfile.TemporaryDirectory() as td:
@@ -237,7 +271,7 @@ class StorageV013Tests(unittest.TestCase):
             storage.add_message(sid, "user", "hello")
             storage.remember("mode", "study")
             stats = storage.database_stats()
-            self.assertEqual(stats["schema_version"], "6")  # 개발 작업·편집 제안 영속 저장
+            self.assertEqual(stats["schema_version"], "7")  # 7: 대화·기억·할 일에 주인(여러 사람이 쓰기)
             self.assertEqual(str(stats["journal_mode"]).lower(), "wal")
             self.assertEqual(stats["sessions"], 1)
             self.assertEqual(stats["messages"], 1)

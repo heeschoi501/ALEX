@@ -4,7 +4,28 @@ const token = document.querySelector('meta[name="jarvis-token"]').content;
 let state = null, busy = false, requestId = null, pullRequestId = null, oldest = null;
 let settingsModelsRequest = 0;
 let pendingAttachments = [];
+// 여러 사람이 쓰기·프로젝트(2026-10-11): 열려 있는 프로젝트 화면과 그 내용
+let openProject = null, projectData = null, editingProject = null;
 const headers = {'Content-Type': 'application/json', 'X-Jarvis-Token': token};
+// 로그인·사용자 관리 화면은 정식 버전에서 연다(2026-10-11 사용자: "지금은 내 컴퓨터만"). 서버의 사람별 구분은 그대로 둔다.
+const ACCOUNTS_UI = false;
+// 화면 테마: 밝게(기본)·어둡게·시스템 따라. 이 브라우저에만 기억한다.
+function applyTheme(choice) {
+  const theme = ['light', 'dark', 'system'].includes(choice) ? choice : 'light';
+  if (theme === 'light') document.documentElement.removeAttribute('data-theme'); else document.documentElement.dataset.theme = theme;
+  const dark = theme === 'dark' || (theme === 'system' && matchMedia('(prefers-color-scheme: dark)').matches);
+  document.querySelector('meta[name="theme-color"]').content = dark ? '#121212' : '#ffffff';
+  document.querySelectorAll('[data-theme-choice]').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.themeChoice === theme)));
+  return theme;
+}
+function savedTheme() { try { return localStorage.getItem('alex-theme') || 'light'; } catch { return 'light'; } }
+applyTheme(savedTheme());
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => applyTheme(savedTheme()));
+document.querySelectorAll('[data-theme-choice]').forEach(b => b.addEventListener('click', () => {
+  const theme = applyTheme(b.dataset.themeChoice);
+  try { localStorage.setItem('alex-theme', theme); } catch { /* 기억하지 못해도 지금 화면에는 적용됐다 */ }
+}));
+if (ACCOUNTS_UI) document.querySelectorAll('.accounts-ui').forEach(el => { el.hidden = false; });
 const notice = text => { $('notice').textContent = text; };
 
 // 토큰은 프로세스마다 새로 만들어져 페이지에 구워진다(web.py:50). 앱이 재시작되면
@@ -19,7 +40,6 @@ function showTokenExpired() {
   box.append(node('span', '', '앱이 다시 시작되어 이 페이지의 연결이 만료되었습니다. 새로고침하면 이어서 쓸 수 있습니다. 대화는 저장되어 있습니다.'));
   const button = node('button', 'primary', '새로고침');
   button.type = 'button';
-  button.style.marginLeft = '10px';
   button.addEventListener('click', () => location.reload());
   box.append(button);
   // 죽은 페이지에 계속 입력하지 않도록 막는다.
@@ -28,13 +48,19 @@ function showTokenExpired() {
   $('media-prompt-open').disabled = true;
   $('screenshot').disabled = true;
 }
+function showLogin(canUseOwner) {
+  if (canUseOwner !== undefined) $('login-owner').hidden = !canUseOwner;
+  $('login-screen').hidden = false;
+  setTimeout(() => $('login-id').focus(), 0);
+}
 
 async function api(path, body) {
   if (appStopped) throw new Error('ALEX가 종료되었습니다. START_ALEX.vbs로 다시 실행한 뒤 새로고침하세요.');
   const r = await fetch(path, {method: body === undefined ? 'GET' : 'POST', headers, body: body === undefined ? undefined : JSON.stringify(body)});
-  if (r.status === 403) { showTokenExpired(); throw new Error('연결이 만료되었습니다.'); }
   let result;
-  try { result = await r.json(); } catch { throw new Error('서버 응답을 읽지 못했습니다. 실행 창을 확인하세요.'); }
+  try { result = await r.json(); } catch { if (r.status === 403) showTokenExpired(); throw new Error('서버 응답을 읽지 못했습니다. 실행 창을 확인하세요.'); }
+  if (r.status === 403 && !result.admin_only) { showTokenExpired(); throw new Error('연결이 만료되었습니다.'); }
+  if (r.status === 401 && path !== '/api/login') { showLogin(); throw new Error('로그인이 필요합니다.'); }
   if (!r.ok) throw new Error(result.error || `HTTP ${r.status}`);
   return result;
 }
@@ -44,6 +70,14 @@ function node(tag, cls, text) {
   if (text !== undefined) el.textContent = text;
   return el;
 }
+// HTML 을 해석하지 않고 아이콘을 만든다(index.html 의 아이콘과 같은 모양).
+function icon(...paths) {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 24 24'); svg.setAttribute('class', 'i'); svg.setAttribute('aria-hidden', 'true');
+  for (const d of paths) { const p = document.createElementNS('http://www.w3.org/2000/svg', 'path'); p.setAttribute('d', d); svg.append(p); }
+  return svg;
+}
+const folderIcon = () => icon('M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.7-.9l-.8-1.2A2 2 0 0 0 7.9 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z');
 function backendLabel(backend) {
   return {strata: 'Strata', ollama: 'Ollama', mock: '데모'}[backend] || '추론 엔진 확인 필요';
 }
@@ -209,15 +243,16 @@ function imageProgressInfo(partial, requested) {
   }
   return null;
 }
+// 대화 한 줄: 내 말은 오른쪽 말풍선, ALEX 답은 말풍선 없이. 복사 등은 아래 줄에(마우스를 올리면 보인다).
 function message(role, text, parent = $('messages')) {
   const el = node('article', 'message ' + (role === 'user' ? 'user' : 'assistant'));
-  const label = node('div', 'message-label', role === 'user' ? 'YOU' : 'ALEX');
-  const copy = node('button', 'copy', '복사'); copy.type = 'button';
   const content = node('div', 'message-content');
+  const actions = node('div', 'message-actions');
+  const copy = node('button', 'copy', '복사'); copy.type = 'button';
   let value = text;
-  copy.addEventListener('click', async () => { try { await navigator.clipboard.writeText(value); copy.textContent = '복사됨'; } catch { notice('복사할 텍스트를 직접 선택해 주세요.'); } });
-  label.append(copy); el.append(label, content); parent.append(el);
-  const result = {el, content, update(t, formatted = false) {
+  copy.addEventListener('click', async () => { try { await navigator.clipboard.writeText(value); copy.textContent = '복사됨'; setTimeout(() => { copy.textContent = '복사'; }, 1500); } catch { notice('복사할 텍스트를 직접 선택해 주세요.'); } });
+  actions.append(copy); el.append(content, actions); parent.append(el);
+  const result = {el, content, actions, update(t, formatted = false) {
     value = t;
     if (formatted) renderContent(content, t, role === 'assistant'); else content.textContent = t;
     el.querySelector('.learned-actions')?.remove();
@@ -232,10 +267,10 @@ function message(role, text, parent = $('messages')) {
           undo.addEventListener('click', () => { if (!busy) { submit(`/undo-learning ${id}`); undo.disabled = true; } });
           row.append(undo);
         }
-        el.append(row);
+        el.insertBefore(row, actions);
       }
     }
-  }};
+  }, status(textValue) { content.replaceChildren(node('span', 'queue-note', textValue)); }};
   result.update(text, true); return result;
 }
 function lock(value) {
@@ -247,6 +282,7 @@ function lock(value) {
   // 토큰이 만료된 뒤에는 lock(false) 가 전송 버튼을 되살리면 안 된다.
   // 새로고침 전까지 어떤 요청도 성공하지 않는다.
   $('send').disabled = value || tokenExpired || appStopped;
+  $('send').hidden = value;
   $('input').disabled = tokenExpired || appStopped;
   $('new-chat').disabled = value;
   $('attach').disabled = value || tokenExpired || appStopped;
@@ -255,53 +291,74 @@ function lock(value) {
   $('knowledge-form').querySelectorAll('input,button').forEach(b => { b.disabled = value || tokenExpired || appStopped; });
   $('attachments').querySelectorAll('button').forEach(button => { button.disabled = value || tokenExpired || appStopped; });
   $('media-prompt-open').disabled = value || tokenExpired || appStopped;
-  $('settings-open').disabled = value;
   $('stop').hidden = !value;
   $('stop').disabled = false;
-  $('stop').textContent = '■ 생성 중단';
-  document.querySelectorAll('#sessions button, #task-form button, #memory-form button, #file-form button, [data-command], #tasks input, #memories button').forEach(b => { b.disabled = value; });
+  $('stop').title = '생성 중단';
+  document.querySelectorAll('#sessions button, #projects button, #project-sessions .psession-row, #file-form button, [data-command]').forEach(b => { b.disabled = value; });
+}
+// 대화 목록은 날짜별로 묶는다(Claude·ChatGPT 처럼).
+function dayGroup(iso) {
+  const d = new Date(iso), now = new Date();
+  if (Number.isNaN(d.getTime())) return '이전';
+  const days = Math.round((new Date(now.getFullYear(), now.getMonth(), now.getDate()) - new Date(d.getFullYear(), d.getMonth(), d.getDate())) / 86400000);
+  if (days <= 0) return '오늘';
+  if (days === 1) return '어제';
+  if (days < 7) return '지난 7일';
+  if (days < 30) return '지난 30일';
+  return `${d.getFullYear()}년 ${d.getMonth() + 1}월`;
 }
 function paintState(s, history = false) {
   if (state && state.session_id !== s.session_id) clearAttachments();
   state = s;
-  const current = s.sessions.find(x => x.session_id === s.session_id);
-  $('title').textContent = current?.title || '새 대화';
-  $('session-count').textContent = s.sessions.length;
+  document.body.classList.toggle('member', !s.is_admin);
+  $('account-name').textContent = ACCOUNTS_UI ? s.user.name : '이 PC';
+  $('account-role').textContent = ACCOUNTS_UI ? `${s.is_admin ? '관리자' : '사용자'} · ${s.user.login}` : '기억 · 할 일 · 설정';
+  $('account-avatar').textContent = ACCOUNTS_UI ? (s.user.name || '?').slice(0, 1).toUpperCase() : 'A';
+  if (!openProject) {
+    $('title').textContent = s.title || '새 대화';
+    $('title-project').hidden = !s.project;
+    $('title-project').textContent = s.project?.name || '';
+  }
+  $('session-count').textContent = s.sessions.length || '';
   $('sessions').replaceChildren();
+  let group = null;
   for (const item of s.sessions) {
+    if (!item.message_count && item.session_id !== s.session_id) continue;  // 빈 대화는 목록에 쌓지 않는다
     const title = item.title || '새 대화';
+    const label = dayGroup(item.updated_at);
+    if (label !== group) { group = label; const g = node('div', 'session-group', label); g.dataset.group = label; $('sessions').append(g); }
     const row = node('div', 'session-row');
-    const b = node('button', 'session-item' + (item.session_id === s.session_id ? ' active' : ''), title);
+    row.dataset.group = label;
+    const b = node('button', 'session-item' + (item.session_id === s.session_id && !openProject ? ' active' : ''), title);
+    b.type = 'button';
     b.title = `${title} · ${item.message_count}개 메시지`;
-    b.addEventListener('click', () => submit('/use ' + item.session_id));
+    b.addEventListener('click', () => openSession(item.session_id));
+    b.addEventListener('dblclick', () => renameSession(item.session_id, title));
     const remove = node('button', 'session-delete', '×');
     remove.type = 'button'; remove.title = '이 대화 삭제'; remove.setAttribute('aria-label', `${title} 대화 삭제`);
     remove.addEventListener('click', () => deleteSession(item));
     row.append(b, remove);
     $('sessions').append(row);
   }
+  if (!s.sessions.length) $('sessions').append(node('div', 'side-empty', '아직 대화가 없습니다.'));
   filterSessions();
-  $('model-label').textContent = (s.mock ? 'DEMO · 실제 AI 아님 · ' : backendLabel(liveBackend(s)) + ' · ') + s.models[0].replace(/^(ollama|strata):/, '');
-  $('badge-model').textContent = s.mock ? '데모' : s.models[0].replace(/^(ollama|strata):/, '');
-  $('hardware').textContent = `${s.profile} · ${s.gpu || 'GPU 미확인'}`;
-  $('memory-count').textContent = Object.keys(s.memories || {}).length;
-  $('project-root').textContent = s.project_root;
-  $('task-count').textContent = s.tasks.filter(t => t.status === 'open').length;
-  $('tasks').replaceChildren();
-  for (const task of s.tasks) {
-    const row = node('div', 'task' + (task.status === 'done' ? ' done' : ''));
-    const cb = node('input'); cb.type = 'checkbox'; cb.checked = task.status === 'done'; cb.setAttribute('aria-label', task.text);
-    cb.addEventListener('change', () => submit((cb.checked ? '/task-done ' : '/task-open ') + task.task_id));
-    row.append(cb, node('span', '', task.text)); $('tasks').append(row);
+  $('projects').replaceChildren();
+  for (const p of s.projects || []) {
+    const b = node('button', 'project-item' + ((openProject || s.project?.id) === p.id ? ' active' : ''));
+    b.type = 'button';
+    b.title = `${p.name} · 대화 ${p.session_count}개`;
+    b.append(folderIcon(), node('span', '', p.name));
+    b.addEventListener('click', () => showProject(p.id));
+    $('projects').append(b);
   }
-  $('memories').replaceChildren();
-  for (const [key, value] of Object.entries(s.memories)) {
-    const row = node('div', 'memory');
-    const remove = node('button', 'text-button', '삭제');
-    remove.addEventListener('click', () => { if (confirm(`“${key}” 기억을 삭제할까요?`)) submit('/forget ' + key); });
-    row.append(remove, node('strong', '', key), node('span', '', value)); $('memories').append(row);
+  if (!(s.projects || []).length) $('projects').append(node('div', 'side-empty', '지침·자료를 묶어 두는 공간'));
+  $('model-label').textContent = s.mock ? 'DEMO · 실제 AI 아님' : backendLabel(liveBackend(s)) + ' · ' + s.models[0].replace(/^(ollama|strata):/, '');
+  if (s.is_admin) {
+    $('hardware').textContent = `${s.profile} · ${s.gpu || 'GPU 미확인'}`;
+    $('project-root').textContent = s.project_root;
   }
-  if (!Object.keys(s.memories).length) $('memories').append(node('small', '', '저장한 기억이 없습니다.'));
+  paintMemories(s.memories || {});
+  paintTasks(s.tasks || []);
   if (history) {
     $('messages').replaceChildren();
     for (const m of s.messages) message(m.role, m.content);
@@ -312,7 +369,30 @@ function paintState(s, history = false) {
   }
   lock(busy);
 }
-async function refresh(history = false) { paintState(await api('/api/state'), history); }
+async function refresh(history = false, sid = state?.session_id) {
+  paintState(await api('/api/state' + (sid ? '?session_id=' + encodeURIComponent(sid) : '')), history);
+}
+// 대화 고르기·새 대화는 모델을 쓰지 않는다 — 다른 사람의 답을 기다리지 않고 바로 바뀐다.
+async function openSession(sid) {
+  if (busy) return;
+  closeProject();
+  setSidebar(false);
+  try { await refresh(true, sid); } catch (e) { notice(e.message); }
+}
+// 제목 직접 바꾸기: 위쪽 제목을 누르거나 목록에서 두 번 누른다. 모델을 쓰지 않으니 바로 바뀐다.
+async function renameSession(sid, current) {
+  if (!sid) return;
+  const title = prompt('대화 제목', current || '');
+  if (title === null || !title.trim() || title.trim() === current) return;
+  try { await api('/api/session/rename', {session_id: sid, title: title.trim()}); await refresh(false); } catch (e) { notice(e.message); }
+}
+$('title').addEventListener('click', () => { if (!openProject && state) renameSession(state.session_id, state.title); });
+async function newChat(projectId = '') {
+  const r = await api('/api/session/new', projectId ? {project_id: projectId} : {});
+  closeProject();
+  await refresh(true, r.session_id);
+  return r.session_id;
+}
 // 대화 목록의 [×] (2026-09-26 사용자: "대화목록 제거 기능도 필요할거 같은데"). /delete-session 명령을 치지 않아도
 // 되게 하고, 확인 창 없이는 보내지 않는다. 보던 대화를 지우면 서버가 새 대화를 만들어 그 ID 를 돌려준다.
 async function deleteSession(item) {
@@ -323,7 +403,8 @@ async function deleteSession(item) {
   lock(true);
   try {
     const r = await api('/api/session/delete', {session_id: current, target: item.session_id, confirmed: true});
-    await refresh(r.session_id !== current);
+    await refresh(r.session_id !== current, r.session_id);
+    if (openProject) await showProject(openProject);
     notice(`“${title}” 대화를 삭제했습니다.`);
   } catch (e) { notice(e.message); } finally { lock(false); }
 }
@@ -331,38 +412,46 @@ async function models() {
   try {
     const x = await api('/api/models');
     // Using x.selected_general instead of x.ready to just check if something is selected and installed
-    let isReady = x.selected_general && x.installed.includes(x.selected_general);
-    $('connection').classList.toggle('offline', !isReady);
+    const isReady = x.selected_general && x.installed.includes(x.selected_general);
+    $('connection').classList.toggle('offline', !x.mock && !isReady);
     const engine = backendLabel(x.backend || liveBackend(state));
-    $('connection-text').textContent = x.mock ? '데모 모드입니다. start_web.bat으로 실제 모델을 실행하세요.' : isReady ? `${engine} 사용 중 · ${x.selected_general}` : `${engine} 연결 확인 필요 · 모델 서버를 준비한 뒤 다시 확인하세요.`;
+    const name = (x.selected_general || '').replace(/^(ollama|strata):/, '');
+    $('connection-text').textContent = x.mock ? '데모 모드' : isReady ? name : `${engine} 확인 필요`;
+    $('connection').title = x.mock ? '데모 모드입니다. start_web.bat으로 실제 모델을 실행하세요.'
+      : isReady ? `${engine} 사용 중 · ${x.selected_general} — 누르면 다시 확인` : `${engine} 연결 확인 필요 · 모델 서버를 준비한 뒤 다시 누르세요.`;
     return x.installed;
-  } catch (e) { $('connection-text').textContent = e.message; return []; }
+  } catch (e) { $('connection-text').textContent = '연결 확인 필요'; $('connection').title = e.message; return []; }
 }
 async function submit(text = $('input').value.trim()) {
   if (busy || !state) return;
+  // 프로젝트 화면에서 쓰면 그 프로젝트 안에 새 대화를 만들고 보낸다(Claude 프로젝트처럼).
+  if (openProject && !text.trim().startsWith('/') && text.trim()) {
+    try { await newChat(openProject); } catch (e) { notice(e.message); return; }
+  }
   const selected = text.trim().startsWith('/') ? [] : pendingAttachments.slice();
   if (!text.trim() && selected.length) text = '첨부한 이미지의 내용을 설명해 주세요.';
   if (!text.trim()) return;
   const body = {message: text, session_id: state.session_id, attachments: selected.map(image => image.name)};
   if (new TextEncoder().encode(JSON.stringify(body)).length > 64000) { notice('요청이 너무 큽니다. 64KB 이하로 줄여 주세요.'); return; }
   const oldSession = state.session_id;
-  lock(true); notice(''); $('input').value = ''; $('welcome').hidden = true;
+  lock(true); notice(''); $('input').value = ''; fitInput(); $('welcome').hidden = true;
+  if (openProject) closeProject();
   const displayed = text + (selected.length ? '\n' + selected.map(image => `![첨부 이미지 ${image.width}×${image.height}](alex-attachment:${image.name})`).join('\n') : '');
   message('user', displayed);
   clearAttachments(new Set(selected.map(image => image.name)));
-  const answer = message('assistant', '모델이 생각하고 있습니다…');
+  const answer = message('assistant', '');
+  answer.status('생각하는 중…');
+  answer.actions.hidden = true;  // 답이 오기 전에는 복사할 것이 없다
   const imageCommand = text.match(/^\/(?:image-prompt|image)\s+([\s\S]+)/);
   const requestedImage = imageCommand ? imageCommand[1].trim() : text;
-  if (imageCommand) {
-    answer.update('이미지 생성 준비 중…');
-    answer.content.replaceChildren(imageLoadingCard('요청을 준비하고 있습니다…', requestedImage));
-  }
+  if (imageCommand) answer.content.replaceChildren(imageLoadingCard('요청을 준비하고 있습니다…', requestedImage));
   let imageProgressActive = Boolean(imageCommand);
   let partial = '', finished = false;
   scrollBottom();
   try {
     const r = await fetch('/api/chat/stream', {method: 'POST', headers, body: JSON.stringify(body)});
     if (r.status === 403) { showTokenExpired(); throw new Error('연결이 만료되었습니다.'); }
+    if (r.status === 401) { showLogin(); throw new Error('로그인이 필요합니다.'); }
     if (!r.ok) { const x = await r.json(); throw new Error(x.error || `HTTP ${r.status}`); }
     const reader = r.body.getReader(), decoder = new TextDecoder();
     let buffer = '';
@@ -374,6 +463,8 @@ async function submit(text = $('input').value.trim()) {
         if (!line.trim()) continue;
         const event = JSON.parse(line);
         if (event.type === 'start') requestId = event.request_id;
+        // 여러 사람이 쓸 때: 모델은 한 번에 한 사람의 답만 만든다. 기다리는 동안 순번을 보여 준다.
+        if (event.type === 'queue' && !partial) answer.status(`차례를 기다리는 중 · 앞에 ${event.position}명`);
         if (event.type === 'chunk') {
           const atBottom = $('chat-scroll').scrollHeight - $('chat-scroll').scrollTop - $('chat-scroll').clientHeight < 130;
           if (event.text.startsWith('[그림 설명을 영어로 옮기는 중') || event.text.startsWith('[그리는 중: ')) imageProgressActive = true;
@@ -384,14 +475,20 @@ async function submit(text = $('input').value.trim()) {
           if (atBottom) scrollBottom();
         }
         if (event.type === 'error') throw new Error(event.error);
+        // 첫 답 뒤에 ALEX 가 지은 대화 제목(첫 메시지 그대로가 아니라 주제로)
+        if (event.type === 'title') {
+          if (state?.session_id === event.session_id && !openProject) $('title').textContent = event.title;
+          await refresh(false, event.session_id);
+        }
         if (event.type === 'done') {
-          finished = true; answer.update(event.response, true);
+          finished = true; answer.update(event.response, true); answer.actions.hidden = false;
           const m = event.metrics || {}, meta = [];
+          if (event.waited > 1) meta.push(`대기 ${event.waited}초`);
           if (event.elapsed !== undefined) meta.push(`${event.elapsed}초`);
           if (m.tokens_per_second) meta.push(`${m.tokens_per_second} tokens/s`);
           if (m.first_token_seconds !== null && m.first_token_seconds !== undefined) meta.push(`첫 응답 ${m.first_token_seconds}초`);
           if (m.done_reason === 'length') meta.push('최대 출력 길이에 도달했습니다');
-          answer.el.append(node('div', 'message-meta', meta.join(' · ')));
+          if (meta.length) answer.actions.append(node('span', 'message-meta', meta.join(' · ')));
           // Only show apply buttons for commands that return real edit proposals.
           if (text.startsWith('/edit-file ') || text.startsWith('/edit-files ') || text === '/dev-next' || text === '/dev-propose' || text === '/dev-auto') {
             const id = event.response.match(/^편집 제안 ID: ([a-f0-9]{12})/m)?.[1];
@@ -402,19 +499,22 @@ async function submit(text = $('input').value.trim()) {
               row.append(apply, discard); answer.el.append(row);
             }
           }
-          await refresh(event.session_id !== oldSession || text === '/new' || text.startsWith('/use '));
+          await refresh(event.session_id !== oldSession || text === '/new', event.session_id);
         }
       }
       if (done) break;
     }
     if (!finished) throw new Error('연결이 끊겼습니다. 새로고침해 저장된 응답을 확인하세요.');
   } catch (e) {
-    answer.update((partial ? partial + '\n\n' : '') + '오류: ' + e.message);
+    answer.update((partial ? partial + '\n\n' : '') + '오류: ' + e.message); answer.actions.hidden = false;
     notice('전송한 요청: ' + text.slice(0, 120) + '\n' + e.message);
     // Keep the original request available for manual retry, never resend automatically.
-    if (!$('input').value) $('input').value = text;
+    if (!$('input').value) { $('input').value = text; fitInput(); }
   } finally { requestId = null; lock(false); $('input').focus(); }
 }
+// 입력창은 글이 길어지면 늘어난다(최대 240px).
+function fitInput() { const el = $('input'); el.style.height = 'auto'; el.style.height = Math.min(el.scrollHeight, 240) + 'px'; }
+$('input').addEventListener('input', fitInput);
 $('chat-form').addEventListener('submit', e => { e.preventDefault(); submit(); });
 // Direct mode sends the prompt exactly as entered to ComfyUI; the chat model does not rewrite it.
 const mediaPromptDialog = $('media-prompt-dialog');
@@ -469,6 +569,9 @@ async function attachScreenshots(files) {
   if (!selected.length) return;
   if (pendingAttachments.length + selected.length > 3) { notice('이미지는 한 번에 최대 3개까지 첨부할 수 있습니다.'); return; }
   if (selected.some(file => file.size > 10000000)) { notice('이미지는 파일당 10MB 이하로 보내 주세요.'); return; }
+  if (openProject) {  // 첨부는 대화에 붙는다 — 프로젝트 화면이면 그 안에 대화를 먼저 연다
+    try { await newChat(openProject); } catch (e) { notice(e.message); return; }
+  }
   const sessionId = state.session_id;
   lock(true);
   notice('이미지를 첨부하고 있습니다…');
@@ -484,7 +587,7 @@ async function attachScreenshots(files) {
       if (state.session_id !== sessionId) throw new Error('대화가 바뀌었습니다. 다시 첨부해 주세요.');
       pendingAttachments.push({...result.attachment, filename: file.name, url: URL.createObjectURL(file)});
     }
-    notice('이미지를 첨부했습니다. 질문을 입력하고 전송하세요.');
+    notice('');
   } catch (error) { notice('이미지 첨부: ' + error.message); }
   finally { lock(false); renderAttachments(); $('input').focus(); }
 }
@@ -512,6 +615,7 @@ $('attach-file').addEventListener('change', async e => {
   const file = e.target.files[0]; e.target.value = '';
   if (!file || busy) return;
   if (file.size > 10000000) { notice('그림이 너무 큽니다(10MB 이하).'); return; }
+  if (openProject) { try { await newChat(openProject); } catch (err) { notice(err.message); return; } }
   lock(true);
   try {
     const r = await fetch('/api/image/upload', {method: 'POST', body: file, headers: {'X-Jarvis-Token': token,
@@ -527,18 +631,20 @@ $('attach-file').addEventListener('change', async e => {
   finally { lock(false); }
 });
 $('input').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); submit(); } });
-$('new-chat').addEventListener('click', () => submit('/new'));
-$('refresh-models').addEventListener('click', models);
+$('new-chat').addEventListener('click', async () => {
+  if (busy) return;
+  setSidebar(false);
+  try { await newChat(); $('input').focus(); } catch (e) { notice(e.message); }
+});
+$('connection').addEventListener('click', models);
 $('stop').addEventListener('click', async () => {
   if (!requestId) return;
-  $('stop').disabled = true; $('stop').textContent = '중단 요청 중…';
+  $('stop').disabled = true; $('stop').title = '중단 요청 중…';
   try { await api('/api/cancel', {request_id: requestId}); } catch (e) { notice(e.message); }
 });
 document.querySelectorAll('[data-prompt]').forEach(b => b.addEventListener('click', () => submit(b.dataset.prompt)));
 document.querySelectorAll('[data-command]').forEach(b => b.addEventListener('click', () => submit(b.dataset.command)));
-$('task-form').addEventListener('submit', e => { e.preventDefault(); if (!busy) { const t = $('task-text').value.trim(); if (t) { submit('/task-add ' + t); $('task-text').value = ''; } } });
 $('developer-form').addEventListener('submit', e => { e.preventDefault(); if (busy) return; const source = $('developer-file').value.trim(), test = $('developer-test').value.trim(), goal = $('developer-goal').value.trim(); if (source && test && goal && !source.includes('::') && !test.includes('::')) submit(`/dev-start ${source} :: ${test} :: ${goal}`); });
-$('memory-form').addEventListener('submit', e => { e.preventDefault(); if (!busy) { const k = $('memory-key').value.trim(), v = $('memory-value').value.trim(); if (k && v && !k.includes('=')) { submit(`/remember ${k}=${v}`); $('memory-value').value = ''; } } });
 $('file-form').addEventListener('submit', e => { e.preventDefault(); const p = $('file-path').value.trim(), q = $('file-question').value.trim(); if (!busy && p && q) submit(`${e.submitter?.value === 'edit' ? '/edit-file' : '/ask-file'} ${p} :: ${q}`); });
 $('knowledge-form').addEventListener('submit', e => {
   e.preventDefault();
@@ -572,6 +678,161 @@ $('older').addEventListener('click', async () => {
     $('messages').prepend(fragment); oldest = page.messages[0]?.id; button.hidden = !page.has_more;
   } catch (e) { notice(e.message); } finally { button.disabled = appStopped || busy; }
 });
+
+// ── 기억·할 일: 나만 보는 것. 모델을 쓰지 않으니 바로 저장된다.
+function paintMemories(memories) {
+  $('memory-count').textContent = Object.keys(memories).length || '';
+  $('memories').replaceChildren();
+  for (const [key, value] of Object.entries(memories)) {
+    const row = node('div', 'memory'), text = node('div');
+    text.append(node('strong', '', key), node('span', '', value));
+    const remove = node('button', 'text-button', '삭제'); remove.type = 'button';
+    remove.addEventListener('click', async () => {
+      if (!confirm(`“${key}” 기억을 삭제할까요?`)) return;
+      try { paintMemories((await api('/api/memory', {action: 'delete', key})).memories); } catch (e) { notice(e.message); }
+    });
+    row.append(text, remove); $('memories').append(row);
+  }
+  if (!Object.keys(memories).length) $('memories').append(node('small', '', '저장한 기억이 없습니다. 예: 선호언어 = 한국어'));
+}
+function paintTasks(tasks) {
+  $('task-count').textContent = tasks.filter(t => t.status === 'open').length || '';
+  $('tasks').replaceChildren();
+  for (const task of tasks) {
+    const row = node('div', 'task' + (task.status === 'done' ? ' done' : ''));
+    const cb = node('input'); cb.type = 'checkbox'; cb.checked = task.status === 'done'; cb.setAttribute('aria-label', task.text);
+    cb.addEventListener('change', async () => {
+      try { paintTasks((await api('/api/task', {action: cb.checked ? 'done' : 'open', id: task.task_id})).tasks); } catch (e) { notice(e.message); }
+    });
+    const remove = node('button', 'text-button', '삭제'); remove.type = 'button';
+    remove.addEventListener('click', async () => {
+      try { paintTasks((await api('/api/task', {action: 'delete', id: task.task_id})).tasks); } catch (e) { notice(e.message); }
+    });
+    row.append(cb, node('span', '', task.text), remove); $('tasks').append(row);
+  }
+  if (!tasks.length) $('tasks').append(node('small', '', '할 일이 없습니다.'));
+}
+$('memory-form').addEventListener('submit', async e => {
+  e.preventDefault();
+  const key = $('memory-key').value.trim(), value = $('memory-value').value.trim();
+  if (!key || !value) return;
+  if (key.includes('=')) { notice('기억 이름에는 = 를 쓸 수 없습니다.'); return; }
+  try { paintMemories((await api('/api/memory', {action: 'add', key, value})).memories); $('memory-key').value = ''; $('memory-value').value = ''; }
+  catch (err) { notice(err.message); }
+});
+$('task-form').addEventListener('submit', async e => {
+  e.preventDefault();
+  const text = $('task-text').value.trim();
+  if (!text) return;
+  try { paintTasks((await api('/api/task', {action: 'add', text})).tasks); $('task-text').value = ''; } catch (err) { notice(err.message); }
+});
+
+// ── 프로젝트(Gemini Gems·Claude Projects 처럼): 이름 + 지침 + 자료 + 그 안의 대화
+async function showProject(id) {
+  if (busy) return;
+  try {
+    const data = await api('/api/project?id=' + encodeURIComponent(id));
+    openProject = id;
+    paintProject(data);
+    $('project-view').hidden = false; $('chat-view').hidden = true;
+    $('title').textContent = data.project.name; $('title-project').hidden = true;
+    $('input').placeholder = `“${data.project.name}” 안에서 새 대화 시작`;
+    setSidebar(false);
+    if (state) paintState(state);
+  } catch (e) { notice(e.message); }
+}
+function closeProject() {
+  if (!openProject) return;
+  openProject = null; projectData = null;
+  $('project-view').hidden = true; $('chat-view').hidden = false;
+  $('input').placeholder = 'ALEX 에게 메시지 보내기';
+  if (state) paintState(state);
+}
+function paintProject(data) {
+  projectData = data;
+  $('project-name').textContent = data.project.name;
+  const instructions = $('project-instructions');
+  instructions.textContent = data.project.instructions || '아직 지침이 없습니다. “지침 편집”에서 ALEX 가 이 프로젝트에서 어떻게 답할지 적어 두세요.';
+  instructions.classList.toggle('empty', !data.project.instructions);
+  $('project-file-count').textContent = data.files.length || '';
+  $('project-files').replaceChildren();
+  for (const file of data.files) {
+    const row = node('div', 'file-row');
+    const remove = node('button', 'text-button', '×'); remove.type = 'button'; remove.title = '이 프로젝트에서 빼기';
+    remove.addEventListener('click', async () => {
+      if (!confirm(`“${file.title}” 자료를 이 프로젝트에서 뺄까요?`)) return;
+      try { paintProject(await api('/api/project', {action: 'unlink_file', id: openProject, document_id: file.id})); } catch (e) { notice(e.message); }
+    });
+    row.append(node('span', '', file.title), node('small', 'muted', `${file.pages}쪽`), remove);
+    $('project-files').append(row);
+  }
+  if (!data.files.length) $('project-files').append(node('small', 'muted', '올린 자료가 없습니다.'));
+  $('project-session-count').textContent = data.sessions.length || '';
+  $('project-sessions').replaceChildren();
+  for (const item of data.sessions) {
+    const row = node('div', 'psession-row');
+    row.tabIndex = 0;
+    row.append(node('span', '', item.title || '새 대화'), node('small', 'muted', dayGroup(item.updated_at)));
+    row.addEventListener('click', () => openSession(item.session_id));
+    row.addEventListener('keydown', e => { if (e.key === 'Enter') openSession(item.session_id); });
+    $('project-sessions').append(row);
+  }
+  if (!data.sessions.length) $('project-sessions').append(node('small', 'muted', '아직 대화가 없습니다. 아래 입력창에 쓰면 시작됩니다.'));
+}
+$('title-project').addEventListener('click', () => { if (state?.project) showProject(state.project.id); });
+$('project-new').addEventListener('click', () => {
+  editingProject = null;
+  $('project-dialog-title').textContent = '새 프로젝트';
+  $('project-form-name').value = ''; $('project-form-instructions').value = ''; $('project-error').textContent = '';
+  $('project-dialog').showModal(); $('project-form-name').focus();
+});
+$('project-edit').addEventListener('click', () => {
+  if (!projectData) return;
+  editingProject = projectData.project.id;
+  $('project-dialog-title').textContent = '프로젝트 편집';
+  $('project-form-name').value = projectData.project.name; $('project-form-instructions').value = projectData.project.instructions;
+  $('project-error').textContent = '';
+  $('project-dialog').showModal();
+});
+$('project-form').addEventListener('submit', async e => {
+  e.preventDefault();
+  const name = $('project-form-name').value.trim(), instructions = $('project-form-instructions').value;
+  try {
+    const data = await api('/api/project', editingProject ? {action: 'update', id: editingProject, name, instructions} : {action: 'create', name, instructions});
+    $('project-dialog').close();
+    await refresh();
+    await showProject(data.project.id);
+  } catch (err) { $('project-error').textContent = err.message; }
+});
+$('project-delete').addEventListener('click', async () => {
+  if (!projectData || busy) return;
+  const {project, sessions} = projectData;
+  if (!confirm(`“${project.name}” 프로젝트를 삭제할까요?\n안의 대화 ${sessions.length}개와 이 프로젝트에만 올린 자료도 지워지고 되돌릴 수 없습니다.`)) return;
+  try {
+    const r = await api('/api/project', {action: 'delete', id: project.id, confirmed: true});
+    closeProject();
+    await refresh(true, r.session_id);
+    notice(`“${project.name}” 프로젝트를 삭제했습니다.`);
+  } catch (e) { notice(e.message); }
+});
+$('project-upload').addEventListener('click', () => { if (openProject) $('project-file').click(); });
+$('project-file').addEventListener('change', async e => {
+  const file = e.target.files[0]; e.target.value = '';
+  if (!file || !openProject) return;
+  if (file.size > 20000000 || !file.size) { notice('자료는 빈 파일이 아니어야 하고 20MB 이하여야 합니다.'); return; }
+  notice('자료를 읽어 이 프로젝트에 저장하고 있습니다…');
+  try {
+    const r = await fetch('/api/project/upload', {method: 'POST', body: file, headers: {'X-Jarvis-Token': token,
+      'Content-Type': file.type || 'application/octet-stream', 'X-Project-Id': openProject, 'X-File-Name': encodeURIComponent(file.name)}});
+    if (r.status === 403) { showTokenExpired(); throw new Error('연결이 만료되었습니다.'); }
+    const result = await r.json();
+    if (!r.ok) throw new Error(result.error || `HTTP ${r.status}`);
+    paintProject(result);
+    notice(`“${result.document.title}”을(를) 저장했습니다 · ${result.document.pages}쪽.`);
+  } catch (err) { notice('자료 저장: ' + err.message); }
+});
+
+// ── 설정(관리자는 모델·사용자까지, 사용자는 문서 저장만)
 async function populateSettingsModels() {
   const request = ++settingsModelsRequest, backend = $('model-backend').value;
   $('settings-save').disabled = true;
@@ -611,11 +872,15 @@ async function populateSettingsModels() {
     : '사용 가능한 모델이 없습니다. setup_local.bat으로 Ollama와 모델을 먼저 준비하세요.';
 }
 $('model-backend').addEventListener('change', populateSettingsModels);
-$('settings-open').addEventListener('click', async () => {
-  if (!state || busy) return;
-  $('settings-error').textContent = ''; $('settings-dialog').showModal();
+async function openSettings() {
+  if (!state) return;
+  closeMenu();
+  $('settings-dialog').showModal();
+  if (!state.is_admin) return;
+  $('settings-error').textContent = '';
   $('settings-save').disabled = true;
   try { await refresh(); } catch (e) { $('settings-error').textContent = e.message; return; }
+  if (ACCOUNTS_UI) loadUsers();
   const s = state.settings;
   $('model-backend').value = liveBackend(state) === 'strata' ? 'strata' : 'ollama';
   // 설정 파일의 값이 목록에 없으면 select 가 조용히 비고, 저장하면 Number('') = 0 이 들어간다.
@@ -634,8 +899,11 @@ $('settings-open').addEventListener('click', async () => {
       ];
     }),
   ].join('\n') : '실제 적용 설정은 앱을 다시 시작한 뒤 확인할 수 있습니다.';
+  if (busy) { $('settings-error').textContent = '응답이 끝난 뒤 모델 설정을 바꿀 수 있습니다.'; return; }
   await populateSettingsModels();
-});
+}
+$('settings-open').addEventListener('click', openSettings);
+$('settings-open-menu').addEventListener('click', openSettings);
 // 엔진을 고르면 그 엔진의 출력 길이와 입력 한도를 보여 준다(2026-10-11 "선택에 따라서 자동으로 설정을 바뀌게끔").
 // Ollama 는 8192 토큰까지(16K 문맥 기준), Strata 는 문맥 창의 절반까지.
 function syncEngineLimits() {
@@ -686,7 +954,84 @@ $('settings-form').addEventListener('submit', async e => {
   catch (e) { $('settings-error').textContent = e.message; }
   finally { lock(false); $('settings-save').disabled = appStopped; $('model-backend').disabled = appStopped; $('settings-close').disabled = appStopped; }
 });
-(async () => { try { await refresh(true); await models(); if (state.busy) notice('다른 요청이 처리 중입니다. 완료 후 새로고침하세요.'); } catch (e) { notice('서버에 연결하지 못했습니다: ' + e.message); } })();
+// 설정 창 안의 명령(문서 저장·백업·모델 내리기)은 창을 닫고 대화에서 실행한다.
+document.querySelectorAll('#settings-dialog [data-command]').forEach(b => b.addEventListener('click', () => $('settings-dialog').close()));
+
+// ── 사용자 관리(관리자)
+async function loadUsers() {
+  try { paintUsers((await api('/api/users')).users); } catch (e) { $('users').replaceChildren(node('small', 'muted', e.message)); }
+}
+function paintUsers(users) {
+  $('users').replaceChildren();
+  for (const user of users) {
+    const row = node('div', 'user-row'), info = node('div'), actions = node('div', 'row-actions');
+    const facts = [user.login, user.role === 'admin' ? '관리자' : '사용자'];
+    if (user.tailscale_login) facts.push('Tailscale ' + user.tailscale_login);
+    if (!user.has_password) facts.push('비밀번호 없음(이 PC 에서만)');
+    if (user.disabled) facts.push('사용 중지됨');
+    info.append(node('strong', '', user.name), node('small', 'muted', facts.join(' · ')));
+    const act = (label, handler) => { const b = node('button', 'text-button', label); b.type = 'button'; b.addEventListener('click', handler); actions.append(b); };
+    const run = async body => { try { paintUsers((await api('/api/users', {...body, id: user.id})).users); } catch (e) { alert(e.message); } };
+    act('비밀번호', () => { const password = prompt(`${user.name}의 새 비밀번호(8자 이상)`); if (password) run({action: 'password', password}); });
+    act('Tailscale', () => { const login = prompt('연결할 Tailscale 계정(메일). 비우면 연결을 끊습니다.', user.tailscale_login); if (login !== null) run({action: 'update', tailscale_login: login.trim()}); });
+    if (user.id !== 'owner' && user.id !== state.user.id) act(user.disabled ? '다시 사용' : '사용 중지', () => { if (user.disabled || confirm(`${user.name} 계정을 사용 중지할까요? 대화는 지워지지 않습니다.`)) run({action: user.disabled ? 'enable' : 'disable'}); });
+    row.append(info, actions); $('users').append(row);
+  }
+}
+$('user-new').addEventListener('click', () => { $('user-form').reset(); $('user-error').textContent = ''; $('user-dialog').showModal(); $('user-name').focus(); });
+$('user-form').addEventListener('submit', async e => {
+  e.preventDefault();
+  try {
+    const r = await api('/api/users', {action: 'create', name: $('user-name').value, login: $('user-login').value,
+      password: $('user-password').value, role: $('user-role').value, tailscale_login: $('user-tailscale').value.trim()});
+    paintUsers(r.users); $('user-dialog').close();
+  } catch (err) { $('user-error').textContent = err.message; }
+});
+
+// ── 계정 메뉴·로그인
+function closeMenu() { $('account-menu').hidden = true; $('account-button').setAttribute('aria-expanded', 'false'); }
+$('account-button').addEventListener('click', e => {
+  e.stopPropagation();
+  const open = $('account-menu').hidden;
+  $('account-menu').hidden = !open; $('account-button').setAttribute('aria-expanded', String(open));
+});
+document.addEventListener('click', e => { if (!$('account-menu').hidden && !e.target.closest('.account')) closeMenu(); });
+document.querySelectorAll('[data-dialog]').forEach(b => b.addEventListener('click', () => { closeMenu(); $(b.dataset.dialog).showModal(); }));
+document.querySelectorAll('[data-close]').forEach(b => b.addEventListener('click', () => b.closest('dialog').close()));
+$('password-open').addEventListener('click', () => {
+  closeMenu();
+  $('password-form').reset(); $('password-error').textContent = '';
+  $('password-current-row').hidden = !state?.user.has_password;
+  $('password-dialog').showModal();
+});
+$('password-form').addEventListener('submit', async e => {
+  e.preventDefault();
+  try {
+    await api('/api/password', {current: $('password-current').value, password: $('password-new').value});
+    $('password-dialog').close(); await refresh(); notice('비밀번호를 바꿨습니다. 다른 기기에서는 다시 로그인해야 합니다.');
+  } catch (err) { $('password-error').textContent = err.message; }
+});
+$('logout').addEventListener('click', async () => {
+  closeMenu();
+  if (busy) { notice('응답이 끝난 뒤 바꾸세요.'); return; }
+  try { await api('/api/logout', {}); } catch { /* 이미 로그아웃 */ }
+  location.reload();
+});
+$('login-form').addEventListener('submit', async e => {
+  e.preventDefault();
+  $('login-error').textContent = ''; $('login-submit').disabled = true;
+  try { await api('/api/login', {login: $('login-id').value, password: $('login-password').value}); location.reload(); }
+  catch (err) { $('login-error').textContent = err.message; $('login-submit').disabled = false; }
+});
+$('login-owner').addEventListener('click', async () => {
+  try { await api('/api/local-owner', {}); location.reload(); } catch (err) { $('login-error').textContent = err.message; }
+});
+
+// ── 좁은 화면: 왼쪽 칸은 서랍
+function setSidebar(open) { $('sidebar').classList.toggle('open', open); $('sidebar-backdrop').hidden = !open; }
+$('sessions-toggle').addEventListener('click', () => setSidebar(true));
+$('sidebar-close').addEventListener('click', () => setSidebar(false));
+$('sidebar-backdrop').addEventListener('click', () => setSidebar(false));
 
 function setContextPanel(open) {
   document.querySelector('.context-panel').classList.toggle('open', open);
@@ -695,16 +1040,18 @@ function setContextPanel(open) {
 }
 $('context-toggle').addEventListener('click', () => setContextPanel(!document.querySelector('.context-panel').classList.contains('open')));
 $('context-close').addEventListener('click', () => setContextPanel(false));
-document.addEventListener('keydown', e => { if (e.key === 'Escape' && document.querySelector('.context-panel.open') && !document.querySelector('dialog[open]')) setContextPanel(false); });
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape' || document.querySelector('dialog[open]')) return;
+  if (document.querySelector('.context-panel.open')) setContextPanel(false);
+  closeMenu(); setSidebar(false);
+});
 function filterSessions() {
   const query = $('session-search').value.trim().toLowerCase();
-  for (const row of $('sessions').children) row.hidden = !!query && !row.textContent.toLowerCase().includes(query);
+  const rows = [...$('sessions').querySelectorAll('.session-row')];
+  for (const row of rows) row.hidden = !!query && !row.textContent.toLowerCase().includes(query);
+  for (const label of $('sessions').querySelectorAll('.session-group')) label.hidden = !rows.some(row => row.dataset.group === label.dataset.group && !row.hidden);
 }
 $('session-search').addEventListener('input', filterSessions);
-// 설정 창 안의 명령(문서 저장·백업·모델 내리기)은 창을 닫고 대화에서 실행한다.
-document.querySelectorAll('#settings-dialog [data-command]').forEach(b => b.addEventListener('click', () => $('settings-dialog').close()));
-$('sessions-toggle').addEventListener('click', () => document.querySelector('.sidebar').classList.toggle('open'));
-$('sessions').addEventListener('click', () => document.querySelector('.sidebar').classList.remove('open'));
 $('workspace-change').addEventListener('click', () => { if (busy) return; $('workspace-path').value = state.project_root; $('workspace-error').textContent = ''; $('workspace-dialog').showModal(); });
 $('workspace-close').addEventListener('click', () => $('workspace-dialog').close());
 $('workspace-form').addEventListener('submit', async e => { e.preventDefault(); if (busy) return; try { await api('/api/workspace', {path: $('workspace-path').value, confirmed: true, session_id: state.session_id}); await refresh(); $('workspace-dialog').close(); notice('프로젝트 폴더를 변경했습니다. 기존의 미적용 수정안은 폐기됩니다.'); } catch (e) { $('workspace-error').textContent = e.message; } });
@@ -714,7 +1061,6 @@ $('shutdown').addEventListener('click', async () => {
   if (!confirm('ALEX를 종료할까요?\n대화와 작업 기록은 저장됩니다. ALEX 서버와 직접 시작한 이미지·영상 엔진을 종료합니다.\nOllama와 따로 실행한 이미지·영상 엔진은 별도 서비스로 계속 실행됩니다.')) return;
   lock(true);
   $('shutdown').disabled = true;
-  $('shutdown').textContent = '종료 중…';
   notice('ALEX를 종료하고 있습니다…');
   let accepted = false;
   try {
@@ -733,7 +1079,6 @@ $('shutdown').addEventListener('click', async () => {
       catch (e) { if (e.name !== 'AbortError') { stopped = true; break; } }
       finally { clearTimeout(timeout); }
     }
-    $('shutdown').textContent = stopped ? '종료됨' : '종료 요청됨';
     notice((stopped ? 'ALEX 종료를 확인했습니다.' : '종료 요청을 보냈지만 서버 종료를 아직 확인하지 못했습니다.')
       + ' 대화와 작업 기록은 저장되어 있습니다.\n다시 사용하려면 START_ALEX.vbs를 실행하고 이 창을 새로고침하세요.\nOllama는 별도 서비스로 유지됩니다.' + warnings);
   } catch (e) {
@@ -742,7 +1087,6 @@ $('shutdown').addEventListener('click', async () => {
     if (!accepted) {
       lock(false);
       $('shutdown').disabled = false;
-      $('shutdown').textContent = '⏻';
     }
   }
 });
@@ -771,22 +1115,17 @@ function renderCatalog(data) {
     stText = `Ollama 저장 경로: ${st.path} (여유 공간: ${st.free_gb} GB)`;
   }
   $('catalog-storage').textContent = canDownload ? stText : '이 카탈로그는 Ollama용 모델 목록입니다. 현재 ' + backendLabel(data.backend) + ' 모드에서는 다운로드·모델 전환을 지원하지 않습니다.';
-  
+
   const list = $('catalog-list');
   list.replaceChildren();
-  
+
   data.catalog.forEach(cand => {
-    const div = node('div', 'row', '');
-    div.style.border = '1px solid #3c5058';
-    div.style.padding = '10px';
-    div.style.borderRadius = '5px';
-    div.style.justifyContent = 'space-between';
-    div.style.alignItems = 'center';
-    
+    const div = node('div', 'row catalog-item', '');
+
     let isInstalled = data.installed.includes(cand.tag) || data.installed.includes(cand.tag + ':latest');
     let isLoaded = data.loaded.includes(cand.tag) || data.loaded.includes(cand.tag + ':latest');
     let isSelected = (data.selected_general === cand.tag || data.selected_coder === cand.tag || data.selected_general === cand.tag + ':latest' || data.selected_coder === cand.tag + ':latest');
-    
+
     const infoParts = [
       `모델 본체: ${cand.params_b ?? '확인 불가'}B`,
       `활성: ${cand.active_params_b ?? '확인 불가'}B`,
@@ -795,12 +1134,12 @@ function renderCatalog(data) {
       `양자화: ${cand.quantization || '확인 불가'}`,
       `예상 다운로드: ${cand.download_size_gb ?? '확인 불가'}GB`,
     ];
-    
+
     const info = node('div');
     const name = node('strong', '', cand.tag);
     const href = safeHref(cand.source_url);
-    if (href) { const link = extLink('출처', href); link.style.marginLeft = '10px'; name.append(link); }
-    
+    if (href) name.append(extLink('출처', href));
+
     const statuses = [isInstalled ? '설치됨' : '카탈로그 후보'];
     if (isSelected) statuses.push('현재 선택됨');
     if (isLoaded) statuses.push('현재 로드됨');
@@ -808,7 +1147,7 @@ function renderCatalog(data) {
     if (cand.memory_estimate?.status === 'insufficient_estimated') memory.style.color = 'var(--danger)';
     info.append(name, node('br'), node('small', 'muted', infoParts.join(' | ')), node('br'),
                 memory, node('br'), node('small', 'muted', `검증일: ${cand.last_verified} | 상태: ${statuses.join(' · ')}`));
-    
+
     const actions = node('div');
     if (!isInstalled) {
         const btn = node('button', 'primary', '다운로드');
@@ -832,7 +1171,7 @@ function renderCatalog(data) {
         });
         actions.append(btn);
     }
-    
+
     div.append(info, actions);
     list.append(div);
   });
@@ -892,3 +1231,16 @@ async function pullModel(tag, btn) {
         lock(false);
     }
 }
+
+// 시작: 누구인지 먼저 확인한다(이 PC 면 주인으로 바로, 밖이면 로그인 화면).
+(async () => {
+  try {
+    const who = await api('/api/me');
+    if (!who.user) { showLogin(who.can_use_owner); return; }
+    await refresh(true); await models();
+    if (state.queue?.position != null) notice('보낸 요청이 아직 처리 중입니다. 끝나면 대화에 저장됩니다 — 잠시 뒤 새로고침하세요.');
+  } catch (e) { if (!tokenExpired && $('login-screen').hidden) notice('서버에 연결하지 못했습니다: ' + e.message); }
+})();
+// 홈 화면에 설치하는 앱(PWA, 2026-10-11): HTTPS(휴대폰·노트북의 Tailscale 주소)에서만 서비스 워커를 쓴다.
+// 워커는 페이지·API 를 저장하지 않고, 연결이 끊겼을 때 안내만 보여 준다(sw.js).
+if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('/sw.js').catch(() => {});
