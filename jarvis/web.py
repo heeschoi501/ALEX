@@ -41,6 +41,7 @@ from .http_control import interrupt_on_cancel
 from .imagegen import IMAGE_TYPES, MAX_UPLOAD_BYTES
 from .documents import download_path, FORMATS, MAX_DOWNLOAD
 from .vision import ImageAttachmentStore, MAX_ATTACHMENTS
+from .knowledge import KnowledgeError, MAX_DOCUMENT_BYTES, import_notice
 
 # 이 서버가 **불러온** 코드의 지문. 모듈을 읽는 순간에 잰다 — /health 를 받을 때 재면
 # 그 사이 디스크에서 바뀐 코드를 자기 것처럼 보고하게 된다. 런처가 이 값으로 옛 서버를 알아본다.
@@ -660,8 +661,46 @@ def _handler_factory(state: WebAppState):
                 state.active_id = None
                 state.active_kind = None
 
+        def _upload_knowledge(self) -> None:
+            if not self._authorized():
+                self._json(HTTPStatus.FORBIDDEN, {"error": "invalid local token"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid content length"})
+                return
+            if length <= 0 or length > MAX_DOCUMENT_BYTES:
+                self._json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "자료는 20MB 이하여야 합니다."})
+                return
+            if not state.lock.acquire(blocking=False):
+                self._json(HTTPStatus.CONFLICT, {"error": "응답이 끝난 뒤 자료를 저장하세요."})
+                return
+            try:
+                if state.shutting_down:
+                    self._json(HTTPStatus.CONFLICT, {"error": "앱을 종료하는 중입니다."})
+                    return
+                if self.headers.get("X-Jarvis-Session", "") != state.session_id:
+                    self._json(HTTPStatus.CONFLICT, {"error": "대화가 바뀌었습니다. 새로고침 후 다시 올려 주세요."})
+                    return
+                name = unquote(self.headers.get("X-File-Name", ""))
+                state.core.knowledge._validate_name(name)
+                data = self.rfile.read(length)
+                if len(data) != length:
+                    raise KnowledgeError("파일 전송이 완료되지 않았습니다.")
+                record = state.core.knowledge.import_bytes(data, name)
+                self._json(HTTPStatus.OK, {"response": import_notice(record), "document": {
+                    key: record[key] for key in ("id", "title", "pages", "chars", "duplicate")}})
+            except (KnowledgeError, OSError) as exc:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            finally:
+                state.lock.release()
+
         def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
             if not self._host_guard():
+                return
+            if self.path == "/api/knowledge/upload":
+                self._upload_knowledge()
                 return
             if self.path == "/api/image/upload":
                 self._upload_image()

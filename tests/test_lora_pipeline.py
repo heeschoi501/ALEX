@@ -363,7 +363,11 @@ class DependencyTests(unittest.TestCase):
         import dependency_audit
 
         self.assertEqual(dependency_audit.audit(), [])
-        self.assertEqual(set(dependency_audit.SEPARATE_ENV), {"scripts/lora_worker.py"})
+        # 학습 패키지는 학습 일꾼에만. 2026-10-11 문서 지식 기능의 PDF 일꾼(pypdf, 별도 venv)도 별도 환경이지만 학습 패키지는 없다.
+        training = {"torch", "transformers", "peft", "huggingface_hub"}
+        self.assertEqual({path for path, roots in dependency_audit.SEPARATE_ENV.items() if roots & training},
+                         {"scripts/lora_worker.py"})
+        self.assertEqual(set(dependency_audit.SEPARATE_ENV), {"scripts/lora_worker.py", "scripts/pdf_extract_worker.py"})
         # ALEX 쪽 지휘 스크립트는 표준 라이브러리만 — 앱 환경에 torch 를 들이지 않는다
         self.assertFalse({"torch", "transformers", "peft", "huggingface_hub"}
                          & dependency_audit.imported_roots(ROOT / "scripts" / "lora.py"))

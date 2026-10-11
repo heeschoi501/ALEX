@@ -40,6 +40,7 @@ from .developer import DeveloperMode
 from .opencode_worker import OpenCodeWorker
 from .imagegen import ComfyImageGenerator
 from .documents import DocumentError, command_export
+from .knowledge import KnowledgeError
 
 # Hardware Profile 에 따라 context 길이를 자동으로 확장한다.
 NUM_CTX_BY_PROFILE = {
@@ -110,6 +111,11 @@ HELP_TEXT = """사용 가능한 명령
   /find 검색어              현재 프로젝트에서 파일 이름 검색
   /read 상대/경로.py        승인된 루트에서 작은 텍스트 파일 읽기
   /ask-file 경로 :: 질문    선택한 파일을 Local 모델에게만 질문 (Cloud 금지)
+  /learn-file 경로          PDF·텍스트 자료를 로컬 지식으로 저장(가중치 학습 아님)
+  /knowledge               저장한 자료 목록(새 대화·재시작 후에도 유지)
+  /knowledge-search 검색어  모델 호출 없이 관련 원문과 쪽수 조회
+  /ask-knowledge [ID] :: 질문  저장한 자료를 Local 모델에게 질문(Cloud 금지)
+  /forget-knowledge ID --yes  저장한 자료·검색 본문·사본 삭제(원본 파일 유지)
   /grep 검색어              프로젝트 내용에서 관련 코드/문서 조각 찾기
   /ask-project 질문         관련 여러 파일 조각을 찾아 Local 모델에게 질문
   /search 검색어            웹 검색 + 상위 결과 한 쪽을 읽고 Local 모델이 답 (출처 표시)
@@ -761,6 +767,44 @@ def build_image_generator(settings: Settings) -> ComfyImageGenerator | None:
 
 def handle_command(core: JarvisCore, session_id: str, text: str) -> tuple[str, bool, str]:
     """CLI 전용 명령을 처리한다. 반환: (출력, 계속 실행 여부, session_id)."""
+    if (text == "/knowledge" or text.startswith(("/learn-file", "/knowledge-search", "/ask-knowledge", "/forget-knowledge"))):
+        try:
+            if text == "/knowledge":
+                docs = core.knowledge.documents()
+                output = "저장한 지식 자료가 없습니다. /learn-file 경로로 저장하세요."
+                if docs:
+                    output = "로컬 지식 자료(원문 참고용·가중치 학습 아님):\n" + "\n".join(
+                        f"- {d['id'][:12]} · {d['title']} · {d['pages']}쪽 · {d['chars']}자" for d in docs)
+            elif text == "/learn-file" or text.startswith("/learn-file "):
+                path = text.removeprefix("/learn-file").strip()
+                if not path:
+                    raise KnowledgeError('사용법: /learn-file "C:\\자료\\강의.pdf"')
+                output = core.learn_file(path)
+            elif text == "/knowledge-search" or text.startswith("/knowledge-search "):
+                query = text.removeprefix("/knowledge-search").strip()
+                if not query:
+                    raise KnowledgeError("사용법: /knowledge-search 검색어")
+                passages = core.knowledge.search(query)
+                output = "관련 자료를 찾지 못했습니다." if not passages else "\n\n".join(
+                    f"[{n}] {p.source()}\n{p.text}" for n, p in enumerate(passages, 1))
+            elif text == "/ask-knowledge" or text.startswith("/ask-knowledge "):
+                payload = text.removeprefix("/ask-knowledge").strip()
+                if "::" in payload:
+                    did, question = (s.strip() for s in payload.split("::", 1))
+                else:
+                    did, question = "", payload
+                output = core.ask_knowledge_local(session_id, question, did)
+            elif text.startswith("/forget-knowledge "):
+                payload = text.removeprefix("/forget-knowledge").strip().split()
+                if len(payload) != 2 or payload[1] != "--yes":
+                    raise KnowledgeError("삭제: /forget-knowledge 자료ID --yes (원본 파일은 유지)")
+                core.knowledge.forget(payload[0])
+                output = "저장한 지식 자료·검색 본문·사본을 삭제했습니다. 원본 파일은 유지합니다."
+            else:
+                raise KnowledgeError("자료 명령은 /help를 확인하세요.")
+        except (KnowledgeError, OSError) as exc:
+            output = f"자료 처리 실패: {exc}"
+        return output, True, session_id
     if text == "/exit":
         return "종료합니다.", False, session_id
 

@@ -251,6 +251,8 @@ function lock(value) {
   $('new-chat').disabled = value;
   $('attach').disabled = value || tokenExpired || appStopped;
   $('screenshot').disabled = value || tokenExpired || appStopped;
+  $('knowledge-upload').disabled = value || tokenExpired || appStopped;
+  $('knowledge-form').querySelectorAll('input,button').forEach(b => { b.disabled = value || tokenExpired || appStopped; });
   $('attachments').querySelectorAll('button').forEach(button => { button.disabled = value || tokenExpired || appStopped; });
   $('media-prompt-open').disabled = value || tokenExpired || appStopped;
   $('settings-open').disabled = value;
@@ -538,6 +540,28 @@ $('task-form').addEventListener('submit', e => { e.preventDefault(); if (!busy) 
 $('developer-form').addEventListener('submit', e => { e.preventDefault(); if (busy) return; const source = $('developer-file').value.trim(), test = $('developer-test').value.trim(), goal = $('developer-goal').value.trim(); if (source && test && goal && !source.includes('::') && !test.includes('::')) submit(`/dev-start ${source} :: ${test} :: ${goal}`); });
 $('memory-form').addEventListener('submit', e => { e.preventDefault(); if (!busy) { const k = $('memory-key').value.trim(), v = $('memory-value').value.trim(); if (k && v && !k.includes('=')) { submit(`/remember ${k}=${v}`); $('memory-value').value = ''; } } });
 $('file-form').addEventListener('submit', e => { e.preventDefault(); const p = $('file-path').value.trim(), q = $('file-question').value.trim(); if (!busy && p && q) submit(`${e.submitter?.value === 'edit' ? '/edit-file' : '/ask-file'} ${p} :: ${q}`); });
+$('knowledge-form').addEventListener('submit', e => {
+  e.preventDefault();
+  const path = $('knowledge-path').value.trim();
+  if (!busy && path) submit('/learn-file ' + path);
+});
+$('knowledge-upload').addEventListener('click', () => { if (!busy && !tokenExpired && !appStopped) $('knowledge-file').click(); });
+$('knowledge-file').addEventListener('change', async e => {
+  const file = e.target.files[0]; e.target.value = '';
+  if (!file || busy || tokenExpired || appStopped) return;
+  if (file.size > 20000000 || !file.size) { notice('자료는 빈 파일이 아니어야 하고 20MB 이하여야 합니다.'); return; }
+  lock(true); notice('자료 본문을 읽고 로컬 지식으로 저장하고 있습니다…');
+  try {
+    const r = await fetch('/api/knowledge/upload', {method: 'POST', body: file,
+      headers: {'Content-Type': file.type || 'application/octet-stream', 'X-Jarvis-Token': token,
+        'X-Jarvis-Session': state.session_id, 'X-File-Name': encodeURIComponent(file.name)}});
+    if (r.status === 403) { showTokenExpired(); throw new Error('연결이 만료되었습니다.'); }
+    const result = await r.json();
+    if (!r.ok) throw new Error(result.error || `HTTP ${r.status}`);
+    notice(result.response);
+  } catch (error) { notice('자료 저장: ' + error.message); }
+  finally { lock(false); }
+});
 $('older').addEventListener('click', async () => {
   if (!oldest || busy) return;
   const button = $('older'); button.disabled = true;

@@ -25,6 +25,8 @@ from typing import Callable
 
 from .device import VSCodeLauncher, WakeOnLanTool
 from .hardware import HardwareInfo
+from .knowledge import (KNOWLEDGE_MARKER, KnowledgeError, KnowledgeStore, import_notice,
+                        knowledge_context, knowledge_notice, learn_path_request, supplied_passages)
 from .lessons import (
     CORRECTION_SOURCE_PREFIX, FOUND_MAX_AGE_DAYS, FOUND_SOURCE_PREFIX, LESSON_MARKER, format_lessons,
     LEARNED_BY, is_time_sensitive, lesson_notice, looks_like_correction, looks_like_failure, looks_like_undo_learning,
@@ -361,6 +363,9 @@ class JarvisCore:
         image_generator: ComfyImageGenerator | None = None,
     ) -> None:
         self.storage = storage
+        self._knowledge_store = None
+        self.last_knowledge = []
+        self._knowledge_sessions_fallback: set[str] = set()
         # ADR-073. None 이면 그림 그리기가 꺼진 것이다. 세션마다 마지막 그림(영어 프롬프트, 가로, 세로)을 기억해 '다시 그려줘' 에 쓴다.
         self.image_generator = image_generator
         # 마지막 그림: prompt·width·height·path·references(그 그림이 기준으로 쓴 캐릭터들, ADR-074)
@@ -560,6 +565,16 @@ class JarvisCore:
     # ------------------------------------------------------------------ execution
 
     def handle(self, session_id: str, text: str) -> tuple[str, RouteDecision]:
+        selected_path = learn_path_request(text)
+        if selected_path:
+            try:
+                response = self.learn_file(selected_path)
+            except (KnowledgeError, OSError) as exc:
+                response = f"자료를 저장하지 못했습니다: {exc}"
+            self.storage.add_message(session_id, "user", text)
+            self.storage.add_message(session_id, "assistant", response)
+            self.last_exchange = None
+            return response, RouteDecision(Destination.LOCAL_GENERAL, "사용자가 지정한 자료 저장", "learn-file")
         decision = route_request(text)
         # "이 캐릭터를 은비로 저장해줘" — 그림을 이름 붙인 캐릭터로 저장한다(ADR-074).
         name = character_save_name(text) if self.image_generator is not None else None
@@ -733,6 +748,7 @@ class JarvisCore:
         self.logger.info("route=%s", explain(decision))
         self.last_lessons = []
         self._answer_failed = False
+        self.last_knowledge = []
         self._thinking_skipped = False
         self._tool_queries = []
         self._tool_sources = []
@@ -769,6 +785,9 @@ class JarvisCore:
                     response += "\n\n[생각이 길어져 답 쓸 자리가 모자라서, 생각 없이 바로 답했습니다.]"
                 response += (self._truncation_notice(decision.destination) + self._tool_notice()
                              + lesson_notice(self.last_lessons))
+                response += knowledge_notice(self.last_knowledge)
+                if self.last_knowledge:
+                    self._mark_knowledge_session(session_id)
         response += self._learned_notice()
 
         self.storage.add_message(session_id, "assistant", response)
@@ -1340,6 +1359,66 @@ class JarvisCore:
         cleaned = re.sub(r"[^0-9a-z가-힣_.\- ]", " ", cleaned)
         tokens = [token for token in cleaned.split() if len(token) > 1]
         return tokens[-1] if tokens else ""
+
+    @property
+    def knowledge(self) -> KnowledgeStore:
+        if self._knowledge_store is None:
+            self._knowledge_store = KnowledgeStore(self.storage.db_path.parent / "knowledge")
+        return self._knowledge_store
+
+    def learn_file(self, path: str) -> str:
+        return import_notice(self.knowledge.import_path(path, workspace=self.current_project_root()))
+
+    def _mark_knowledge_session(self, session_id: str) -> None:
+        """K03(2026-10-11): 저장 자료를 인용한 답이 이 대화에 남았다 — 이후 Cloud 로는 이 대화의 이력·요약을 보내지 않는다.
+        답 본문의 '참고 자료' 표시 문자열에 기대지 않고 대화 단위로 기록한다(답을 고치거나 요약해도 유지)."""
+        try:
+            self.storage.set_state(f"knowledge.session.{session_id}", "1")
+        except StorageError:
+            self.logger.warning("knowledge session flag could not be saved")
+            self._knowledge_sessions_fallback.add(session_id)
+
+    def _knowledge_session(self, session_id: str) -> bool:
+        if session_id in self._knowledge_sessions_fallback:
+            return True
+        try:
+            return self.storage.get_state(f"knowledge.session.{session_id}") == "1"
+        except StorageError:
+            return True  # 확인할 수 없으면 보내지 않는 쪽
+
+    def ask_knowledge_local(self, session_id: str, question: str, document_id: str = "") -> str:
+        question = question.strip()
+        if not question:
+            raise KnowledgeError("사용법: /ask-knowledge [자료ID] :: 질문")
+        passages = self.knowledge.search(question, document_id=document_id)
+        base = self._system_base(max(200, self.context_char_budget // 5))
+        q = self._truncate_text(question, max(200, self.context_char_budget // 5))
+        material, kept = knowledge_context(passages, self.context_char_budget - len(base) - len(q))
+        if not kept:
+            return "질문과 관련된 자료 본문을 찾지 못했습니다. /knowledge에서 자료 ID를 지정해 주세요."
+        messages = [Message("system", base), Message("system", material), Message("user", q)]
+        seen = set()
+        for destination in (Destination.LOCAL_GENERAL, Destination.LOCAL_CODER):
+            provider = self.providers[destination]
+            if id(provider) in seen:
+                continue
+            seen.add(id(provider))
+            try:
+                if not self._safe_health_check(provider):
+                    continue
+                response = provider.generate(messages).strip()
+                if not response:
+                    continue
+            except GenerationCancelled:
+                raise
+            except ProviderError:
+                continue
+            response += knowledge_notice(kept)
+            self._mark_knowledge_session(session_id)
+            self.storage.add_message(session_id, "user", f"[자료 질문 {document_id or '검색'}] {question}")
+            self.storage.add_message(session_id, "assistant", response)
+            return response
+        return "자료는 찾았지만 로컬 모델이 응답하지 못했습니다. 클라우드로는 보내지 않았습니다."
 
     def ask_file_local(self, session_id: str, relative_path: str, question: str) -> str:
         """Explicitly read one safe file and ask LOCAL models only.
@@ -2202,6 +2281,8 @@ class JarvisCore:
     def _learning_line(self) -> str:
         """현재 성장 기능을 설명한다. 파일 분석의 제한된 원문 예산에는 넣지 않는다."""
         facts: list[str] = []
+        facts.append("/learn-file 경로로 PDF·텍스트 자료를 로컬 지식으로 저장할 수 있다. /knowledge로 목록을 보고 "
+                     "/ask-knowledge 자료ID :: 질문으로 출처·쪽수와 함께 참고한다. 저장은 모델 가중치 학습이 아니다.")
         facts.append(
             "ALEX의 대화 기록·장기 메모·기록된 경험은 로컬 DB에 저장되어 새 세션과 앱 재시작 후에도 남는다. "
             "대화 로그 저장과 교훈 학습은 다르다. 성공·실패 전체를 자동 수집·평가하는 기능은 없다. "
@@ -2275,12 +2356,27 @@ class JarvisCore:
         if lessons:
             messages.append(Message("system", format_lessons(lessons)))
 
+        self.last_knowledge = []
+        knowledge_db = self.storage.db_path.parent / "knowledge" / "knowledge.db"
+        if knowledge_db.is_file() and destination not in CLOUD_DESTINATIONS:
+            try:
+                material, kept = knowledge_context(self.knowledge.search(latest_user),
+                                                   min(7000, self.context_char_budget // 3))
+                if material:
+                    messages.append(Message("system", material))
+                    self.last_knowledge = kept
+            except (KnowledgeError, OSError) as exc:
+                self.logger.warning("로컬 자료 검색 실패: %s", exc)
+
         messages.extend(Message(m.role, m.content) for m in history)
         if (self.fact_reminder and destination in (Destination.LOCAL_GENERAL, Destination.LOCAL_CODER)
                 and any(m.role == "assistant" for m in history) and messages[-1].role == "user"):
             # ADR-071: 쌓인 자기 오답보다 사실을 따르게 마지막 질문 바로 앞에 한 번 더(맨 앞 안내는 긴 대화에서 약하다).
             messages.insert(len(messages) - 1, Message("system", self._fact_reminder_line(destination)))
-        return self._fit_context(messages)
+        fitted = self._fit_context(messages)
+        supplied = "\n".join(m.content for m in fitted if m.role == "system" and m.content.startswith(KNOWLEDGE_MARKER))
+        self.last_knowledge = supplied_passages(self.last_knowledge, supplied)
+        return fitted
 
     def _fact_reminder_line(self, destination: Destination | None) -> str:
         """2026-09-29 실측: 14b·gpt-oss:120b 는 '인터넷이 막혀 있다' 는 자기 오답이 쌓인 대화에서 맨 앞 안내 대신 기록을 따랐다(바로잡기 0/3)."""
@@ -2295,7 +2391,7 @@ class JarvisCore:
         return " ".join(facts)
 
     def _web_tool_active(self) -> bool:
-        return self.web_reader is not None and self.web_tool_enabled
+        return self.web_reader is not None and self.web_tool_enabled and not self.last_knowledge
 
     def _run_web_tool(self, name: str, arguments: dict) -> str:
         """모델이 부른 web_search 를 앱이 실행한다(ADR-056). 돌려주는 글은 모델에게 가는 자료다.
@@ -2627,10 +2723,19 @@ class JarvisCore:
     def _is_lesson_context(message: Message) -> bool:
         return message.role == "system" and LESSON_MARKER in message.content
 
-    def _prepare_cloud_messages(self, messages: list[Message]) -> list[Message]:
-        """Cloud에는 persistent context를 기본 제외해 데이터 최소화 원칙을 지킨다."""
+    def _prepare_cloud_messages(self, messages: list[Message], *, private_history: bool = False) -> list[Message]:
+        """Cloud에는 persistent context를 기본 제외해 데이터 최소화 원칙을 지킨다.
+
+        private_history: 저장 자료를 인용한 답이 있는 대화(K03) — 지난 대화·요약은 빼고 지금 질문만 보낸다.
+        """
+        if private_history:
+            last_user = next((i for i in range(len(messages) - 1, -1, -1) if messages[i].role == "user"), None)
+            messages = [m for i, m in enumerate(messages) if (m.role == "system" and not self._is_summary_context(m))
+                        or i == last_user]
         result: list[Message] = []
         for message in messages:
+            if message.role == "system" and message.content.startswith(KNOWLEDGE_MARKER):
+                continue  # Documents remain private even with cloud_include_memory enabled.
             if self._is_memory_context(message) and not self.cloud_include_memory:
                 continue
             if self._is_summary_context(message) and not self.cloud_include_summary:
@@ -2679,6 +2784,9 @@ class JarvisCore:
         # 데스크톱 general·coder 가 같은 모델이라 35초를 더 기다려 같은 빈 답을 받았다.
         exhausted: set[tuple[object, object]] = set()
         for candidate in (destination, *FALLBACK_CHAIN.get(destination, ())):
+            if self.last_knowledge and candidate in CLOUD_DESTINATIONS:
+                attempted.append(f"{candidate.value}(로컬 자료 요청이므로 Cloud 제외)")
+                continue
             if self.local_only and candidate in CLOUD_DESTINATIONS:
                 continue
             provider = self.providers.get(candidate)
@@ -2691,7 +2799,8 @@ class JarvisCore:
                 continue
 
             candidate_messages = (
-                self._prepare_cloud_messages(messages) if candidate in CLOUD_DESTINATIONS else messages
+                self._prepare_cloud_messages(messages, private_history=self._knowledge_session(session_id))
+                if candidate in CLOUD_DESTINATIONS else messages
             )
 
             if candidate in CLOUD_DESTINATIONS:

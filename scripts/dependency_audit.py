@@ -14,7 +14,8 @@ STDLIB = set(getattr(sys, "stdlib_module_names", ()))
 LOCAL_TOP_LEVEL = {"jarvis", "scripts", "tests"}
 # 별도 환경에서만 도는 파일과 그 파일에만 허용하는 패키지. ALEX 앱 환경에는 없고 필요도 없다 —
 # LoRA 학습 일꾼은 C:\ALEX\tools\lora\venv 의 파이썬으로만 실행된다(ADR-084). 목록 밖 패키지는 여전히 실패.
-SEPARATE_ENV = {"scripts/lora_worker.py": {"torch", "transformers", "peft", "huggingface_hub"}}
+SEPARATE_ENV = {"scripts/lora_worker.py": {"torch", "transformers", "peft", "huggingface_hub"},
+                "scripts/pdf_extract_worker.py": {"pypdf"}}
 
 # Python 3.10 has `sys.stdlib_module_names`; fallback is only for unusual interpreters.
 FALLBACK_STDLIB = {

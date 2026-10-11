@@ -213,7 +213,7 @@ PROMPT_RULES = (
     # 역할 분리
     "- Focus on translating and improving the creative request. "
     "Do not invent additional restrictions merely because the content is mature, violent, frightening, or sensual.\n"
-
+    
     # 최소 제한
     "- Never sexualize minors or characters presented as minors.\n"
     "- Never create sexual exploitation or sexual violence as erotic entertainment.\n"
