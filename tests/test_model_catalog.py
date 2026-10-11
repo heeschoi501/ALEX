@@ -91,9 +91,12 @@ class PullHTTPTests(unittest.TestCase):
         self.ollama_thread.start()
         host = f"http://127.0.0.1:{self.ollama.server_address[1]}"
         provider = OllamaProvider("mistral-large:123b", host=host)
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
         core = SimpleNamespace(
             providers={Destination.LOCAL_GENERAL: provider, Destination.LOCAL_CODER: provider},
             hardware=DESKTOP, require_cloud_approval=True, approval_callback=None,
+            storage=SimpleNamespace(db_path=Path(self.temp.name) / "jarvis.db"),
         )
         self.state = WebAppState(core=core, session_id="test-session", token="test-token")
         self.server = make_server(self.state, 0)

@@ -270,6 +270,17 @@ VIDEO_NOT = ("편집", "자막", "요약", "다운로드", "유튜브", "youtube
 _VIDEO_MAKE = re.compile(r"(?:만들어|생성\s*해|뽑아|제작해)\s*" + _IMAGE_ENDINGS)
 _ANIMATE = re.compile(r"움직이게\s*(?:해|만들어)\s*" + _IMAGE_ENDINGS)
 _EN_VIDEO = re.compile(r"\b(?:make|generate|create|render)\s+(?:me\s+)?(?:an?\s+)?(?:short\s+)?(?:video|animation|clip)\b")
+_VIDEO_AUDIO_END = re.compile(r"(?:넣어|포함\s*해|추가\s*해|더해)\s*" + _IMAGE_ENDINGS + r"[.!?…\s]*$")
+
+
+def _video_tail_ok(tail: str) -> bool:
+    tail = tail.strip()
+    if len(tail) <= IMAGE_TAIL_MAX_CHARS:
+        return True
+    # A second audio instruction still describes this video. Keep unrelated
+    # follow-up questions out of the generation route (live LTX test, 2026-10-11).
+    return (len(tail) <= 120 and _contains_any(tail, ("소리", "음악", "음성", "대사", "효과음"))
+            and _VIDEO_AUDIO_END.search(tail) is not None)
 
 
 def video_request(normalized: str) -> str | None:
@@ -285,7 +296,7 @@ def video_request(normalized: str) -> str | None:
     if matches:
         match = matches[-1]
         if (_contains_any(normalized[:match.start()], VIDEO_WORDS)
-                and len(normalized[match.end():].strip()) <= IMAGE_TAIL_MAX_CHARS):
+                and _video_tail_ok(normalized[match.end():])):
             return match.group(0)
     match = _EN_VIDEO.search(normalized)
     return match.group(0) if match and match.start() <= 40 else None

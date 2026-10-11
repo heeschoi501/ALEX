@@ -4,6 +4,7 @@
 같은 날 실측: 한 번에 쓴 테트리스는 Q3 9번 중 6번이 시작하자마자 실제 버그로 죽었다 — 시작 직후 실행만 해도 잡힌다.
 """
 import sys
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -112,6 +113,11 @@ class CheckTests(unittest.TestCase):
             import pygame  # noqa: F401
         except ImportError:
             self.skipTest("pygame 없음")
+        visible = subprocess.run([sys.executable, "-I", "-c",
+                                  "import importlib.util,sys; sys.exit(importlib.util.find_spec('pygame') is None)"],
+                                 capture_output=True, timeout=10)
+        if visible.returncode:
+            self.skipTest("pygame이 격리 실행 파이썬에는 없음(user site는 실행 보호상 제외)")
         code = ("import pygame\npygame.init()\nscreen = pygame.display.set_mode((100, 100))\n"
                 "font = pygame.font.SysFont('consolas', 16)\nscreen.blit(font.render('1', True, (255, 255, 255)), (0, 0))\n"
                 "pygame.display.flip()\npygame.quit()\n")

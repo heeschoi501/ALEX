@@ -32,6 +32,37 @@ def project(files):
 
 
 class ParallelSuiteTests(unittest.TestCase):
+    def test_trusted_cli_keeps_workspace_sibling_packages_importable(self):
+        tmp, root = project({'test_import.py': 'import unittest\nfrom pkg import value\n'
+                             'class T(unittest.TestCase):\n    def test_value(self): self.assertEqual(value,7)\n',
+                             'test_pass.py': PASS})
+        self.addCleanup(tmp.cleanup)
+        (root / 'pkg').mkdir()
+        (root / 'pkg/__init__.py').write_text('value=7\n', encoding='utf-8')
+        for workers in (1, 2):
+            with patch.object(developer, 'SUITE_WORKERS', workers):
+                code, output = _default_suite_runner(root)
+            self.assertEqual(code, 0, output)
+            self.assertIn('Ran 3 tests', output)
+
+    def test_an_empty_module_does_not_spoil_other_executed_tests(self):
+        parallel, serial, _ = self.run_both({'test_empty.py': '# intentionally no tests\n', 'test_pass.py': PASS})
+        self.assertEqual(parallel, ('ok', frozenset(), ''))
+        self.assertEqual(serial, ('ok', frozenset(), ''))
+
+    def test_failure_ids_and_unexpected_successes_are_complete_on_supported_python(self):
+        body = ('import unittest\nclass F(unittest.TestCase):\n'
+                '    @unittest.expectedFailure\n    def test_unexpected(self): pass\n'
+                '    def test_sub(self):\n'
+                '        for n in (1,2):\n'
+                '            with self.subTest(n=n): self.assertEqual(n,0)\n')
+        parallel, serial, _ = self.run_both({'test_contract.py': body, 'test_pass.py': PASS})
+        expected = frozenset({'UNEXPECTED SUCCESS: test_unexpected (test_contract.F.test_unexpected)',
+                              'test_sub (test_contract.F.test_sub) (n=1)',
+                              'test_sub (test_contract.F.test_sub) (n=2)'})
+        self.assertEqual(parallel, ('failed', expected, ''))
+        self.assertEqual(serial, ('failed', expected, ''))
+
     def test_redirected_unicode_output_is_utf8_in_every_child(self):
         body = 'print("한글 출력")\n' + PASS
         tmp, root = project({"test_a.py": body, "test_b.py": body})

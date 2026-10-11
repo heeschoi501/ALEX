@@ -400,7 +400,7 @@ def _test_fingerprints(workspace: Path, tests: list[str]) -> dict[str, str]:
 
 def _run_unittest(workspace: Path, pattern: str | None,
                   cancel_event: threading.Event | None = None, limit_seconds: float = 120) -> tuple[int, str]:
-    command = [sys.executable, "-W", "error::ResourceWarning", "-m", "unittest",
+    command = [sys.executable, "-W", "error::ResourceWarning", str(Path(__file__).with_name("suite_runner.py")),
                "discover", "-s", "tests"]
     if pattern is not None:
         command.extend(("-p", pattern))
@@ -578,7 +578,7 @@ def _run_parallel_suite(workspace: Path, files: list[str], cancel_event: threadi
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return name, 124, f"전체 검사 시간 제한({SUITE_LIMIT_SECONDS:g}초) 초과"
-        command = [sys.executable, "-W", "error::ResourceWarning", "-m", "unittest", "discover", "-s", "tests",
+        command = [sys.executable, "-W", "error::ResourceWarning", str(Path(__file__).with_name("suite_runner.py")), "discover", "-s", "tests",
                    "-p", name, "-v"]
         code, output = _run_bounded(command, workspace, cancel_event, "전체 검사", remaining,
                                     digest=_suite_digest)

@@ -47,7 +47,6 @@ class LifecycleTests(unittest.TestCase):
         self.assertIsNone(health(self.base))
         self.assertFalse(stop_server(self.base, expected_instance=expected))
 
-    @unittest.skip("공개판에는 이미지 엔진이 없습니다")
     def test_shutdown_reaps_only_the_image_engine_it_started(self):
         generator = ComfyImageGenerator(Path(self.temp.name) / "images")
         process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
@@ -64,7 +63,6 @@ class LifecycleTests(unittest.TestCase):
         self.assertIsNotNone(process.poll())
         self.assertIsNone(generator._process)
 
-    @unittest.skip("공개판에는 이미지 엔진이 없습니다")
     def test_shutdown_leaves_preexisting_image_service_untouched(self):
         generator = ComfyImageGenerator(Path(self.temp.name) / "images")
         generator._request = Mock(side_effect=AssertionError("external service must not receive stop/free"))

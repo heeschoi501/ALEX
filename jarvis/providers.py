@@ -62,12 +62,16 @@ class Message:
     # 도구 호출 루프(ADR-056)에서만 쓴다: 모델이 부른 도구(assistant), 그 결과를 돌려주는 tool 메시지의 도구 이름.
     tool_calls: list | None = None
     tool_name: str = ""
+    images: tuple[str, ...] = ()  # Local-only data URLs; binary data is never stored in chat history.
 
 
 class BaseLLMProvider(ABC):
     """Small provider contract. 모든 Provider는 이 계약만 지키면 된다."""
 
     name = "base"
+
+    def supports_images(self) -> bool:
+        return False
 
     @abstractmethod
     def generate(self, messages: Sequence[Message], **kwargs: object) -> str:
@@ -216,11 +220,20 @@ class OllamaProvider(BaseLLMProvider):
     @staticmethod
     def _wire(message: Message) -> dict:
         item = {"role": message.role, "content": message.content}
+        if message.images:
+            item["images"] = [source.split(",", 1)[1] for source in message.images]
         if message.tool_calls:
             item["tool_calls"] = message.tool_calls
         if message.tool_name:
             item["tool_name"] = message.tool_name
         return item
+
+    def supports_images(self) -> bool:
+        try:
+            info = self._post_json("/api/show", {"model": self.model})
+            return "vision" in info.get("capabilities", [])
+        except ProviderError:
+            return False
 
     def _thinking_budget(self, messages: Sequence[Message]) -> int:
         """답 자리(출력 한도의 1/3, 최소 1,024토큰)를 남기는 생각 상한. 프롬프트는 글자 2.5자를 1토큰으로 넉넉히 어림한다
@@ -591,6 +604,10 @@ class StrataProvider(OllamaProvider):
         pending: list[tuple[str, str]] = []  # (도구 이름, id) — 아직 결과가 안 온 호출
         for message in messages:
             item: dict = {"role": message.role, "content": message.content}
+            if message.images:
+                item["content"] = [{"type": "text", "text": message.content},
+                                   *({"type": "image_url", "image_url": {"url": source}}
+                                     for source in message.images)]
             if message.tool_calls:
                 calls = []
                 for index, call in enumerate(message.tool_calls):
@@ -764,6 +781,10 @@ class StrataProvider(OllamaProvider):
     def _fetch_installed_models(self) -> set[str]:
         return {self.model} if self._health() is not None else set()
 
+    def supports_images(self) -> bool:
+        health = self._health()
+        return bool(health and health.get("images"))
+
     def _fetch_loaded_models(self) -> set[str]:
         health = self._health()
         return {self.model} if health is not None and health.get("loaded") else set()
@@ -785,6 +806,7 @@ class StrataProvider(OllamaProvider):
                 response.read()
         except urllib.error.HTTPError as exc:
             if exc.code == 409:
+                exc.close()
                 raise ProviderError("Strata 가 답을 만드는 중이라 지금은 내릴 수 없습니다. 끝난 뒤 다시 시도하세요.") from exc
             raise self._strata_http_error(exc) from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:

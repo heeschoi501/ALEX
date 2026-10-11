@@ -29,16 +29,18 @@ import webbrowser
 import threading
 from typing import Any
 
-from .app import build_core, build_providers, build_summary_provider, handle_command, provider_runtime_settings, CONTEXT_CHAR_BUDGET_BY_PROFILE
+from .app import (build_core, build_providers, build_summary_provider, engine_context_limits, handle_command,
+                  provider_runtime_settings, CONTEXT_CHAR_BUDGET_BY_PROFILE)
 from .config import ConfigError, Settings, load_settings, validate, LOCAL_FIELDS, local_config_path
 from .core import JarvisCore
-from .providers import GenerationCancelled, OllamaProvider, StrataProvider
+from .providers import GenerationCancelled, MockLLMProvider, OllamaProvider, StrataProvider
 from .imagegen import ImageGenError
 from .router import Destination
 from .launcher import code_fingerprint
 from .http_control import interrupt_on_cancel
 from .imagegen import IMAGE_TYPES, MAX_UPLOAD_BYTES
 from .documents import download_path, FORMATS, MAX_DOWNLOAD
+from .vision import ImageAttachmentStore, MAX_ATTACHMENTS
 
 # 이 서버가 **불러온** 코드의 지문. 모듈을 읽는 순간에 잰다 — /health 를 받을 때 재면
 # 그 사이 디스크에서 바뀐 코드를 자기 것처럼 보고하게 된다. 런처가 이 값으로 옛 서버를 알아본다.
@@ -50,6 +52,17 @@ MAX_BODY_BYTES = 64_000
 
 STATIC = Path(__file__).with_name("static")
 PAGE = (STATIC / "index.html").read_text(encoding="utf-8")
+
+
+def _provider_backend(provider: object) -> str:
+    # Strata inherits Ollama's tool loop, but uses its own inference server.
+    if isinstance(provider, StrataProvider):
+        return "strata"
+    if isinstance(provider, OllamaProvider):
+        return "ollama"
+    if isinstance(provider, MockLLMProvider):
+        return "mock"
+    return "unknown"
 
 
 @dataclass
@@ -64,13 +77,25 @@ class WebAppState:
     cancel_event: threading.Event = field(default_factory=threading.Event)
     active_kind: str | None = None
     shutting_down: bool = False
+    inactive_providers: list[OllamaProvider] = field(default_factory=list)
+    handoff_blocked: bool = False
+    attachments: ImageAttachmentStore = field(init=False)
 
     def __post_init__(self) -> None:
+        data_dir = self.settings.data_dir if self.settings is not None else self.core.storage.db_path.parent
+        self.attachments = ImageAttachmentStore(data_dir / "attachments")
         # Web Alpha has no interactive confirmation surface. Even if the global CLI
         # setting disabled approval, entering the Web surface must restore fail-closed
         # Cloud behavior instead of silently inheriting that weaker policy.
         self.core.require_cloud_approval = True
         self.core.approval_callback = lambda _request: False
+        if self.settings is not None and self.settings.use_ollama:
+            from .model_switch import backend_available
+            other = "ollama" if self.settings.local_backend == "strata" else "strata"
+            if backend_available(replace(self.settings, local_backend=other)):
+                provider = OllamaProvider(self.settings.general_model, host=self.settings.ollama_host) if other == "ollama" else StrataProvider(self.settings.strata_model, host=self.settings.strata_host)
+                self.inactive_providers.append(provider)
+                self.core.local_engine_guard = self._check_inactive_engines
 
     def close_owned_services(self) -> dict[str, Any]:
         """Shared Ollama and pre-existing ComfyUI services remain independent."""
@@ -98,6 +123,10 @@ class WebAppState:
             "project_root": str(self.core.current_project_root() or ""),
             "profile": self.core.hardware.profile.value, "gpu": self.core.hardware.gpu,
             "models": [p.name for p in providers],
+            "backends": {
+                "general": _provider_backend(providers[0]),
+                "coder": _provider_backend(providers[1]),
+            },
             "effective_settings": {
                 "general": provider_runtime_settings(providers[0]),
                 "coder": provider_runtime_settings(providers[1]),
@@ -107,16 +136,42 @@ class WebAppState:
             "busy": self.active_id is not None, "request_id": self.active_id,
             "active_kind": self.active_kind, "shutting_down": self.shutting_down,
             "settings": {k: getattr(self.settings, k) for k in LOCAL_FIELDS} if self.settings else {},
+            # 지금 적용 중인 입력 한도와, 엔진을 고르면 바뀔 한도(설정 창에 미리 보인다)
+            "context_limits": {"chars": self.core.context_char_budget, "history": self.core.history_limit},
+            "engine_limits": {backend: dict(zip(("chars", "history"), engine_context_limits(
+                replace(self.settings, local_backend=backend), self.core.hardware.profile)[:2]))
+                for backend in ("strata", "ollama")} if self.settings else {},
         }
 
-    def model_status(self) -> dict:
+    def model_status(self, backend: str | None = None) -> dict:
         from .model_registry import get_candidates, get_ollama_storage_info, estimate_memory_fit
+        from .model_switch import stored_ollama_models
         
         p = self.core.providers[Destination.LOCAL_GENERAL]
         c = self.core.providers[Destination.LOCAL_CODER]
+        preview = backend is not None and backend != _provider_backend(p)
+        if backend is not None and backend not in {"strata", "ollama"}:
+            raise ValueError("지원하지 않는 추론 엔진입니다.")
+        if preview:
+            if self.settings is None:
+                raise ValueError("설정 변경을 지원하지 않는 실행 모드입니다.")
+            p, c, _ = build_providers(replace(self.settings, local_backend=backend), self.core.hardware)
         local = isinstance(p, OllamaProvider)
         installed = p._fetch_installed_models() if local else set()
         loaded = p._fetch_loaded_models() if local else set()
+        offline = False
+        can_start = False
+        startup_error = ""
+        if preview and isinstance(p, StrataProvider) and not installed:
+            from .model_switch import check_backend_install
+            try:
+                check_backend_install(replace(self.settings, local_backend="strata"))
+                can_start = True
+            except ValueError as exc:
+                startup_error = str(exc)
+        if preview and isinstance(p, OllamaProvider) and not isinstance(p, StrataProvider) and not installed:
+            installed = stored_ollama_models(p.host)
+            offline = bool(installed)
         candidates = get_candidates(self.core.hardware)
         
         # Only a store path confirmed by the launcher is safe to label as Ollama's.
@@ -148,45 +203,116 @@ class WebAppState:
             c._last_health_at = 0
             
         return {
+            "backend": _provider_backend(p),
             "installed": sorted(installed),
             "loaded": sorted(loaded),
             "selected_general": p.model if local else "",
             "selected_coder": c.model if isinstance(c, OllamaProvider) else "",
             "catalog": catalog,
             "storage": storage_info,
-            "mock": not local
+            "mock": not local,
+            "offline_store": offline, "preview": preview,
+            "can_start": can_start, "startup_error": startup_error,
         }
+
+    def _check_inactive_engines(self) -> None:
+        from .providers import ProviderError, loaded_local_models
+        for provider in self.inactive_providers:
+            try:
+                remaining = loaded_local_models(provider)
+            except ProviderError as exc:
+                self.handoff_blocked = True
+                raise ProviderError("이전에 사용한 엔진의 GPU 반환 상태를 확인하지 못했습니다. "
+                                    "모델 설정에서 엔진 전환을 다시 시도하세요.") from exc
+            if remaining:
+                self.handoff_blocked = True
+                raise ProviderError("다른 엔진에 모델이 올라가 있어 생성을 중단했습니다. "
+                                    "모델 설정에서 엔진 전환을 다시 시도하세요.")
 
     def save_settings(self, changes: dict) -> dict:
         if self.settings is None:
             raise ValueError("설정 변경을 지원하지 않는 실행 모드입니다.")
         allowed = {"general_model", "coder_model", "desktop_general_model", "desktop_coder_model",
                    "auto_profile_models", "single_model_on_laptop", "local_max_output_tokens",
-                   "desktop_max_output_tokens", "ollama_think", "num_ctx"}
+                   "desktop_max_output_tokens", "ollama_think", "num_ctx", "local_backend", "strata_max_output_tokens"}
         if not isinstance(changes, dict) or not changes or any(k not in allowed or type(v) is not LOCAL_FIELDS[k] for k, v in changes.items()):
             raise ValueError("지원하지 않는 설정 또는 잘못된 형식입니다.")
+        if changes.get("local_backend", self.settings.local_backend) == "strata" and any(k not in {
+                "local_max_output_tokens", "desktop_max_output_tokens", "ollama_think", "local_backend",
+                "strata_max_output_tokens"} for k in changes):
+            raise ValueError("Strata는 서버에 설정된 모델 하나를 대화·코딩에 공유합니다. "
+                             "여기서는 출력 길이와 Thinking만 변경할 수 있습니다. "
+                             "다른 모델 선택은 Ollama 모드에서 지원합니다.")
         for k in changes:
             if "JARVIS_" + k.upper() in os.environ:
                 raise ValueError(f"{k}: 환경변수로 고정되어 있습니다. 환경변수를 해제하고 재시작하세요.")
         candidate = validate(replace(self.settings, **changes))
-        general, coder, notes = build_providers(candidate, self.core.hardware)
-        for provider in {general, coder}:
-            if not provider.health_check():
-                raise ValueError(f"설치되지 않은 모델입니다: {provider.name}")
+        switching = candidate.local_backend != self.settings.local_backend or bool(self.handoff_blocked and "local_backend" in changes)
+        from .model_switch import check_backend_install, release_current, start_backend
+        from .app import effective_local_models
+        from .opencode_worker import OpenCodeWorker
+        previous = [p for p in self.core.providers.values() if isinstance(p, OllamaProvider)]
+        released = []
+        general = coder = None
+        owns_switch = False
         path = local_config_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(path.name + ".tmp")
         try:
+            if switching:
+                if self.active_id is not None:
+                    raise ValueError("작업 중에는 추론 엔진을 전환할 수 없습니다.")
+                check_backend_install(candidate)
+                self.active_id = secrets.token_hex(12)
+                self.active_kind = "model_switch"
+                owns_switch = True
+                released = release_current([*previous, *self.inactive_providers])
+                start_backend(candidate, self.core.hardware.profile, effective_local_models(candidate, self.core.hardware.profile))
+            general, coder, notes = build_providers(candidate, self.core.hardware)
+            for provider in {general, coder}:
+                if not provider.health_check():
+                    raise ValueError(f"선택한 엔진/모델을 사용할 수 없습니다: {provider.name}")
+            # OpenCode must follow the selected coding engine/model as well.
+            worker = self.core.opencode_worker
+            if worker is not None:
+                if candidate.local_backend == "ollama":
+                    candidate = replace(candidate, opencode_model=coder.model)
+                worker = OpenCodeWorker(worker.home, coder.model, context=coder.num_ctx,
+                                       timeout=candidate.opencode_timeout, host=coder.host,
+                                       backend=candidate.local_backend, command=worker.command)
             temporary.write_text(json.dumps({k: getattr(candidate, k) for k in LOCAL_FIELDS}, ensure_ascii=False, indent=2), encoding="utf-8")
             os.replace(temporary, path)
+        except Exception:
+            if switching and general is not None:
+                # Keep the old settings/providers; prevent a ready target from competing with them.
+                try:
+                    release_current([general, coder])
+                finally:
+                    targets = [p for p in (general, coder) if isinstance(p, OllamaProvider)]
+                    self.inactive_providers = list({(type(p), p.host): p for p in [*self.inactive_providers, *targets]}.values())
+                    self.handoff_blocked = True
+                    self.core.local_engine_guard = self._check_inactive_engines
+            raise
         finally:
             temporary.unlink(missing_ok=True)
+            if owns_switch:
+                self.active_id = None
+                self.active_kind = None
+        if switching:
+            self.inactive_providers = list({(type(p), p.host): p for p in [*previous, *self.inactive_providers]
+                                           if not (type(p) is type(general) and p.host == general.host)}.values())
+            self.core.local_engine_guard = self._check_inactive_engines
+            self.handoff_blocked = False
         self.settings = candidate
+        # 엔진을 바꾸면 입력 한도도 그 엔진 값으로(Strata 64K 창 ↔ Ollama 16K 기준)
+        (self.core.context_char_budget, self.core.history_limit,
+         self.core.summary_trigger_messages) = engine_context_limits(candidate, self.core.hardware.profile)
         self.core.providers[Destination.LOCAL_GENERAL] = general
         self.core.providers[Destination.LOCAL_CODER] = coder
         self.core.local_summarizer = build_summary_provider(general, candidate)
+        self.core.opencode_worker = worker
         self.core.bind_gpu_guards()
-        return {"saved": True, "notes": notes}
+        return {"saved": True, "notes": notes, "released_models": released}
 
     def register_workspace(self, path: str, confirmed: bool) -> dict:
         """Only the explicit UI endpoint can register a new root; model text cannot."""
@@ -221,7 +347,7 @@ class WebAppState:
             self.core.storage.set_state("web.current_session", self.session_id)
         return {"deleted": target, "session_id": self.session_id}
 
-    def process(self, message: str) -> dict[str, Any]:
+    def process(self, message: str, attachments: list[str] | None = None) -> dict[str, Any]:
         text = message.strip()
         if not text:
             raise ValueError("메시지가 비어 있습니다.")
@@ -230,6 +356,16 @@ class WebAppState:
 
         with self.lock:
             before_count = self.core.storage.message_count(self.session_id)
+            if attachments:
+                if text.startswith("/"):
+                    raise ValueError("이미지 첨부와 명령어는 따로 보내 주세요. 이미지에는 일반 질문을 입력해 주세요.")
+                images = [self.attachments.load(self.session_id, name) for name in attachments]
+                response, decision = self.core.handle_images(self.session_id, text, images)
+                if before_count == 0:
+                    self.core.storage.rename_session(self.session_id, text[:60])
+                self.core.storage.set_state("web.current_session", self.session_id)
+                return {"response": response, "route": decision.destination.value, "session_id": self.session_id,
+                        "attachment_error": self.core._answer_failed}
             if text.startswith("/"):
                 output, keep_running, new_session = handle_command(self.core, self.session_id, text)
                 self.session_id = new_session
@@ -280,12 +416,12 @@ def _handler_factory(state: WebAppState):
             self.end_headers()
             self.wfile.write(raw)
 
-        def _upload_image(self) -> None:
+        def _upload_image(self, *, attachment: bool = False) -> None:
             """채팅창 '그림 올리기'(ADR-074 보충) — 그림 바이트를 그대로 받는다. 토큰 필수, PNG·JPEG·WebP, 10MB 까지."""
             if not self._authorized():
                 self._json(HTTPStatus.FORBIDDEN, {"error": "invalid local token"})
                 return
-            if state.core.image_generator is None:
+            if not attachment and state.core.image_generator is None:
                 self._json(HTTPStatus.CONFLICT, {"error": "그림 그리기가 꺼져 있습니다."})
                 return
             content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
@@ -301,6 +437,9 @@ def _handler_factory(state: WebAppState):
                 self._json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "그림이 너무 큽니다(10MB 이하)."})
                 return
             data = self.rfile.read(length)
+            if len(data) != length:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": "이미지 전송이 끝나기 전에 연결이 끊겼습니다."})
+                return
             if self.headers.get("X-Jarvis-Session", state.session_id) != state.session_id:
                 self._json(HTTPStatus.CONFLICT, {"error": "다른 탭에서 대화가 바뀌었습니다. 새로고침 후 다시 올려 주세요."})
                 return
@@ -308,13 +447,25 @@ def _handler_factory(state: WebAppState):
                 self._json(HTTPStatus.CONFLICT, {"error": "응답 생성 중입니다. 완료 또는 중단 후 다시 시도하세요."})
                 return
             try:
-                reply = state.core.add_reference_picture(state.session_id, data, unquote(self.headers.get("X-File-Name", ""))[:120])
+                if self.headers.get("X-Jarvis-Session", state.session_id) != state.session_id:
+                    self._json(HTTPStatus.CONFLICT, {"error": "대화가 바뀌었습니다. 새로고침 후 다시 첨부해 주세요."})
+                    return
+                if attachment:
+                    image = state.attachments.store(state.session_id, data, content_type)
+                    reply = {"name": image.name, "width": image.width, "height": image.height,
+                             "mime": image.mime, "bytes": len(image.data)}
+                else:
+                    reply = state.core.add_reference_picture(state.session_id, data, unquote(self.headers.get("X-File-Name", ""))[:120])
             except ValueError as exc:
                 self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return
+            except OSError:
+                self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "이미지를 저장하지 못했습니다. 저장 공간을 확인해 주세요."})
+                return
             finally:
                 state.lock.release()
-            self._json(HTTPStatus.OK, {"response": reply, "session_id": state.session_id})
+            self._json(HTTPStatus.OK, {"attachment": reply, "session_id": state.session_id} if attachment else
+                       {"response": reply, "session_id": state.session_id})
 
         def _authorized(self) -> bool:
             return secrets.compare_digest(self.headers.get("X-Jarvis-Token", ""), state.token)
@@ -352,7 +503,7 @@ def _handler_factory(state: WebAppState):
                 self.end_headers()
                 self.wfile.write(body)
                 return
-            if self.path in {"/app.js", "/style.css"}:
+            if self.path in {"/app.js", "/style.css", "/markdown.js"}:
                 body = (STATIC / self.path[1:]).read_bytes()
                 self.send_response(HTTPStatus.OK)
                 self._security_headers("text/javascript; charset=utf-8" if self.path.endswith(".js") else "text/css; charset=utf-8")
@@ -363,8 +514,12 @@ def _handler_factory(state: WebAppState):
             if self.path.startswith("/api/") and not self._authorized():
                 self._json(HTTPStatus.FORBIDDEN, {"error": "invalid local token"})
                 return
-            if self.path == "/api/models":
-                self._json(HTTPStatus.OK, state.model_status())
+            if urlparse(self.path).path == "/api/models":
+                try:
+                    backend = parse_qs(urlparse(self.path).query).get("backend", [None])[0]
+                    self._json(HTTPStatus.OK, state.model_status(backend))
+                except ValueError as exc:
+                    self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return
             if self.path.startswith("/api/document?"):
                 name = parse_qs(urlparse(self.path).query).get("name", [""])[0]
@@ -403,6 +558,26 @@ def _handler_factory(state: WebAppState):
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            if self.path.startswith("/api/attachment?"):
+                if not self._authorized():
+                    self._json(HTTPStatus.FORBIDDEN, {"error": "invalid local token"})
+                    return
+                query = parse_qs(urlparse(self.path).query)
+                sid = query.get("session_id", [state.session_id])[0]
+                if sid != state.session_id:
+                    self._json(HTTPStatus.CONFLICT, {"error": "대화가 바뀌었습니다. 새로고침해 주세요."})
+                    return
+                try:
+                    image = state.attachments.load(sid, query.get("name", [""])[0])
+                except (ValueError, OSError):
+                    self._json(HTTPStatus.NOT_FOUND, {"error": "첨부 이미지를 찾을 수 없습니다."})
+                    return
+                self.send_response(HTTPStatus.OK)
+                self._security_headers(image.mime)
+                self.send_header("Content-Length", str(len(image.data)))
+                self.end_headers()
+                self.wfile.write(image.data)
+                return
             if self.path.startswith("/api/image?"):
                 # ADR-073: 앱이 그린 PNG 만 내준다 — 이름 모양을 확인하고 data/images 바로 아래에서만 찾는다.
                 generator = state.core.image_generator
@@ -435,7 +610,7 @@ def _handler_factory(state: WebAppState):
                 return
             self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
-        def _stream(self, message: str) -> None:
+        def _stream(self, message: str, attachments: list[str] | None = None) -> None:
             state.active_id = secrets.token_hex(12)
             state.active_kind = "chat"
             state.cancel_event.clear()
@@ -470,7 +645,7 @@ def _handler_factory(state: WebAppState):
                 for p in local:
                     p.cancel_event = state.cancel_event
                     p.last_metrics = {}
-                result = state.process(message)
+                result = state.process(message, attachments)
                 metrics = next((p.last_metrics for p in local if p.last_metrics), {})
                 emit({"type": "done", **result, "metrics": metrics, "elapsed": round(time.monotonic() - started, 2)})
             except GenerationCancelled:
@@ -490,6 +665,9 @@ def _handler_factory(state: WebAppState):
                 return
             if self.path == "/api/image/upload":
                 self._upload_image()
+                return
+            if self.path == "/api/attachment/upload":
+                self._upload_image(attachment=True)
                 return
             if self.path not in {"/api/chat", "/api/chat/stream", "/api/cancel", "/api/settings", "/api/workspace", "/api/shutdown", "/api/pull", "/api/session/delete"}:
                 self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
@@ -613,10 +791,19 @@ def _handler_factory(state: WebAppState):
                     message = body.get("message")
                     if not isinstance(message, str) or not message.strip() or len(message) > 32000:
                         raise ValueError("메시지는 1~32000자 문자열이어야 합니다.")
+                    attachments = body.get("attachments", [])
+                    if (not isinstance(attachments, list) or len(attachments) > MAX_ATTACHMENTS
+                            or any(not isinstance(name, str) for name in attachments)
+                            or len(set(attachments)) != len(attachments)):
+                        raise ValueError("이미지는 한 번에 최대 3개까지 첨부할 수 있습니다.")
+                    if attachments and message.strip().startswith("/"):
+                        raise ValueError("이미지 첨부에는 일반 질문을 입력해 주세요. 명령어는 따로 보내 주세요.")
+                    for name in attachments:
+                        state.attachments.load(state.session_id, name)  # Validate ownership before opening a stream.
                     if self.path == "/api/chat/stream":
-                        self._stream(message)
+                        self._stream(message, attachments)
                         return
-                    result = state.process(message)
+                    result = state.process(message, attachments)
                 finally:
                     state.lock.release()
                 message = body.get("message")

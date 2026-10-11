@@ -2,6 +2,8 @@
 const $ = id => document.getElementById(id);
 const token = document.querySelector('meta[name="jarvis-token"]').content;
 let state = null, busy = false, requestId = null, pullRequestId = null, oldest = null;
+let settingsModelsRequest = 0;
+let pendingAttachments = [];
 const headers = {'Content-Type': 'application/json', 'X-Jarvis-Token': token};
 const notice = text => { $('notice').textContent = text; };
 
@@ -24,6 +26,7 @@ function showTokenExpired() {
   $('send').disabled = true;
   $('input').disabled = true;
   $('media-prompt-open').disabled = true;
+  $('screenshot').disabled = true;
 }
 
 async function api(path, body) {
@@ -40,6 +43,18 @@ function node(tag, cls, text) {
   if (cls) el.className = cls;
   if (text !== undefined) el.textContent = text;
   return el;
+}
+function backendLabel(backend) {
+  return {strata: 'Strata', ollama: 'Ollama', mock: '데모'}[backend] || '추론 엔진 확인 필요';
+}
+function liveBackend(snapshot, kind = 'general') {
+  if (snapshot?.backends?.[kind]) return snapshot.backends[kind];
+  // A busy server may still run the previous API until its next safe restart.
+  // Use its live provider name, never the unapplied settings file.
+  const name = snapshot?.models?.[kind === 'coder' ? 1 : 0] || '';
+  if (name.startsWith('strata:')) return 'strata';
+  if (name.startsWith('ollama:')) return 'ollama';
+  return snapshot?.mock ? 'mock' : 'unknown';
 }
 function scrollBottom() { const el = $('chat-scroll'); el.scrollTop = el.scrollHeight; }
 // 주소를 링크로 (2026-09-25: 검색 답의 출처가 글자로만 나와서 누를 수 없었다).
@@ -89,12 +104,14 @@ function appendLinked(el, text) {
 // 앱이 그린 그림(ADR-073): "![설명](alex-image:20261003-112233-42.png)" 한 줄. 이름 모양을 확인하고,
 // 토큰을 붙여 받아 blob 주소로만 보인다(CSP img-src blob:) — 다른 주소의 그림은 그리지 않는다.
 const IMAGE_LINE = /^!\[([^\]\n]{0,200})\]\(alex-image:(\d{8}-\d{6}-\d{1,20}\.(?:png|jpg|webp))\)$/;
-function imageFigure(caption, name) {
+const ATTACHMENT_LINE = /^!\[([^\]\n]{0,120})\]\(alex-attachment:([a-f0-9]{24}\.(?:png|jpg|webp))\)$/;
+function imageFigure(caption, name, attachment = false) {
   const figure = node('figure', 'gen-image');
   const img = node('img'); img.alt = caption; img.title = '클릭하면 새 탭에서 크게 봅니다';
   const cap = node('figcaption', '', caption);
   figure.append(img, cap);
-  fetch('/api/image?name=' + encodeURIComponent(name), {headers})
+  const path = attachment ? '/api/attachment?name=' + encodeURIComponent(name) + '&session_id=' + encodeURIComponent(state.session_id) : '/api/image?name=' + encodeURIComponent(name);
+  fetch(path, {headers})
     .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.blob(); })
     .then(blob => { const url = URL.createObjectURL(blob); img.src = url; img.addEventListener('click', () => window.open(url, '_blank', 'noopener')); })
     .catch(e => { cap.textContent = `${caption} — 그림을 불러오지 못했습니다(${e.message})`; });
@@ -135,13 +152,27 @@ function appendWithImages(el, text) {
   let buffer = [];
   const flush = () => { if (buffer.length) { appendLinked(el, buffer.join('\n')); buffer = []; } };
   for (const line of text.split('\n')) {
-    const m = line.match(IMAGE_LINE), v = line.match(VIDEO_LINE), d = line.match(DOCUMENT_LINE);
-    if (m) { flush(); el.append(imageFigure(m[1], m[2])); } else if (v) { flush(); el.append(videoFigure(v[1], v[2])); } else if (d) { flush(); el.append(documentDownload(d[1])); } else buffer.push(line);
+    const m = line.match(IMAGE_LINE), a = line.match(ATTACHMENT_LINE), v = line.match(VIDEO_LINE), d = line.match(DOCUMENT_LINE);
+    if (m) { flush(); el.append(imageFigure(m[1], m[2])); } else if (a) { flush(); el.append(imageFigure(a[1], a[2], true)); } else if (v) { flush(); el.append(videoFigure(v[1], v[2])); } else if (d) { flush(); el.append(documentDownload(d[1])); } else buffer.push(line);
   }
   flush();
 }
-function renderContent(el, text) {
+function mediaLine(line) {
+  const m = line.match(IMAGE_LINE), a = line.match(ATTACHMENT_LINE), v = line.match(VIDEO_LINE), d = line.match(DOCUMENT_LINE);
+  if (m) return imageFigure(m[1], m[2]);
+  if (a) return imageFigure(a[1], a[2], true);
+  if (v) return videoFigure(v[1], v[2]);
+  if (d) return documentDownload(d[1]);
+  return null;
+}
+function renderContent(el, text, markdown = false) {
   el.replaceChildren();
+  // ALEX 답은 굵게·목록·표·코드 블록을 꾸며 보인다(markdown.js — HTML 은 실행하지 않고 글자로만 그린다).
+  if (markdown && window.AlexMarkdown) {
+    el.classList.add('markdown');
+    try { window.AlexMarkdown.render(el, text, mediaLine); return; } catch { el.replaceChildren(); }
+  }
+  el.classList.remove('markdown');
   // Deliberately small formatter: no HTML evaluation or external markdown scripts.
   const chunks = text.split(/(```[^\n]*\n[\s\S]*?```)/g);
   for (const chunk of chunks) {
@@ -188,7 +219,7 @@ function message(role, text, parent = $('messages')) {
   label.append(copy); el.append(label, content); parent.append(el);
   const result = {el, content, update(t, formatted = false) {
     value = t;
-    if (formatted) renderContent(content, t); else content.textContent = t;
+    if (formatted) renderContent(content, t, role === 'assistant'); else content.textContent = t;
     el.querySelector('.learned-actions')?.remove();
     if (formatted && role === 'assistant') {
       const ids = [...t.matchAll(/^— (?:바로잡아 주신 내용을|찾은 내용을) 배웠습니다\(([0-9a-f]{8})/gm)]
@@ -219,6 +250,8 @@ function lock(value) {
   $('input').disabled = tokenExpired || appStopped;
   $('new-chat').disabled = value;
   $('attach').disabled = value || tokenExpired || appStopped;
+  $('screenshot').disabled = value || tokenExpired || appStopped;
+  $('attachments').querySelectorAll('button').forEach(button => { button.disabled = value || tokenExpired || appStopped; });
   $('media-prompt-open').disabled = value || tokenExpired || appStopped;
   $('settings-open').disabled = value;
   $('stop').hidden = !value;
@@ -227,6 +260,7 @@ function lock(value) {
   document.querySelectorAll('#sessions button, #task-form button, #memory-form button, #file-form button, [data-command], #tasks input, #memories button').forEach(b => { b.disabled = value; });
 }
 function paintState(s, history = false) {
+  if (state && state.session_id !== s.session_id) clearAttachments();
   state = s;
   const current = s.sessions.find(x => x.session_id === s.session_id);
   $('title').textContent = current?.title || '새 대화';
@@ -244,8 +278,11 @@ function paintState(s, history = false) {
     row.append(b, remove);
     $('sessions').append(row);
   }
-  $('model-label').textContent = (s.mock ? 'DEMO · 실제 AI 아님 · ' : '') + s.models[0].replace(/^ollama:/, '');
+  filterSessions();
+  $('model-label').textContent = (s.mock ? 'DEMO · 실제 AI 아님 · ' : backendLabel(liveBackend(s)) + ' · ') + s.models[0].replace(/^(ollama|strata):/, '');
+  $('badge-model').textContent = s.mock ? '데모' : s.models[0].replace(/^(ollama|strata):/, '');
   $('hardware').textContent = `${s.profile} · ${s.gpu || 'GPU 미확인'}`;
+  $('memory-count').textContent = Object.keys(s.memories || {}).length;
   $('project-root').textContent = s.project_root;
   $('task-count').textContent = s.tasks.filter(t => t.status === 'open').length;
   $('tasks').replaceChildren();
@@ -294,16 +331,23 @@ async function models() {
     // Using x.selected_general instead of x.ready to just check if something is selected and installed
     let isReady = x.selected_general && x.installed.includes(x.selected_general);
     $('connection').classList.toggle('offline', !isReady);
-    $('connection-text').textContent = x.mock ? '데모 모드입니다. start_web.bat으로 실제 모델을 실행하세요.' : isReady ? '선택한 로컬 모델이 설치되어 있습니다' : '모델 연결 안 됨 · setup_local.bat으로 모델을 준비한 뒤 다시 확인하세요.';
+    const engine = backendLabel(x.backend || liveBackend(state));
+    $('connection-text').textContent = x.mock ? '데모 모드입니다. start_web.bat으로 실제 모델을 실행하세요.' : isReady ? `${engine} 사용 중 · ${x.selected_general}` : `${engine} 연결 확인 필요 · 모델 서버를 준비한 뒤 다시 확인하세요.`;
     return x.installed;
   } catch (e) { $('connection-text').textContent = e.message; return []; }
 }
 async function submit(text = $('input').value.trim()) {
-  if (busy || !text.trim() || !state) return;
-  if (new TextEncoder().encode(JSON.stringify({message: text, session_id: state.session_id})).length > 64000) { notice('요청이 너무 큽니다. 64KB 이하로 줄여 주세요.'); return; }
+  if (busy || !state) return;
+  const selected = text.trim().startsWith('/') ? [] : pendingAttachments.slice();
+  if (!text.trim() && selected.length) text = '첨부한 이미지의 내용을 설명해 주세요.';
+  if (!text.trim()) return;
+  const body = {message: text, session_id: state.session_id, attachments: selected.map(image => image.name)};
+  if (new TextEncoder().encode(JSON.stringify(body)).length > 64000) { notice('요청이 너무 큽니다. 64KB 이하로 줄여 주세요.'); return; }
   const oldSession = state.session_id;
   lock(true); notice(''); $('input').value = ''; $('welcome').hidden = true;
-  message('user', text);
+  const displayed = text + (selected.length ? '\n' + selected.map(image => `![첨부 이미지 ${image.width}×${image.height}](alex-attachment:${image.name})`).join('\n') : '');
+  message('user', displayed);
+  clearAttachments(new Set(selected.map(image => image.name)));
   const answer = message('assistant', '모델이 생각하고 있습니다…');
   const imageCommand = text.match(/^\/(?:image-prompt|image)\s+([\s\S]+)/);
   const requestedImage = imageCommand ? imageCommand[1].trim() : text;
@@ -315,7 +359,7 @@ async function submit(text = $('input').value.trim()) {
   let partial = '', finished = false;
   scrollBottom();
   try {
-    const r = await fetch('/api/chat/stream', {method: 'POST', headers, body: JSON.stringify({message: text, session_id: oldSession})});
+    const r = await fetch('/api/chat/stream', {method: 'POST', headers, body: JSON.stringify(body)});
     if (r.status === 403) { showTokenExpired(); throw new Error('연결이 만료되었습니다.'); }
     if (!r.ok) { const x = await r.json(); throw new Error(x.error || `HTTP ${r.status}`); }
     const reader = r.body.getReader(), decoder = new TextDecoder();
@@ -384,9 +428,81 @@ $('media-prompt-form').addEventListener('submit', e => {
   if (busy || tokenExpired || !state) return;
   const prompt = $('media-prompt-text').value.trim();
   if (!prompt) return;
-  const command = $('media-prompt-kind').value === 'video' ? '/video-prompt' : '/image-prompt';
+  const video = $('media-prompt-kind').value === 'video', model = $(video ? 'media-prompt-video-model' : 'media-prompt-model').value;
   mediaPromptDialog.close();
-  submit(`${command} ${prompt}`);
+  submit(`${video ? '/video-prompt' : '/image-prompt'}${model ? ' --model=' + model : ''} ${prompt}`);
+});
+$('media-prompt-kind').addEventListener('change', () => {
+  const video = $('media-prompt-kind').value === 'video';
+  $('media-prompt-model-row').hidden = video;
+  $('media-prompt-video-model-row').hidden = !video;
+});
+function renderAttachments() {
+  const list = $('attachments');
+  list.replaceChildren();
+  list.hidden = !pendingAttachments.length;
+  for (const image of pendingAttachments) {
+    const card = node('div', 'attachment-preview');
+    const preview = document.createElement('img');
+    preview.src = image.url; preview.alt = image.filename || '첨부 스크린샷';
+    const remove = node('button', 'text-button', '✕');
+    remove.type = 'button'; remove.title = '첨부 취소';
+    remove.disabled = busy || tokenExpired || appStopped;
+    remove.addEventListener('click', () => { if (!busy) clearAttachments(new Set([image.name])); });
+    card.append(preview, node('span', '', `${image.width}×${image.height}`), remove);
+    list.append(card);
+  }
+}
+function clearAttachments(names = null) {
+  pendingAttachments = pendingAttachments.filter(image => {
+    if (names && !names.has(image.name)) return true;
+    URL.revokeObjectURL(image.url);
+    return false;
+  });
+  renderAttachments();
+}
+async function attachScreenshots(files) {
+  if (busy || tokenExpired || appStopped || !state) return;
+  const selected = Array.from(files);
+  if (!selected.length) return;
+  if (pendingAttachments.length + selected.length > 3) { notice('이미지는 한 번에 최대 3개까지 첨부할 수 있습니다.'); return; }
+  if (selected.some(file => file.size > 10000000)) { notice('이미지는 파일당 10MB 이하로 보내 주세요.'); return; }
+  const sessionId = state.session_id;
+  lock(true);
+  notice('이미지를 첨부하고 있습니다…');
+  try {
+    for (const file of selected) {
+      const mime = file.type || ({png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp'}[file.name.split('.').pop().toLowerCase()]);
+      if (!['image/png', 'image/jpeg', 'image/webp'].includes(mime)) throw new Error('PNG·JPEG·WebP 이미지만 첨부할 수 있습니다.');
+      const response = await fetch('/api/attachment/upload', {method: 'POST', body: file,
+        headers: {'X-Jarvis-Token': token, 'X-Jarvis-Session': sessionId, 'Content-Type': mime}});
+      if (response.status === 403) { showTokenExpired(); throw new Error('연결이 만료되었습니다.'); }
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+      if (state.session_id !== sessionId) throw new Error('대화가 바뀌었습니다. 다시 첨부해 주세요.');
+      pendingAttachments.push({...result.attachment, filename: file.name, url: URL.createObjectURL(file)});
+    }
+    notice('이미지를 첨부했습니다. 질문을 입력하고 전송하세요.');
+  } catch (error) { notice('이미지 첨부: ' + error.message); }
+  finally { lock(false); renderAttachments(); $('input').focus(); }
+}
+$('screenshot').addEventListener('click', () => { if (!busy) $('screenshot-file').click(); });
+$('screenshot-file').addEventListener('change', event => {
+  const files = Array.from(event.target.files); event.target.value = '';
+  attachScreenshots(files);
+});
+$('input').addEventListener('paste', event => {
+  const files = Array.from(event.clipboardData?.items || []).filter(item => item.kind === 'file' && item.type.startsWith('image/')).map(item => item.getAsFile()).filter(Boolean);
+  if (files.length) { event.preventDefault(); attachScreenshots(files); }
+});
+const composer = document.querySelector('.composer');
+composer.addEventListener('dragover', event => {
+  if (Array.from(event.dataTransfer?.types || []).includes('Files')) { event.preventDefault(); composer.classList.add('drag-over'); }
+});
+composer.addEventListener('dragleave', () => composer.classList.remove('drag-over'));
+composer.addEventListener('drop', event => {
+  composer.classList.remove('drag-over');
+  if (event.dataTransfer?.files.length) { event.preventDefault(); attachScreenshots(event.dataTransfer.files); }
 });
 // 참고 그림 올리기(ADR-074 보충): 그림 바이트를 토큰과 함께 보내고, 받은 답이 들어간 대화를 다시 그린다.
 $('attach').addEventListener('click', () => { if (!busy) $('attach-file').click(); });
@@ -432,35 +548,61 @@ $('older').addEventListener('click', async () => {
     $('messages').prepend(fragment); oldest = page.messages[0]?.id; button.hidden = !page.has_more;
   } catch (e) { notice(e.message); } finally { button.disabled = appStopped || busy; }
 });
+async function populateSettingsModels() {
+  const request = ++settingsModelsRequest, backend = $('model-backend').value;
+  $('settings-save').disabled = true;
+  $('settings-error').textContent = '모델 목록을 확인하는 중입니다…';
+  let data;
+  try { data = await api('/api/models?backend=' + encodeURIComponent(backend)); }
+  catch (e) { if (request === settingsModelsRequest) $('settings-error').textContent = e.message; return; }
+  if (request !== settingsModelsRequest) return;
+  const installed = data.installed, s = state.settings, strata = backend === 'strata';
+  $('settings-error').textContent = '';
+  $('settings-model-note').textContent = strata
+    ? (data.can_start ? '설치된 Strata 서버가 꺼져 있습니다. 설정 저장을 누르면 시작합니다. 첫 모델 적재는 1~3분 걸릴 수 있습니다. ' : '') + 'Strata 서버의 모델 하나를 대화·코딩에 공유합니다. 다른 모델을 쓰려면 위에서 Ollama를 선택하세요. 엔진은 설정 저장 시 전환합니다.'
+    : (data.offline_store ? '저장된 Ollama 모델입니다. 설정 저장 시 Ollama 서버를 준비합니다. ' : '') + '대화·코딩 모델을 선택하세요. 엔진 전환 전에 기존 모델의 GPU 반환을 확인합니다.';
+  for (const [id, key] of [['general-model', s.auto_profile_models && state.profile === 'DESKTOP' ? 'desktop_general_model' : 'general_model'], ['coder-model', s.auto_profile_models && state.profile === 'DESKTOP' ? 'desktop_coder_model' : 'coder_model']]) {
+    let selected = strata ? data.selected_general || s.strata_model : s[key];
+    if (!strata && backend !== liveBackend(state) && !installed.includes(selected)) {
+      const saved = s[id === 'general-model' ? 'general_model' : 'coder_model'];
+      selected = installed.includes(saved) ? saved : '';
+    }
+    $(id).replaceChildren();
+    if (!selected) { const o = node('option', '', '모델을 선택하세요'); o.value = ''; $(id).append(o); }
+    for (const name of installed) { const o = node('option', '', name); o.value = name; $(id).append(o); }
+    // Preserve an unavailable configured model; opening settings must not replace it.
+    if (selected && !installed.includes(selected)) {
+      const o = node('option', '', selected + (data.can_start ? ' (서버 시작 후 확인)' : ' (서버 확인 필요)'));
+      o.value = selected; $(id).append(o);
+    }
+    $(id).value = selected || '';
+    $(id).disabled = strata || appStopped;
+  }
+  $('single-model').checked = strata || s.single_model_on_laptop;
+  $('single-model').disabled = strata || state.profile === 'DESKTOP';
+  updateSharedModel();
+  $('settings-save').disabled = appStopped || (installed.length === 0 && !data.can_start);
+  if (!installed.length && !data.can_start) $('settings-error').textContent = strata
+    ? data.startup_error || 'Strata 서버에 연결하지 못했습니다. ALEX를 다시 실행한 뒤 확인하세요.'
+    : '사용 가능한 모델이 없습니다. setup_local.bat으로 Ollama와 모델을 먼저 준비하세요.';
+}
+$('model-backend').addEventListener('change', populateSettingsModels);
 $('settings-open').addEventListener('click', async () => {
   if (!state || busy) return;
   $('settings-error').textContent = ''; $('settings-dialog').showModal();
   $('settings-save').disabled = true;
   try { await refresh(); } catch (e) { $('settings-error').textContent = e.message; return; }
-  const installed = await models(), s = state.settings;
-  for (const [id, key] of [['general-model', s.auto_profile_models && state.profile === 'DESKTOP' ? 'desktop_general_model' : 'general_model'], ['coder-model', s.auto_profile_models && state.profile === 'DESKTOP' ? 'desktop_coder_model' : 'coder_model']]) {
-    $(id).replaceChildren();
-    for (const name of installed) { const o = node('option', '', name); o.value = name; $(id).append(o); }
-    // Preserve an unavailable configured model; opening settings must not replace it.
-    if (s[key] && !installed.includes(s[key])) {
-      const o = node('option', '', s[key] + ' (설치 확인 필요)');
-      o.value = s[key]; $(id).append(o);
-    }
-    $(id).value = s[key] || '';
-  }
-  $('single-model').checked = s.single_model_on_laptop;
-  $('single-model').disabled = state.profile === 'DESKTOP';
+  const s = state.settings;
+  $('model-backend').value = liveBackend(state) === 'strata' ? 'strata' : 'ollama';
   // 설정 파일의 값이 목록에 없으면 select 가 조용히 비고, 저장하면 Number('') = 0 이 들어간다.
   // 실측으로 정한 6144 가 목록(4096까지)에 없어서 실제로 그 상태가 나왔다. 없으면 만들어 넣는다.
-  const desktop = state.profile === 'DESKTOP';
-  setOutputLimit((desktop && s.desktop_max_output_tokens) || s.local_max_output_tokens || 1024);
-  $('output-scope').textContent = desktop ? '이 데스크톱의 출력 길이를 설정합니다.' : '노트북에서 사용할 출력 길이를 설정합니다.';
+  syncEngineLimits();
   $('think').checked = s.ollama_think;
-  updateSharedModel();
   const effective = state.effective_settings;
   $('effective-settings').textContent = effective ? [
-    '현재 대화 모델: ' + effective.general.model,
-    '현재 코딩 모델: ' + effective.coder.model + (effective.shared ? ' (대화 모델 공유)' : ''),
+    '현재 대화 모델: ' + backendLabel(liveBackend(state)) + ' · ' + effective.general.model,
+    '현재 코딩 모델: ' + backendLabel(liveBackend(state, 'coder')) + ' · ' + effective.coder.model + (effective.shared ? ' (대화 모델 공유)' : ''),
+    ...(state.context_limits ? [`입력 한도: ${state.context_limits.chars.toLocaleString()}자 · 최근 대화 ${state.context_limits.history}개`] : []),
     ...['general', 'coder'].filter(k => k === 'general' || !effective.shared).flatMap(k => {
       const p = effective[k];
       return p.num_predict === undefined ? [] : [
@@ -468,13 +610,24 @@ $('settings-open').addEventListener('click', async () => {
       ];
     }),
   ].join('\n') : '실제 적용 설정은 앱을 다시 시작한 뒤 확인할 수 있습니다.';
-  $('settings-save').disabled = appStopped || installed.length === 0;
-  if (!installed.length) $('settings-error').textContent = '사용 가능한 모델이 없습니다. setup_local.bat을 실행하세요.';
+  await populateSettingsModels();
 });
+// 엔진을 고르면 그 엔진의 출력 길이와 입력 한도를 보여 준다(2026-10-11 "선택에 따라서 자동으로 설정을 바뀌게끔").
+// Ollama 는 8192 토큰까지(16K 문맥 기준), Strata 는 문맥 창의 절반까지.
+function syncEngineLimits() {
+  const s = state.settings, strata = $('model-backend').value === 'strata', desktop = state.profile === 'DESKTOP';
+  for (const o of $('output-limit').options) o.disabled = strata ? Number(o.value) > (s.strata_num_ctx || 65536) / 2 : Number(o.value) > 8192;
+  setOutputLimit(strata ? s.strata_max_output_tokens || 16384 : (desktop && s.desktop_max_output_tokens) || s.local_max_output_tokens || 1024);
+  const limits = (state.engine_limits || {})[strata ? 'strata' : 'ollama'];
+  $('output-scope').textContent = (strata ? `Strata(문맥 ${Math.round((s.strata_num_ctx || 65536) / 1024)}K)` : desktop ? 'Ollama · 이 데스크톱' : 'Ollama · 노트북')
+    + '의 출력 길이입니다.' + (limits ? ` 이 엔진을 고르면 입력 ${limits.chars.toLocaleString()}자, 최근 대화 ${limits.history}개로 자동으로 맞춥니다.` : '');
+}
+$('model-backend').addEventListener('change', syncEngineLimits);
 function updateSharedModel() {
+  const strata = $('model-backend').value === 'strata';
   const shared = state.profile !== 'DESKTOP' && $('single-model').checked;
-  $('coder-model').disabled = shared || appStopped;
-  $('coder-model-note').textContent = shared ? '일반 대화 모델을 코딩에도 사용합니다. 별도 코딩 모델 선택은 적용되지 않습니다.' : '코딩 요청에 사용할 모델을 선택하세요.';
+  $('coder-model').disabled = strata || shared || appStopped;
+  $('coder-model-note').textContent = strata ? 'Strata 모델을 대화·코딩에 함께 사용합니다.' : shared ? '일반 대화 모델을 코딩에도 사용합니다. 별도 코딩 모델 선택은 적용되지 않습니다.' : '코딩 요청과 OpenCode 작업에 사용할 모델을 선택하세요.';
 }
 $('single-model').addEventListener('change', updateSharedModel);
 function setOutputLimit(value) {
@@ -492,21 +645,40 @@ $('settings-form').addEventListener('submit', async e => {
   e.preventDefault(); $('settings-save').disabled = true;
   const desktop = state.profile === 'DESKTOP';
   const profileModels = desktop && state.settings.auto_profile_models;
-  const outputKey = desktop ? 'desktop_max_output_tokens' : 'local_max_output_tokens';
+  const outputKey = $('model-backend').value === 'strata' ? 'strata_max_output_tokens' : desktop ? 'desktop_max_output_tokens' : 'local_max_output_tokens';
   const changes = {
-    [profileModels ? 'desktop_general_model' : 'general_model']: $('general-model').value,
+    local_backend: $('model-backend').value,
     [outputKey]: Number($('output-limit').value),
     ollama_think: $('think').checked,
   };
-  if (!desktop) changes.single_model_on_laptop = $('single-model').checked;
-  if (!$('coder-model').disabled) changes[profileModels ? 'desktop_coder_model' : 'coder_model'] = $('coder-model').value;
+  if (changes.local_backend !== 'strata') {
+    changes[profileModels ? 'desktop_general_model' : 'general_model'] = $('general-model').value;
+    if (!desktop) changes.single_model_on_laptop = $('single-model').checked;
+    if (!$('coder-model').disabled) changes[profileModels ? 'desktop_coder_model' : 'coder_model'] = $('coder-model').value;
+  }
+  lock(true); $('model-backend').disabled = true; $('settings-close').disabled = true;
+  $('settings-error').textContent = changes.local_backend !== liveBackend(state) ? '이전 모델의 GPU 반환을 확인하고 엔진을 준비하는 중입니다. Strata 첫 실행은 1~3분 걸릴 수 있습니다.' : '설정을 저장하는 중입니다…';
   try { await api('/api/settings', {session_id: state.session_id, settings: changes}); await refresh(); await models(); $('settings-dialog').close(); notice('모델 설정을 저장했습니다. 다음 메시지부터 적용됩니다.'); }
-  catch (e) { $('settings-error').textContent = e.message; } finally { $('settings-save').disabled = appStopped; }
+  catch (e) { $('settings-error').textContent = e.message; }
+  finally { lock(false); $('settings-save').disabled = appStopped; $('model-backend').disabled = appStopped; $('settings-close').disabled = appStopped; }
 });
 (async () => { try { await refresh(true); await models(); if (state.busy) notice('다른 요청이 처리 중입니다. 완료 후 새로고침하세요.'); } catch (e) { notice('서버에 연결하지 못했습니다: ' + e.message); } })();
 
-$('context-toggle').addEventListener('click', () => document.querySelector('.context-panel').classList.toggle('open'));
-$('context-close').addEventListener('click', () => document.querySelector('.context-panel').classList.remove('open'));
+function setContextPanel(open) {
+  document.querySelector('.context-panel').classList.toggle('open', open);
+  $('context-toggle').setAttribute('aria-expanded', String(open));
+  $('context-toggle').classList.toggle('active', open);
+}
+$('context-toggle').addEventListener('click', () => setContextPanel(!document.querySelector('.context-panel').classList.contains('open')));
+$('context-close').addEventListener('click', () => setContextPanel(false));
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && document.querySelector('.context-panel.open') && !document.querySelector('dialog[open]')) setContextPanel(false); });
+function filterSessions() {
+  const query = $('session-search').value.trim().toLowerCase();
+  for (const row of $('sessions').children) row.hidden = !!query && !row.textContent.toLowerCase().includes(query);
+}
+$('session-search').addEventListener('input', filterSessions);
+// 설정 창 안의 명령(문서 저장·백업·모델 내리기)은 창을 닫고 대화에서 실행한다.
+document.querySelectorAll('#settings-dialog [data-command]').forEach(b => b.addEventListener('click', () => $('settings-dialog').close()));
 $('sessions-toggle').addEventListener('click', () => document.querySelector('.sidebar').classList.toggle('open'));
 $('sessions').addEventListener('click', () => document.querySelector('.sidebar').classList.remove('open'));
 $('workspace-change').addEventListener('click', () => { if (busy) return; $('workspace-path').value = state.project_root; $('workspace-error').textContent = ''; $('workspace-dialog').showModal(); });
@@ -546,12 +718,13 @@ $('shutdown').addEventListener('click', async () => {
     if (!accepted) {
       lock(false);
       $('shutdown').disabled = false;
-      $('shutdown').textContent = 'ALEX 종료';
+      $('shutdown').textContent = '⏻';
     }
   }
 });
 
 $('catalog-open').addEventListener('click', async () => {
+  if ($('settings-dialog').open) $('settings-dialog').close();
   if (!state || busy) return;
   $('catalog-dialog').showModal();
   try {
@@ -567,12 +740,13 @@ $('catalog-close').addEventListener('click', () => {
 });
 
 function renderCatalog(data) {
+  const canDownload = data.backend === 'ollama';
   const st = data.storage;
   let stText = '저장 공간 확인 불가';
   if (st && st.free_gb !== null) {
     stText = `Ollama 저장 경로: ${st.path} (여유 공간: ${st.free_gb} GB)`;
   }
-  $('catalog-storage').textContent = stText;
+  $('catalog-storage').textContent = canDownload ? stText : '이 카탈로그는 Ollama용 모델 목록입니다. 현재 ' + backendLabel(data.backend) + ' 모드에서는 다운로드·모델 전환을 지원하지 않습니다.';
   
   const list = $('catalog-list');
   list.replaceChildren();
@@ -614,6 +788,7 @@ function renderCatalog(data) {
     const actions = node('div');
     if (!isInstalled) {
         const btn = node('button', 'primary', '다운로드');
+        btn.disabled = !canDownload;
         let downloading = false;
         btn.addEventListener('click', async () => {
             if (downloading) {

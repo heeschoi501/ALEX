@@ -9,7 +9,7 @@ from unittest.mock import patch
 from jarvis.app import build_providers
 from jarvis.config import Settings, load_settings
 from jarvis.hardware import PerformanceProfile
-from jarvis.providers import OllamaProvider
+from jarvis.providers import OllamaProvider, StrataProvider
 from jarvis.router import Destination
 from test_web import make_state
 
@@ -121,6 +121,37 @@ class RuntimeSettingsTests(unittest.TestCase):
         self.assertIn("coder_runtime: think=True", out)
         self.assertIn("timeout=456", out)
         self.assertFalse(self.state.snapshot()["effective_settings"]["shared"])
+
+    def test_strata_rejects_ollama_model_settings_without_writing(self):
+        with patch.object(StrataProvider, "health_check", return_value=True):
+            self.configure(PerformanceProfile.DESKTOP, local_backend="strata", num_ctx=16384)
+            original = self.state.core.providers[Destination.LOCAL_GENERAL]
+            for changes in ({"general_model": "other:7b"}, {"coder_model": "other:7b"},
+                            {"desktop_general_model": "other:7b"}, {"desktop_coder_model": "other:7b"},
+                            {"auto_profile_models": False}, {"single_model_on_laptop": False},
+                            {"num_ctx": 8192}):
+                with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, "Strata"):
+                    self.state.save_settings(changes)
+                self.assertIs(self.state.core.providers[Destination.LOCAL_GENERAL], original)
+                self.assertFalse(self.config.exists())
+
+    def test_strata_save_changes_live_output_and_thinking_only(self):
+        with patch.object(StrataProvider, "health_check", return_value=True), \
+                patch.object(OllamaProvider, "_fetch_installed_models", side_effect=AssertionError("Ollama called")):
+            self.configure(PerformanceProfile.DESKTOP, local_backend="strata", num_ctx=16384,
+                           strata_model="strata-current", desktop_general_model="ollama-old:7b",
+                           desktop_max_output_tokens=4096, ollama_think=True)
+            # 2026-10-11: Strata 는 자기 출력 한도(strata_max_output_tokens)를 쓴다. Ollama 용 값은 Ollama 로 돌아갈 때 쓴다.
+            self.state.save_settings({"strata_max_output_tokens": 5120, "ollama_think": False})
+        snapshot = self.state.snapshot()
+        self.assertTrue(snapshot["effective_settings"]["shared"])
+        self.assertEqual(snapshot["effective_settings"]["general"]["model"], "strata-current")
+        self.assertEqual(snapshot["effective_settings"]["general"]["num_predict"], 5120)
+        self.assertFalse(snapshot["effective_settings"]["general"]["think"])
+        restored = load_settings()
+        self.assertEqual(restored.strata_model, "strata-current")
+        self.assertEqual(restored.desktop_general_model, "ollama-old:7b")
+        self.assertEqual((restored.strata_max_output_tokens, restored.desktop_max_output_tokens), (5120, 4096))
 
 
 if __name__ == "__main__":

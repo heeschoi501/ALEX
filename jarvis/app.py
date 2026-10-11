@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from types import SimpleNamespace
@@ -81,6 +82,7 @@ HELP_TEXT = """사용 가능한 명령
   /unload                  Ollama 에 올라간 모델을 지금 내려 그래픽카드를 비움(게임 등, 다음 질문 때 다시 올라옴)
   /image 설명               그림 그리기(ComfyUI). 그냥 '노을 지는 바닷가 그려줘' 라고 말해도 된다
   /image-prompt 프롬프트    입력한 문장을 그대로 그림 모델에 전달(기본 1024×1024)
+                           앞에 --model=zimage|qwen|anime 를 붙이면 그 모델로(없으면 자동 선택)
   /video-prompt 프롬프트    입력한 문장을 그대로 영상 모델에 전달(기본 720p·5초)
   /characters              저장한 캐릭터 목록. 그림 뒤 '이 캐릭터를 은비로 저장해줘' 라고 하면 저장된다
   /character save 이름      방금 그림을 그 이름의 캐릭터로 저장(이후 '은비가 ~ 장면 그려줘' 로 같은 모습 유지)
@@ -119,6 +121,7 @@ HELP_TEXT = """사용 가능한 명령
   /undo-file 경로 --yes      해당 파일의 가장 최근 ALEX 백업으로 복구
   /undo-bundle ID --yes      적용한 묶음을 통째로 되돌림 (그 뒤 바뀐 파일이 있으면 거부)
   /build 요청               코딩 모델이 작업 폴더(data/builds)에 파일을 직접 만들고 검사가 통과할 때까지 고침
+  /rtl 폴더 [회수] [--continue]  Verilog 설계: 모델이 쓰고 린트·시뮬레이션 결과로 스스로 고침(fabless 폴더의 규격·시험기 기준)
                            (채팅의 '~ 만들어줘' 는 코드를 답으로 주고 뒤에서 실행만 확인)
   /dev-start 파일[, 파일2…] :: 테스트[, 테스트2…] :: 목표   개발 작업 시작 (여러 파일이면 묶음 수정안, 테스트는 모두 통과해야 함)
   /dev-next                테스트 → 실패 분석 → 수정안 생성 (최대 3회)
@@ -304,6 +307,23 @@ def effective_runtime_limits(
     )
 
 
+def engine_context_limits(settings: Settings, profile: PerformanceProfile) -> tuple[int, int, int]:
+    """고른 엔진에 맞는 (대화 글자 예산, 최근 대화 수, 요약을 시작하는 메시지 수). 2026-10-11 사용자: "선택에 따라서
+    자동으로 설정을 바뀌게끔". Strata 는 64K 문맥 창에 맞춰 키우고, Ollama 로 바꾸면 기존 값(16K 기준)으로 돌아간다.
+
+    Strata 자동 예산 = (문맥 창 - 답 자리 - 지시문 자리 4096) × 0.9 글자 — 한국어 최악(1글자 1토큰)에도 넘치지 않는다.
+    64K·답 16K 이면 40,550자(기존 24,000자). 코드는 1토큰에 3~4글자라 여유가 더 크다.
+    """
+    if settings.local_backend == "strata":
+        budget = settings.strata_context_char_budget or max(
+            CONTEXT_CHAR_BUDGET_BY_PROFILE[PerformanceProfile.UNKNOWN],
+            int((settings.strata_num_ctx - settings.strata_max_output_tokens - 4096) * 0.9))
+        history = settings.strata_history_limit
+        return budget, history, max(settings.summary_trigger_messages, history * 2)
+    budget = settings.context_char_budget or CONTEXT_CHAR_BUDGET_BY_PROFILE[profile]
+    return budget, settings.history_limit, settings.summary_trigger_messages
+
+
 def num_gpu_for(settings: Settings, model: str) -> int:
     """그 모델에 줄 GPU 층 수. `num_gpu_layers_model` 이 정해져 있으면 그 모델에만 주고 다른 모델은 자동(0)이다."""
     if settings.num_gpu_layers_model and model != settings.num_gpu_layers_model:
@@ -361,10 +381,12 @@ def build_providers(
         # ADR-086: 대화·코딩이 같은 Strata 서버의 한 모델(Qwen3.8-Flash-Next)을 쓴다 — 모델을 바꿔 올리는 일이 없다.
         strata = StrataProvider(
             model=settings.strata_model, host=settings.strata_host, timeout=timeout, num_ctx=settings.strata_num_ctx,
-            think=settings.ollama_think, num_predict=num_predict, reasoning_effort=settings.strata_reasoning_effort,
+            think=settings.ollama_think, num_predict=settings.strata_max_output_tokens,
+            reasoning_effort=settings.strata_reasoning_effort,
         )
         notes.append(f"Strata 모드: {settings.strata_host} ({settings.strata_model}, num_ctx={settings.strata_num_ctx}, "
-                     f"num_predict={num_predict}, think={settings.ollama_think}/{settings.strata_reasoning_effort})")
+                     f"num_predict={settings.strata_max_output_tokens}, "
+                     f"think={settings.ollama_think}/{settings.strata_reasoning_effort})")
         if not strata.health_check():
             notes.append(f"주의: Strata 서버({settings.strata_host})가 응답하지 않습니다 — Strata 를 켰는지 확인하세요.")
         return strata, strata, notes
@@ -500,8 +522,8 @@ def build_core(
     if logging_warning:
         notes.append(logging_warning)
 
-    context_char_budget = settings.context_char_budget or CONTEXT_CHAR_BUDGET_BY_PROFILE[hardware.profile]
-    notes.append(f"Context char budget: {context_char_budget}")
+    context_char_budget, history_limit, summary_trigger = engine_context_limits(settings, hardware.profile)
+    notes.append(f"Context char budget: {context_char_budget}, history {history_limit}")
     coding_budget = coding_char_budget(settings, effective_runtime_limits(settings, hardware.profile)[0], context_char_budget)
     if settings.coding_num_ctx:
         notes.append(f"Coding context (ADR-076): num_ctx={settings.coding_num_ctx}, char budget {coding_budget}, "
@@ -517,7 +539,7 @@ def build_core(
         local_coder=coder,
         cloud_coder=cloud_coder,
         cloud_reasoning=cloud_reasoning,
-        history_limit=settings.history_limit,
+        history_limit=history_limit,
         context_char_budget=context_char_budget,
         file_search_tool=SafeFileSearchTool(settings.file_search_root),
         web_reader=WebReader() if settings.web_enabled else None,
@@ -566,6 +588,8 @@ def build_core(
             timeout=settings.opencode_timeout,
             host=settings.strata_host if settings.local_backend == "strata" else settings.ollama_host,
             backend=settings.local_backend) if settings.coding_worker == "opencode" else None,
+        rtl_root=Path(settings.rtl_root) if settings.rtl_root else Path(__file__).resolve().parents[2] / "fabless",
+        rtl_tools_dir=Path(settings.rtl_tools_dir) if settings.rtl_tools_dir else Path("C:/oss-cad-suite"),
         image_generator=build_image_generator(settings),
         require_cloud_approval=settings.require_cloud_approval,
         approval_callback=approval_callback,
@@ -574,7 +598,7 @@ def build_core(
         cloud_include_summary=settings.cloud_include_summary,
         cloud_block_sensitive=settings.cloud_block_sensitive,
         summary_enabled=settings.summary_enabled,
-        summary_trigger_messages=settings.summary_trigger_messages,
+        summary_trigger_messages=summary_trigger,
         summary_max_chars=settings.summary_max_chars,
         misroute_log_path=settings.log_dir / "misroute.jsonl",
     )
@@ -751,6 +775,17 @@ def handle_command(core: JarvisCore, session_id: str, text: str) -> tuple[str, b
                     "이어서 '고쳐줘' 라고 하면 같은 폴더에서 이어서 고칩니다."), True, session_id
         answer, _ = core.handle_build(session_id, request)
         return answer, True, session_id
+
+    if text == "/rtl" or text.startswith("/rtl "):
+        parts = text.removeprefix("/rtl").split()
+        resume = "--continue" in parts
+        parts = [p for p in parts if p != "--continue"]
+        if not parts:
+            return ("사용법: /rtl 프로젝트폴더 [최대회수] [--continue]\n"
+                    "rtl_root(기본 C:\\ALEX\\fabless) 아래 폴더에 rtl.json·spec.md·시험기를 두면, 코딩 모델이 Verilog 를 쓰고 "
+                    "린트·시뮬레이션 결과를 보며 스스로 고칩니다. --continue 는 지금 설계 파일에서 이어서 고칩니다."), True, session_id
+        rounds = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+        return core.handle_rtl(session_id, parts[0], rounds=rounds, resume=resume), True, session_id
 
     if text.startswith("/dev-start "):
         parts = [part.strip() for part in text.removeprefix("/dev-start ").split("::", maxsplit=2)]
@@ -943,21 +978,29 @@ def handle_command(core: JarvisCore, session_id: str, text: str) -> tuple[str, b
 
     if text == "/image-prompt" or text.startswith("/image-prompt ") or text.startswith("/image-prompt\n"):
         prompt = text.removeprefix("/image-prompt").strip()
+        model = re.match(r"--model=(zimage|qwen|anime)(?:\s+|$)", prompt)
+        if model:
+            prompt = prompt[model.end():].strip()
         if not prompt:
             return "사용법: /image-prompt A cat sitting beside a window at sunset", True, session_id
         if len(prompt) > 4000:
             return "직접 입력 프롬프트는 4000자 이하로 적어 주세요.", True, session_id
-        return core.handle_forced(session_id, prompt, Destination.TOOL_IMAGE_GEN,
-                                  reason="direct media prompt")[0], True, session_id
+        return core.handle_forced(session_id, prompt, Destination.TOOL_IMAGE_GEN, reason="direct media prompt",
+                                  matched=model.group(1) if model else "manual")[0], True, session_id
 
     if text == "/video-prompt" or text.startswith("/video-prompt ") or text.startswith("/video-prompt\n"):
         prompt = text.removeprefix("/video-prompt").strip()
+        model = re.match(r"--model=(ltx|wan)(?:\s+|$)", prompt)
+        if model:
+            prompt = prompt[model.end():].strip()
+        elif prompt.startswith("--model="):
+            return "영상 모델은 ltx 또는 wan을 선택하세요: /video-prompt --model=ltx 프롬프트", True, session_id
         if not prompt:
-            return "사용법: /video-prompt A cat runs through a garden, camera follows", True, session_id
+            return "사용법: /video-prompt [--model=ltx|wan] A cat runs through a garden, camera follows", True, session_id
         if len(prompt) > 4000:
             return "직접 입력 프롬프트는 4000자 이하로 적어 주세요.", True, session_id
         return core.handle_forced(session_id, prompt, Destination.TOOL_VIDEO_GEN,
-                                  reason="direct media prompt")[0], True, session_id
+                                  reason="direct media prompt", matched=model.group(1) if model else "manual")[0], True, session_id
 
     if text == "/image" or text.startswith("/image "):
         description = text.removeprefix("/image").strip()
@@ -997,6 +1040,8 @@ def handle_command(core: JarvisCore, session_id: str, text: str) -> tuple[str, b
         servers = {p.host: p for p in core.providers.values() if isinstance(p, OllamaProvider)}  # Ollama 또는 Strata
         if not servers:
             return "로컬 Ollama 모델을 쓰지 않는 설정입니다." + comfy_note, True, session_id
+        backend_label = " / ".join(sorted({"Strata" if isinstance(p, StrataProvider) else "Ollama"
+                                            for p in servers.values()}))
         try:
             names = [name for host in sorted(servers) for name in unload_local_models(servers[host])]
             remaining = [name for host in sorted(servers) for name in loaded_local_models(servers[host])]
@@ -1009,9 +1054,9 @@ def handle_command(core: JarvisCore, session_id: str, text: str) -> tuple[str, b
             return (f"{asked}지금 올라가 있는 모델: {', '.join(remaining)} — 답을 만드는 중이거나 다른 요청이 올린 것입니다. "
                     "잠시 뒤 다시 누르세요." + comfy_note, True, session_id)
         if not names:
-            return ("Ollama 에 올라간 모델이 없습니다(방금 확인한 Ollama 목록 기준 — 다른 프로그램이 쓰는 그래픽카드 메모리는 따로입니다)."
+            return (f"{backend_label} 에 올라간 모델이 없습니다(방금 확인한 {backend_label} 목록 기준 — 다른 프로그램이 쓰는 그래픽카드 메모리는 따로입니다)."
                     + comfy_note, True, session_id)
-        return (f"모델을 내렸습니다: {', '.join(names)} — Ollama 가 쓰던 그래픽카드 메모리를 비웠습니다(다른 프로그램 몫은 따로). "
+        return (f"모델을 내렸습니다: {', '.join(names)} — {backend_label} 가 쓰던 그래픽카드 메모리를 비웠습니다(다른 프로그램 몫은 따로). "
                 "다음 질문 때 다시 올라옵니다(수십 초)." + comfy_note, True, session_id)
 
     if text == "/backup":

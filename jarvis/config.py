@@ -143,6 +143,14 @@ class Settings:
     strata_model: str = "qwen3.8-flash-next"
     strata_num_ctx: int = 65536            # Strata 설치 때 고른 문맥 창(이 PC: 64K)과 맞춘다
     strata_reasoning_effort: str = "medium"  # 생각을 켤 때(ollama_think) 쓰는 정도: low|medium|high
+    # Strata 를 고르면 쓰는 상한(2026-10-11 사용자 "선택에 따라서 자동으로 설정을 바뀌게끔"). Ollama 로 바꾸면 위의
+    # Desktop/전역 값(16K 문맥 기준)으로 돌아간다. 문맥 글자 예산 0 = 문맥 창에서 계산(app.engine_context_limits).
+    strata_max_output_tokens: int = 16384   # 생각 토큰 포함. 실측 초당 59~76토큰 → 다 쓰면 약 4분
+    strata_context_char_budget: int = 0
+    strata_history_limit: int = 24
+    # RTL 모드(2026-10-10, ADR-087): /rtl 프로젝트 폴더의 뿌리(비우면 C:\ALEX\fabless)와 칩 도구(oss-cad-suite) 위치
+    rtl_root: str = ""
+    rtl_tools_dir: str = ""
     # 자연어 그림 그리기(ADR-073): 이 PC 의 ComfyUI(127.0.0.1)로 Z-Image Turbo 를 돌린다. 기본 꺼짐 — 설치한 PC 에서 켠다.
     image_generation_enabled: bool = False
     # 비우면 ALEX 폴더 옆 comfyui\ComfyUI_windows_portable (C:\ALEX\comfyui\...) 을 쓴다.
@@ -275,6 +283,12 @@ def validate(settings: Settings) -> Settings:
         raise ConfigError("strata_num_ctx 는 4096~1048576 사이여야 합니다.")
     if settings.strata_reasoning_effort not in ("low", "medium", "high"):
         raise ConfigError("strata_reasoning_effort 는 low, medium, high 중 하나여야 합니다.")
+    if not 64 <= settings.strata_max_output_tokens <= settings.strata_num_ctx // 2:
+        raise ConfigError("strata_max_output_tokens 는 64 이상, 문맥 창(strata_num_ctx)의 절반 이하여야 합니다.")
+    if settings.strata_context_char_budget != 0 and not 1000 <= settings.strata_context_char_budget <= 500_000:
+        raise ConfigError("strata_context_char_budget 는 0(자동) 또는 1000~500000 사이여야 합니다.")
+    if not 2 <= settings.strata_history_limit <= 200:
+        raise ConfigError("strata_history_limit 는 2~200 사이여야 합니다.")
     if settings.desktop_max_output_tokens != 0 and (
         settings.desktop_max_output_tokens < 64 or settings.desktop_max_output_tokens > 8192
     ):
@@ -383,6 +397,8 @@ LOCAL_FIELDS = {
     "lesson_context_limit": int, "web_tool_enabled": bool, "auto_lessons_enabled": bool, "coding_insights_enabled": bool, "fact_reminder_enabled": bool, "coding_api_map_enabled": bool,
     "coding_num_ctx": int, "coding_num_gpu_layers": int, "coding_context_char_budget": int, "coding_auto_attempts": int, "coding_regression_check": bool, "coding_diagnostic_context": bool, "coding_build_loop_enabled": bool, "coding_code_check_enabled": bool, "coding_worker": str, "opencode_dir": str, "opencode_model": str, "opencode_context": int, "opencode_timeout": int,
     "local_backend": str, "strata_host": str, "strata_model": str, "strata_num_ctx": int, "strata_reasoning_effort": str,
+    "strata_max_output_tokens": int, "strata_context_char_budget": int, "strata_history_limit": int,
+    "rtl_root": str, "rtl_tools_dir": str,
     "image_generation_enabled": bool, "comfyui_dir": str, "comfyui_url": str,
 }
 
@@ -452,6 +468,11 @@ def load_settings() -> Settings:
         strata_model=os.getenv("JARVIS_STRATA_MODEL", "qwen3.8-flash-next").strip(),
         strata_num_ctx=_env_int("JARVIS_STRATA_NUM_CTX", 65536),
         strata_reasoning_effort=os.getenv("JARVIS_STRATA_REASONING_EFFORT", "medium").strip().lower(),
+        strata_max_output_tokens=_env_int("JARVIS_STRATA_MAX_OUTPUT_TOKENS", 16384),
+        strata_context_char_budget=_env_int("JARVIS_STRATA_CONTEXT_CHAR_BUDGET", 0),
+        strata_history_limit=_env_int("JARVIS_STRATA_HISTORY_LIMIT", 24),
+        rtl_root=os.getenv("JARVIS_RTL_ROOT", ""),
+        rtl_tools_dir=os.getenv("JARVIS_RTL_TOOLS_DIR", ""),
         image_generation_enabled=_env_flag("JARVIS_IMAGE_GENERATION_ENABLED", False),
         comfyui_dir=os.getenv("JARVIS_COMFYUI_DIR", ""),
         comfyui_url=os.getenv("JARVIS_COMFYUI_URL", "http://127.0.0.1:8188"),
