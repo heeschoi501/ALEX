@@ -4,9 +4,13 @@
 뒤에는 로그인해야 한다. 밖(Tailscale Serve 로 넘어온 요청)은 로그인하거나 연결된 Tailscale 계정이어야 한다.
 """
 import json
+import http.cookiejar
+from concurrent.futures import ThreadPoolExecutor
 import tempfile
 import threading
+import time
 import unittest
+from unittest.mock import patch
 import urllib.error
 import urllib.request
 from dataclasses import replace
@@ -14,6 +18,8 @@ from pathlib import Path
 
 from jarvis import accounts
 from jarvis.config import load_settings
+from jarvis.providers import GenerationCancelled, OllamaProvider
+from jarvis.router import Destination
 from jarvis.storage import OWNER
 from jarvis.web import make_server
 from test_web import make_state
@@ -131,6 +137,39 @@ class MultiUserHTTPTests(unittest.TestCase):
         self.assertEqual(status, 401)
         self.assertIn("너무 많습니다", body["error"])
 
+    def test_concurrent_wrong_passwords_cannot_lose_the_login_lock(self):
+        start = threading.Barrier(8)
+
+        def attempt():
+            start.wait(timeout=3)
+            try:
+                self.state.login("minsu", "bad-password", False)
+            except PermissionError:
+                return
+            self.fail("wrong password was accepted")
+
+        def wrong_password(*_args):
+            time.sleep(0.02)  # emulate password hashing releasing the GIL
+            return False
+
+        with patch("jarvis.accounts.verify_password", side_effect=wrong_password):
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                list(pool.map(lambda _: attempt(), range(8)))
+        with self.assertRaisesRegex(PermissionError, "너무 많습니다"):
+            self.state.login("minsu", "member-pass-1", False)
+
+    def test_unknown_login_names_cannot_evict_an_existing_account_lock(self):
+        with patch("jarvis.accounts.verify_password", return_value=False):
+            for _ in range(5):
+                with self.assertRaises(PermissionError):
+                    self.state.login("minsu", "bad", False)
+        for number in range(1002):
+            with self.assertRaises(PermissionError):
+                self.state.login(f"unknown-{number}", "bad", False)
+        with self.assertRaisesRegex(PermissionError, "너무 많습니다"):
+            self.state.login("minsu", "member-pass-1", False)
+        self.assertLessEqual(len(self.state.login_failures), 2)
+
     def test_admin_manages_users_and_disabling_ends_their_login(self):
         cookie = self.login_member()
         status, body, _ = self.call("/api/users", {"action": "create", "name": "지원", "login": "jiwon", "password": "short"})
@@ -139,6 +178,38 @@ class MultiUserHTTPTests(unittest.TestCase):
         users = self.call("/api/users", {"action": "disable", "id": self.member.user_id})[1]["users"]
         self.assertTrue(next(u for u in users if u["login"] == "minsu")["disabled"])
         self.assertEqual(self.call("/api/state", cookie=cookie)[0], 401)
+
+    def browser_login(self):
+        """Use real Set-Cookie handling, including the local login-mode marker."""
+        jar = http.cookiejar.CookieJar()
+        browser = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+        browser.addheaders = [("X-Jarvis-Token", "test-token"), ("Content-Type", "application/json")]
+        request = urllib.request.Request(self.url + "/api/login",
+                                         data=json.dumps({"login": "minsu", "password": "member-pass-1"}).encode(),
+                                         headers={"Content-Type": "application/json"})
+        with browser.open(request) as r:
+            self.assertEqual(json.load(r)["user"]["id"], self.member.user_id)
+        return browser, jar
+
+    def test_local_browser_does_not_become_owner_after_account_is_disabled(self):
+        browser, _jar = self.browser_login()
+        self.storage.update_user(self.member.user_id, disabled=True)
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            browser.open(self.url + "/api/state")
+        self.assertEqual(caught.exception.code, 401)
+        caught.exception.close()
+
+    def test_local_browser_does_not_become_owner_after_login_cookie_expires(self):
+        browser, jar = self.browser_login()
+        session = next(c for c in jar if c.name == "alex_session")
+        jar.clear(session.domain, session.path, session.name)  # browser removes an expired cookie
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            browser.open(self.url + "/api/state")
+        self.assertEqual(caught.exception.code, 401)
+        caught.exception.close()
+
+    def test_invalid_local_login_cookie_does_not_fall_back_to_owner(self):
+        self.assertEqual(self.call("/api/state", cookie="alex_session=expired-or-invalid")[0], 401)
 
     def test_remote_requests_need_a_login_or_a_linked_tailscale_account(self):
         self.state.settings = replace(load_settings(), remote_web_host=REMOTE, remote_web_users="owner@example.com")
@@ -221,6 +292,73 @@ class MultiUserHTTPTests(unittest.TestCase):
             worker.join(10)
         self.assertTrue(events[-1].get("cancelled"))
         self.assertEqual(self.storage.message_count(self.call("/api/state", cookie=cookie)[1]["session_id"]), 0)
+
+    def test_http_waiter_cancel_preserves_active_generation_and_active_cancel_still_works(self):
+        class ControlledModel(OllamaProvider):
+            def __init__(self):
+                super().__init__("controlled-no-live-model")
+                self.started, self.release = threading.Event(), threading.Event()
+
+            def health_check(self):
+                return True
+
+            def generate_stream(self, messages, **kwargs):
+                self.started.set()
+                while not self.release.wait(0.01):
+                    if self.cancel_event is not None and self.cancel_event.is_set():
+                        raise GenerationCancelled()
+                yield "controlled answer"
+
+        model = ControlledModel()
+        self.state.core.providers[Destination.LOCAL_GENERAL] = model
+        self.state.core.providers[Destination.LOCAL_CODER] = model
+        cookie = self.login_member()
+        active_events, waiting_events, errors = [], [], []
+        waiting_seen = threading.Event()
+
+        def stream(events, member=False):
+            req = urllib.request.Request(self.url + "/api/chat/stream",
+                data=json.dumps({"message": "안녕하세요"}).encode(),
+                headers={"X-Jarvis-Token": "test-token", "Content-Type": "application/json",
+                         **({"Cookie": cookie} if member else {})})
+            try:
+                with urllib.request.urlopen(req, timeout=10) as response:
+                    for line in response:
+                        event = json.loads(line)
+                        events.append(event)
+                        if member and event["type"] == "queue":
+                            waiting_seen.set()
+            except Exception as exc:
+                errors.append(exc)
+
+        active = threading.Thread(target=stream, args=(active_events,), daemon=True)
+        waiting = threading.Thread(target=stream, args=(waiting_events, True), daemon=True)
+        try:
+            active.start()
+            self.assertTrue(model.started.wait(3))
+            active_cancel = model.cancel_event
+            waiting.start()
+            self.assertTrue(waiting_seen.wait(3))
+            self.assertEqual(self.call("/api/cancel", {"request_id": waiting_events[0]["request_id"]}, cookie=cookie)[0], 200)
+            waiting.join(3)
+            self.assertFalse(waiting.is_alive())
+            self.assertTrue(waiting_events[-1].get("cancelled"))
+            self.assertIs(model.cancel_event, active_cancel)
+            self.assertFalse(active_cancel.is_set())
+            self.assertEqual(self.call("/api/cancel", {"request_id": active_events[0]["request_id"]})[0], 200)
+            active.join(3)
+            self.assertFalse(active.is_alive())
+            self.assertTrue(active_cancel.is_set())
+            self.assertEqual(self.state.queue, [])
+            self.assertIsNone(self.state.active_id)
+            self.assertEqual(errors, [])
+            model.release.set()
+            self.assertEqual(self.call("/api/chat", {"message": "안녕하세요 다시"})[0], 200)
+        finally:
+            model.release.set()
+            active.join(3)
+            if waiting.ident is not None:
+                waiting.join(3)
 
 
 class ProjectTests(unittest.TestCase):

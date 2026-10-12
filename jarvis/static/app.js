@@ -426,13 +426,14 @@ async function submit(text = $('input').value.trim()) {
   if (busy || !state) return;
   // 프로젝트 화면에서 쓰면 그 프로젝트 안에 새 대화를 만들고 보낸다(Claude 프로젝트처럼).
   if (openProject && !text.trim().startsWith('/') && text.trim()) {
-    try { await newChat(openProject); } catch (e) { notice(e.message); return; }
+    lock(true);  // creating the project conversation is part of this request
+    try { await newChat(openProject); } catch (e) { notice(e.message); lock(false); return; }
   }
   const selected = text.trim().startsWith('/') ? [] : pendingAttachments.slice();
   if (!text.trim() && selected.length) text = '첨부한 이미지의 내용을 설명해 주세요.';
-  if (!text.trim()) return;
+  if (!text.trim()) { lock(false); return; }
   const body = {message: text, session_id: state.session_id, attachments: selected.map(image => image.name)};
-  if (new TextEncoder().encode(JSON.stringify(body)).length > 64000) { notice('요청이 너무 큽니다. 64KB 이하로 줄여 주세요.'); return; }
+  if (new TextEncoder().encode(JSON.stringify(body)).length > 64000) { notice('요청이 너무 큽니다. 64KB 이하로 줄여 주세요.'); lock(false); return; }
   const oldSession = state.session_id;
   lock(true); notice(''); $('input').value = ''; fitInput(); $('welcome').hidden = true;
   if (openProject) closeProject();

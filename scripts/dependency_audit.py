@@ -16,6 +16,9 @@ LOCAL_TOP_LEVEL = {"jarvis", "scripts", "tests"}
 # LoRA 학습 일꾼은 C:\ALEX\tools\lora\venv 의 파이썬으로만 실행된다(ADR-084). 목록 밖 패키지는 여전히 실패.
 SEPARATE_ENV = {"scripts/lora_worker.py": {"torch", "transformers", "peft", "huggingface_hub"},
                 "scripts/pdf_extract_worker.py": {"pypdf"}}
+# Only the isolated generated-code worker may optionally prewarm pygame fonts.
+# It is never imported by the Core at startup and is not a mandatory dependency.
+OPTIONAL_WORKER_IMPORTS = {"jarvis/build_runner.py": {"pygame"}}
 
 # Python 3.10 has `sys.stdlib_module_names`; fallback is only for unusual interpreters.
 FALLBACK_STDLIB = {
@@ -46,7 +49,9 @@ def audit() -> list[tuple[Path, str]]:
             relative = path.relative_to(ROOT)
             local = LOCAL_TOP_LEVEL | (sibling_scripts if folder.name == "scripts" else set())
             for root in sorted(imported_roots(path)):
-                if root not in allowed and root not in local and root not in SEPARATE_ENV.get(relative.as_posix(), ()):
+                if (root not in allowed and root not in local
+                        and root not in SEPARATE_ENV.get(relative.as_posix(), ())
+                        and root not in OPTIONAL_WORKER_IMPORTS.get(relative.as_posix(), ())):
                     failures.append((relative, root))
     return failures
 
@@ -57,7 +62,7 @@ def main() -> int:
         for path, package in failures:
             print(f"FAIL {path}: external import {package!r}")
         return 1
-    print("Dependency audit PASS: jarvis/ + scripts/ use stdlib/local imports only")
+    print("Dependency audit PASS: Core stdlib/local; explicit optional worker imports only")
     return 0
 
 

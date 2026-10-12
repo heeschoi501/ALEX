@@ -166,6 +166,24 @@ class RunTests(unittest.TestCase):
             self.assertEqual(workspace.run("test_checks.py", None)[0], 0)
             self.assertEqual(workspace.last_run_checks, 0)
 
+    def test_unittest_count_does_not_depend_on_the_module_file_alias(self):
+        import json
+        import subprocess
+        import sys
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target, evidence, wrapper = root / "checks.py", root / "evidence.json", root / "wrapper.py"
+            runner = Path(__file__).resolve().parent.parent / "jarvis" / "build_runner.py"
+            target.write_text("import unittest\nclass Check(unittest.TestCase):\n"
+                              "    def test_value(self): self.assertEqual(2+3, 5)\nunittest.main()\n", encoding="utf-8")
+            wrapper.write_text("import runpy, sys, unittest\n"
+                               "unittest.case.__file__ = 'a-different-module-alias.py'\n"
+                               f"sys.argv = [{str(runner)!r}, {str(target)!r}, {str(root)!r}, {str(evidence)!r}]\n"
+                               f"runpy.run_path({str(runner)!r}, run_name='__main__')\n", encoding="utf-8")
+            result = subprocess.run([sys.executable, "-I", str(wrapper)], capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertGreater(json.loads(evidence.read_text())["checks"], 0)
+
     def test_it_really_runs_and_reports_the_exit_code(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = BuildWorkspace(Path(tmp))
