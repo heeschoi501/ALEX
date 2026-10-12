@@ -150,6 +150,7 @@ class WebAppState:
     exchange_session: str = ""
     exchanges: dict[tuple[str, str], tuple[Any, Any]] = field(default_factory=dict)
     login_failures: dict[str, tuple[int, float]] = field(default_factory=dict)
+    login_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def owner_viewer(self) -> Viewer:
         return Viewer(self.core.storage.get_user(OWNER))  # type: ignore[arg-type]
@@ -587,22 +588,29 @@ class WebAppState:
 
     # ---------------------------------------------------------------- 계정
     def login(self, login: Any, password: Any, remote: bool) -> tuple[Viewer, str]:
+        # Password hashing releases the GIL. Keep failure counts and login issuance
+        # together without taking the model lock or losing concurrent failures.
+        with self.login_lock:
+            return self._login_locked(login, password, remote)
+
+    def _login_locked(self, login: Any, password: Any, remote: bool) -> tuple[Viewer, str]:
         name = str(login or "").strip().lower()
-        failures, until = self.login_failures.get(name, (0, 0.0))
+        user = self.core.storage.user_by_login(name) if name else None
+        # Unknown names share one bucket: random names cannot grow the cache or
+        # clear the lock of an existing account. NUL cannot be a real login ID.
+        failure_key = name if user is not None else "\0unknown"
+        failures, until = self.login_failures.get(failure_key, (0, 0.0))
         if until > time.monotonic():
             raise PermissionError("로그인 시도가 너무 많습니다. 1분 뒤 다시 시도하세요.")
         if until:
             failures = 0  # 잠금이 풀리면 다시 다섯 번
-        if len(self.login_failures) > 1000:
-            self.login_failures.clear()
-        user = self.core.storage.user_by_login(name) if name else None
         if (user is None or user.disabled or not user.password_hash
                 or not accounts.verify_password(str(password or ""), user.password_hash)):
             failures += 1
-            self.login_failures[name] = (failures, time.monotonic() + LOGIN_LOCK_SECONDS
+            self.login_failures[failure_key] = (failures, time.monotonic() + LOGIN_LOCK_SECONDS
                                          if failures >= LOGIN_LOCK_AFTER else 0.0)
             raise PermissionError("아이디 또는 비밀번호가 맞지 않습니다.")
-        self.login_failures.pop(name, None)
+        self.login_failures.pop(failure_key, None)
         token = accounts.new_session_token()
         expires = datetime.now(timezone.utc) + timedelta(days=accounts.SESSION_DAYS)
         self.core.storage.create_auth_session(accounts.token_hash(token), user.user_id, expires.isoformat())
@@ -808,6 +816,8 @@ def _handler_factory(state: WebAppState):
                 user = storage.get_user(user_id) if user_id else None
                 if user is not None and not user.disabled:
                     return Viewer(user, remote)
+                if not remote:
+                    return None  # an invalid/disabled login never becomes the local owner
             if remote:
                 user = storage.user_by_tailscale(self.headers.get("Tailscale-User-Login", ""))
                 return Viewer(user, True) if user is not None and not user.disabled else None
@@ -949,25 +959,26 @@ def _handler_factory(state: WebAppState):
             if not state.lock.acquire(blocking=False):
                 self._json(HTTPStatus.CONFLICT, {"error": "응답이 끝난 뒤 자료를 저장하세요."})
                 return
+            status = HTTPStatus.OK
             try:
                 if state.shutting_down:
-                    self._json(HTTPStatus.CONFLICT, {"error": "앱을 종료하는 중입니다."})
-                    return
-                if self.headers.get("X-Jarvis-Session", "") == "" or self._session_header(viewer) is None:
-                    self._json(HTTPStatus.CONFLICT, {"error": "대화가 바뀌었습니다. 새로고침 후 다시 올려 주세요."})
-                    return
-                name = unquote(self.headers.get("X-File-Name", ""))
-                state.core.knowledge._validate_name(name)
-                data = self.rfile.read(length)
-                if len(data) != length:
-                    raise KnowledgeError("파일 전송이 완료되지 않았습니다.")
-                record = state.core.knowledge.import_bytes(data, name)
-                self._json(HTTPStatus.OK, {"response": import_notice(record), "document": {
-                    key: record[key] for key in ("id", "title", "pages", "chars", "duplicate")}})
+                    status, payload = HTTPStatus.CONFLICT, {"error": "앱을 종료하는 중입니다."}
+                elif self.headers.get("X-Jarvis-Session", "") == "" or self._session_header(viewer) is None:
+                    status, payload = HTTPStatus.CONFLICT, {"error": "대화가 바뀌었습니다. 새로고침 후 다시 올려 주세요."}
+                else:
+                    name = unquote(self.headers.get("X-File-Name", ""))
+                    state.core.knowledge._validate_name(name)
+                    data = self.rfile.read(length)
+                    if len(data) != length:
+                        raise KnowledgeError("파일 전송이 완료되지 않았습니다.")
+                    record = state.core.knowledge.import_bytes(data, name)
+                    payload = {"response": import_notice(record), "document": {
+                        key: record[key] for key in ("id", "title", "pages", "chars", "duplicate")}}
             except (KnowledgeError, OSError) as exc:
-                self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                status, payload = HTTPStatus.BAD_REQUEST, {"error": str(exc)}
             finally:
                 state.lock.release()
+            self._json(status, payload)  # client can send the next request once it receives this
 
         # ------------------------------------------------------------ GET
         def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
@@ -1129,7 +1140,9 @@ def _handler_factory(state: WebAppState):
                     disconnected = True
                     ticket.cancel.set()
 
-            previous = previous_command_cancel_event = None
+            previous = None
+            previous_command_cancel_event = None
+            previous_provider_cancel_events: dict[OllamaProvider, Any] = {}
             local: set[OllamaProvider] = set()
             acquired = False
             waited_from = time.monotonic()
@@ -1146,15 +1159,19 @@ def _handler_factory(state: WebAppState):
                           "response": "앱을 종료하는 중이라 요청을 보내지 못했습니다." if state.shutting_down
                           else "기다리던 요청을 취소했습니다."})
                     return
-                state.running = ticket
-                state.active_id, state.active_kind = ticket.request_id, "chat"
-                state.cancel_event = ticket.cancel
-                # 대기 중인 요청의 취소/끊김은 실행 중인 다른 방의 콜백과 취소 신호를 건드리지 않는다.
+                # A queued request does not own these shared fields until it gets
+                # the model lock. Snapshot the current providers here too: an
+                # engine/settings operation may have replaced them while waiting.
+                # (대기 중인 요청의 취소/끊김은 실행 중인 다른 방의 콜백과 취소 신호를 건드리지 않는다.)
                 previous = state.core.response_chunk_callback
                 previous_command_cancel_event = getattr(state.core, "command_cancel_event", None)
                 local = {p for p in state.core.providers.values() if isinstance(p, OllamaProvider)}
                 if isinstance(state.core.local_summarizer, OllamaProvider):
                     local.add(state.core.local_summarizer)
+                previous_provider_cancel_events = {p: p.cancel_event for p in local}
+                state.running = ticket
+                state.active_id, state.active_kind = ticket.request_id, "chat"
+                state.cancel_event = ticket.cancel
                 started = time.monotonic()
                 emit({"type": "running", "request_id": ticket.request_id, "session_id": session_id})
                 state.core.response_chunk_callback = lambda chunk: emit({"type": "chunk", "text": chunk})
@@ -1178,8 +1195,8 @@ def _handler_factory(state: WebAppState):
                 if acquired:
                     state.core.response_chunk_callback = previous
                     state.core.command_cancel_event = previous_command_cancel_event
-                    for p in local:
-                        p.cancel_event = None
+                    for p, previous_cancel_event in previous_provider_cancel_events.items():
+                        p.cancel_event = previous_cancel_event
                     state.running = None
                     state.active_id = None
                     state.active_kind = None
@@ -1409,7 +1426,7 @@ def _handler_factory(state: WebAppState):
             if self.path == "/api/login":
                 viewer, token = state.login(body.get("login"), body.get("password"), self._is_remote())
                 self._json(HTTPStatus.OK, {"user": viewer.public()},
-                           cookies=(self._session_cookie(token), self._manual_cookie(False)))
+                           cookies=(self._session_cookie(token), self._manual_cookie(not self._is_remote())))
                 return True
             if self.path == "/api/logout":
                 token = self._cookies().get(SESSION_COOKIE)

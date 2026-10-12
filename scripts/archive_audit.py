@@ -14,12 +14,14 @@ import zipfile
 
 FORBIDDEN_PARTS = {
     ".git", ".idea", ".pytest_cache", ".mypy_cache", "__pycache__",
-    ".venv", ".venv-alex-study", "venv", "data", "logs", "dist",
+    ".venv", ".venv-alex-study", "venv", "data", "logs", "dist", "runtime",
+    "node_modules", "playwright-report", "test-results",
 }
 FORBIDDEN_SUFFIXES = {".pyc", ".pyo", ".pem", ".key", ".p12", ".pfx"}
 SENSITIVE_BASENAMES = {
     ".env", "credentials", "credentials.json", "secrets.json", "secrets.toml",
     "id_rsa", "id_ed25519", "api_key.txt", "apikey.txt",
+    "jarvis.local.json", "ollama-release.json", "claude_next.md", "claude_start_prompt.md",
 }
 
 
@@ -29,8 +31,6 @@ def _sensitive_name(name: str) -> bool:
 REQUIRED_RELATIVE = {
     "README.md",
     "RELEASE_NOTES.md",
-    "CLAUDE_NEXT.md",
-    "CLAUDE_START_PROMPT.md",
     "DECISIONS.md",
     "TODO.md",
     "TEST_RESULTS.md",

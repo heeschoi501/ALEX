@@ -72,16 +72,16 @@ class TitleHTTPTests(unittest.TestCase):
     def test_first_answer_gets_a_model_title_and_later_answers_do_not(self):
         sid = self.state.session_id
         events = self.stream("안녕 반가워, 오늘 뭐 하고 놀까")
-        self.assertEqual([e["type"] for e in events], ["start", "done", "title"])
+        self.assertEqual([e["type"] for e in events], ["start", "running", "done", "title"])  # running: 차례가 왔다(방 이동 기능)
         self.assertEqual(events[-1], {"type": "title", "session_id": sid, "title": "간단한 인사 나누기"})
         self.assertEqual(self.state.core.storage.session_title(sid), "간단한 인사 나누기")
         self.assertIn("안녕 반가워", self.model.calls[0][-1].content)  # 첫 질문과 답을 보고 짓는다
-        self.assertEqual([e["type"] for e in self.stream("두 번째 말")], ["start", "done"])
+        self.assertEqual([e["type"] for e in self.stream("두 번째 말")], ["start", "running", "done"])
         self.assertEqual(len(self.model.calls), 1)
 
     def test_a_failed_title_keeps_the_provisional_one(self):
         self.model.reply = "   "
-        self.assertEqual([e["type"] for e in self.stream("파이썬 리스트 설명해줘")], ["start", "done"])
+        self.assertEqual([e["type"] for e in self.stream("파이썬 리스트 설명해줘")], ["start", "running", "done"])
         self.assertEqual(self.state.core.storage.session_title(self.state.session_id), "파이썬 리스트 설명해줘")
 
     def test_titles_can_be_renamed_by_hand_but_only_your_own(self):

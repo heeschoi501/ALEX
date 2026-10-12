@@ -55,6 +55,19 @@ class BenchmarkHelperTests(unittest.TestCase):
             targets = _targets(settings, PerformanceProfile.DESKTOP, "both")
             self.assertEqual([label for label, _ in targets], ["general", "coder"])
 
+    def test_optional_pygame_is_worker_only_and_training_imports_remain_blocked(self):
+        from scripts import dependency_audit
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "jarvis").mkdir()
+            (root / "scripts").mkdir()
+            (root / "jarvis/build_runner.py").write_text("import pygame\nimport torch\n")
+            (root / "jarvis/app.py").write_text("import pygame\n")
+            with patch.object(dependency_audit, "ROOT", root):
+                self.assertEqual(dependency_audit.audit(), [(Path("jarvis/app.py"), "pygame"),
+                                                            (Path("jarvis/build_runner.py"), "torch")])
+
 class ModelSetupTests(unittest.TestCase):
     def test_laptop_requires_only_shared_general_by_default(self):
         from jarvis.config import Settings
@@ -87,6 +100,43 @@ class ArchiveAuditTests(unittest.TestCase):
             self._write_zip(archive_path, files)
             ok, issues = audit(archive_path)
             self.assertTrue(ok, issues)
+
+    def test_public_archive_does_not_require_private_handoff_notes(self):
+        from scripts.archive_audit import REQUIRED_RELATIVE, audit
+        with tempfile.TemporaryDirectory() as td:
+            archive_path = Path(td) / "public.zip"
+            public_files = REQUIRED_RELATIVE - {"CLAUDE_NEXT.md", "CLAUDE_START_PROMPT.md"}
+            self._write_zip(archive_path, {f"alex/{name}": "x" for name in public_files})
+            ok, issues = audit(archive_path)
+            self.assertTrue(ok, issues)
+
+    def test_runtime_and_private_configuration_are_rejected(self):
+        from scripts.archive_audit import REQUIRED_RELATIVE, audit
+        with tempfile.TemporaryDirectory() as td:
+            archive_path = Path(td) / "public.zip"
+            for name in ("runtime/state.json", "node_modules/vendor.js", "test-results/trace.zip",
+                         "playwright-report/index.html", "jarvis.local.json", "ollama-release.json",
+                         "CLAUDE_NEXT.md", "CLAUDE_START_PROMPT.md"):
+                with self.subTest(name=name):
+                    self._write_zip(archive_path, {**{f"alex/{f}": "x" for f in REQUIRED_RELATIVE},
+                                                  f"alex/{name}": "private"})
+                    ok, issues = audit(archive_path)
+                    self.assertFalse(ok, issues)
+
+    def test_release_export_excludes_private_handoff_and_runtime(self):
+        from scripts import package_release
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            for name in ("README.md", "CLAUDE_NEXT.md", "CLAUDE_START_PROMPT.md",
+                         "jarvis.local.json", "runtime/state.json", "node_modules/vendor.js",
+                         "playwright-report/index.html", "test-results/trace.zip"):
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("fixture", encoding="utf-8")
+            with patch.object(package_release, "ROOT", root):
+                exported = {str(relative) for _, relative in package_release.iter_release_files()}
+            self.assertEqual(exported, {"README.md"})
 
     def test_runtime_data_is_rejected(self):
         from scripts.archive_audit import REQUIRED_RELATIVE, audit

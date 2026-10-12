@@ -535,6 +535,7 @@ async function submit(text = $('input').value.trim()) {
   if (roomRequests.size >= 4) { notice('동시에 최대 4개 대화의 요청을 받을 수 있습니다. 하나가 끝난 뒤 보내 주세요.'); return; }
   // 프로젝트 화면에서 쓰면 그 프로젝트 안에 새 대화를 만들고 보낸다(Claude 프로젝트처럼).
   if (openProject && !text.trim().startsWith('/') && text.trim()) {
+    // 대화를 만드는 동안 newChat 의 navigating 이 전송을 막는다(두 번 보내기 방지 — 2026-10-12 클라우드 점검 항목).
     try { if (!await newChat(openProject)) return; } catch (e) { notice(e.message); return; }
   }
   const selected = text.trim().startsWith('/') ? [] : pendingAttachments.slice();

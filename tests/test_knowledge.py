@@ -388,6 +388,35 @@ class KnowledgeTests(unittest.TestCase):
             server.server_close()
             thread.join(2)
 
+    def test_upload_releases_model_lock_before_sending_the_response(self):
+        from io import BytesIO
+        from jarvis.web import _handler_factory
+        core, sid, *_ = self.make_core()
+        state = WebAppState(core, sid)
+        handler = object.__new__(_handler_factory(state))
+        handler._authorized = lambda: True
+        handler._require_viewer = lambda **_kwargs: state.owner_viewer()
+        handler._session_header = lambda _viewer: sid
+
+        def reply(_status, _payload):
+            available = []
+            def probe():
+                acquired = state.lock.acquire(blocking=False)
+                available.append(acquired)
+                if acquired:
+                    state.lock.release()
+            peer = threading.Thread(target=probe)
+            peer.start()
+            peer.join(2)
+            self.assertEqual(available, [True], "HTTP response still owns the model lock")
+
+        handler._json = reply
+        for name in ("valid.md", "../invalid.md"):
+            with self.subTest(name=name):
+                handler.headers = {"Content-Length": "3", "X-Jarvis-Session": sid, "X-File-Name": name}
+                handler.rfile = BytesIO(b"FSM")
+                handler._upload_knowledge()
+
 
 if __name__ == "__main__":
     unittest.main()

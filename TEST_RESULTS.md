@@ -1,4 +1,43 @@
-# TEST RESULTS — Project ALEX (구 JARVIS) v0.2.0
+# TEST RESULTS — Project ALEX (구 JARVIS)
+
+## 2026-10-12 — 추가 실행 검증 완료
+
+기준 404b25d에서 추가 수정. 버전별 임시 폴더를 분리해 최종 공개본을 검증했다.
+
+| 환경 | 전체 | PASS | SKIP | FAIL | 시간 | 릴리스 |
+|---|---:|---:|---:|---:|---:|---|
+| Linux Python 3.10.22 | 1,342 | 1,338 | 4 | 0 | 74.809초 | PASS |
+| Linux Python 3.11.17, pygame 2.6.1 | 1,342 | 1,339 | 3 | 0 | 73.143초 | PASS |
+| Linux Python 3.12.14 | 1,342 | 1,338 | 4 | 0 | 78.693초 | PASS |
+
+실제 PDF 일꾼(pypdf 6.20.0), HTTP 두 사람 대기·취소·후속 요청, HTTPS Chromium 브라우저의 데스크톱·모바일·PWA·쿠키·권한·계정 중지를 확인했다. JavaScript page error 0개. 합성 구형 DB의 11대화·833메시지·2기억·50할 일 이전, 온라인 백업·폴더 사본 복구도 통과했다.
+
+Windows 전용 검사는 3개 skip이며 pygame 미설치 버전은 1개 추가 skip이다. GPU/실LLM·실제 Windows·Tailscale Serve·Android 설치·사용자 DB는 이번 환경에서 실측하지 않았다. [검증 범위·복구 안내](docs/FULL_VALIDATION_20261012.md).
+
+최종 설치 wheel: 정적 파일 8개 바이트 일치, 설치한 패키지의 PWA 경로 4개 HTTP 200·MIME PASS. ZIP·TAR 파일 감사 PASS. 압축을 푼 사본에서 코드 바이트 일치와 전체 1,342개(1,339 PASS·3 SKIP, 47.637초) 릴리스 PASS를 확인했다.
+
+첫 압축 사본 검사에서는 test_imagegen.py 프로세스의 완료 기록이 없어 FAIL로 처리됐다. 별도 사본에서 해당 모듈 77/77 및 전체 검사를 재확인해 통과했다. 최초 중단 원인은 특정하지 못했으며, 이를 처음부터 모두 통과한 것으로 기록하지 않는다.
+
+GPT-5.6 Luna 비교 도구는 18과제와 채점기 7개 회귀를 검증했다. **모델 성능 비교는 아직 미실행이다.** [실행 방법](docs/MODEL_COMPARISON_GPT56_LUNA_20261012.md).
+
+## 2026-10-12 — 공개본 대기열·PWA 보완
+
+기준: `main`의 `4a39bf4aeb77e07bd87ead5dd5af32de834ede0f`에서 수정. Linux / Python 3.12.14, 모델·GPU 호출 없이 임시 DB와 테스트 서버 사용.
+
+| 검사 | 결과 |
+|---|---|
+| 전체 단위·통합, ResourceWarning 포함 | 1,323개: 1,318 PASS·5 SKIP·0 FAIL; 51.928초 |
+| 스트리밍 상태 회귀 | 7/7 PASS; 새 테스트 5개는 수정 전 실패 확인(오류·생성 취소 subTest 포함 6개 실패) |
+| 사용자 분리·프로젝트 HTTP 검사 | 15/15 PASS |
+| Python 3.10 문법 감사 | PASS, 160개 파일; 실제 3.10 실행과는 별개 |
+| 의존성 / compileall / alpha / beta | 모두 PASS |
+| 라우터 / 보안 스모크 | 83/83 / 13/13 PASS |
+| wheel 설치 검증 | 정적 파일 8개 바이트 일치; manifest·서비스 워커·아이콘 2개 HTTP 200·MIME 확인 |
+| 릴리스 종합 | PASS |
+
+이번 공개본 통과는 개발 PC의 별도 pygame 게임을 포함한 원본 검사 결과와 구별한다. 실제 GPU/LLM의 중단 동작·Windows 런타임·Tailscale 원격은 이번에 재검증하지 않았다. 상세 및 롤백은 [보완 기록](docs/CODEX_HARDENING_20261012.md).
+
+아래는 이전 버전의 검증 기록이다.
 
 ## 2026-09-19 — 경험 저장소
 

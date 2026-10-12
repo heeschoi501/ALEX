@@ -23,6 +23,9 @@ READ_ONLY_WINREG = {"winreg.OpenKey", "winreg.OpenKey/result", "winreg.EnumKey",
 def install_guard(workspace: Path) -> None:
     fonts = Path(os.environ.get("WINDIR") or os.environ.get("SYSTEMROOT") or r"C:\Windows") / "Fonts"
     readable = (workspace, Path(sys.base_prefix).resolve(), Path(sys.prefix).resolve(), fonts)
+    if os.name != "nt":
+        readable += (Path("/usr/share/fonts"), Path("/usr/local/share/fonts"),
+                     Path.home() / ".local/share/fonts", Path.home() / ".fonts")
 
     def inside(path: object, roots: tuple[Path, ...]) -> bool:
         if isinstance(path, int):
@@ -79,12 +82,35 @@ def main() -> None:
                 return node
 
         # unittest assertions execute in the library rather than the target AST.
-        case_file = str(Path(unittest.case.__file__).resolve())
+        assertion_codes = {method.__code__ for name in dir(unittest.TestCase)
+                           if name.startswith("assert") and
+                           hasattr(method := getattr(unittest.TestCase, name), "__code__")}
         def count_unittest(frame, event, arg):
             nonlocal checks
-            if event == "call" and frame.f_code.co_filename == case_file and frame.f_code.co_name.startswith("assert"):
+            if event == "call" and frame.f_code in assertion_codes:
                 checks += 1
 
+        # Trusted bootstrap only: pygame's Unix font discovery invokes fc-list.
+        # Warm its read-only font cache before adding workspace import paths and
+        # the runtime guard. Generated code still cannot launch subprocesses.
+        if os.name != "nt":
+            tree = ast.parse(target.read_text(encoding="utf-8"), filename=str(target))
+            if any(isinstance(node, (ast.Import, ast.ImportFrom)) and
+                   ((isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] == "pygame") or
+                    (isinstance(node, ast.Import) and any(alias.name.split(".")[0] == "pygame" for alias in node.names)))
+                   for node in ast.walk(tree)):
+                old_path = os.environ.get("PATH")
+                try:
+                    os.environ["PATH"] = os.defpath  # fixed OS tools, never a candidate's fc-list
+                    import pygame
+                    pygame.font.get_fonts()
+                except ImportError:
+                    pass  # normal execution reports a missing optional package
+                finally:
+                    if old_path is None:
+                        os.environ.pop("PATH", None)
+                    else:
+                        os.environ["PATH"] = old_path
         sys.argv = [str(target)]
         sys.path[:0] = [str(target.parent), str(workspace)]
         install_guard(workspace)

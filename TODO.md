@@ -1,5 +1,7 @@
 # TODO — after Project JARVIS v0.2.0 Local Beta
 
+이 문서는 v0.2.0 시점의 과거 계획이다. 아래 항목을 현재의 미완료 목록으로 해석하지 않는다. 최신 보완·검증·남은 실사용 확인은 [2026-10-12 보완 기록](docs/CODEX_HARDENING_20261012.md), `CHANGELOG.md`, `TEST_RESULTS.md`를 참고한다.
+
 ## P0 — 실제 사용자 장비 검증
 
 1. RTX 4070 Laptop / Windows + WSL에서 Python 3.10+ runtime 검증

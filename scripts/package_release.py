@@ -14,12 +14,13 @@ ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_VERSION = "0.3.0"
 EXCLUDED_PARTS = {
     ".git", ".idea", ".pytest_cache", ".mypy_cache", "__pycache__", ".venv", ".venv-alex-study", "venv",
-    "data", "logs", "dist", "runtime",
+    "data", "logs", "dist", "runtime", "node_modules", "playwright-report", "test-results",
 }
 EXCLUDED_SUFFIXES = {".pyc", ".pyo", ".pem", ".key", ".p12", ".pfx"}
 SENSITIVE_BASENAMES = {
     ".env", "credentials", "credentials.json", "secrets.json", "secrets.toml",
     "id_rsa", "id_ed25519", "api_key.txt", "apikey.txt", "jarvis.local.json", "ollama-release.json",
+    "claude_next.md", "claude_start_prompt.md",
 }
 
 

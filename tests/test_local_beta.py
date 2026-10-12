@@ -121,7 +121,7 @@ class BrowserWorkflowTests(unittest.TestCase):
     def test_stream_and_refresh_restore_same_answer(self):
         with self.request("/api/chat/stream", {"message": "안녕", "session_id": self.state.session_id}) as r:
             events = [json.loads(line) for line in r]
-        self.assertEqual([e["type"] for e in events], ["start", "done"])
+        self.assertEqual([e["type"] for e in events], ["start", "running", "done"])  # running: 차례가 와서 답을 만들기 시작
         self.assertIn("GENERAL", events[-1]["response"])
         with self.request("/api/state") as r:
             saved = json.load(r)
