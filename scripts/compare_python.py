@@ -39,14 +39,21 @@ def worker(request_path: Path, evidence: Path):
     workspace = request_path.parent.resolve()
     namespace = {"__name__": "__benchmark__"}
     with evidence.open("w", encoding="utf-8") as record:
+        # The fixture is trusted check code. csv_summary's fixture makes its input file with
+        # tempfile.mkdtemp(), whose writable-directory probe deletes a file (os.remove) — the guard
+        # forbids that, so the task could never pass (2026-10-12, found in the first live run).
+        # Run the fixture first; the candidate and the checks still run under the guard.
+        try:
+            exec(compile(task.get("setup", ""), "<fixture>", "exec"), namespace)
+        except BaseException as exc:
+            json.dump({"passed": False, "detail": "fixture " + type(exc).__name__ + ": " + str(exc)[:150]}, record)
+            return
         install_guard(workspace)
         try:
-            fixture = compile(task.get("setup", ""), "<fixture>", "exec")
             candidate = compile(request["code"], "<candidate>", "exec")
             checks = compile(task["tests"], "<checks>", "exec")
             # Fix the checks before the candidate executes.
             execute = exec
-            execute(fixture, namespace)
             execute(candidate, namespace)
             execute(checks, namespace)
         except BaseException as exc:
