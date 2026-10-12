@@ -2,6 +2,46 @@
 const $ = id => document.getElementById(id);
 const token = document.querySelector('meta[name="jarvis-token"]').content;
 let state = null, busy = false, requestId = null, pullRequestId = null, oldest = null;
+// 열린 화면과 작업 중인 방은 별개다. 스트림은 방을 이동해도 같은 요청에 붙어 있다.
+const roomRequests = new Map(), roomDrafts = new Map(), unreadRooms = new Set();
+const roomViews = new Map();  // 명령 결과·diff 버튼도 방을 오갈 때 보존한다(기존 DB 저장 범위는 유지).
+let serverRequests = new Map(), auxiliaryBusy = false, desiredSession = null;
+let snapshotRequest = 0, navigationVersion = 0, navigating = false, polling = false;
+function composerKey() { return openProject ? `project:${openProject}` : state ? `session:${state.session_id}` : null; }
+function saveComposer() {
+  const key = composerKey();
+  if (key) roomDrafts.set(key, {text: $('input').value, attachments: pendingAttachments.slice()});
+}
+function restoreComposer() {
+  const draft = roomDrafts.get(composerKey());
+  $('input').value = draft?.text || '';
+  pendingAttachments = draft?.attachments?.slice() || [];
+  renderAttachments(); fitInput();
+}
+function saveRoomView() {
+  if (!state || openProject) return;
+  roomViews.set(state.session_id, {nodes: Array.from($('messages').children), oldest,
+    hasMore: !$('older').hidden, latestMessageId: state.messages.at(-1)?.id || 0});
+  if (roomViews.size > 20) {
+    const oldestRoom = Array.from(roomViews.keys()).find(sid => sid !== state.session_id && !roomRequests.has(sid));
+    if (oldestRoom) roomViews.delete(oldestRoom);
+  }
+}
+function roomRequest(sid) { return roomRequests.get(sid) || serverRequests.get(sid); }
+function viewedRequest() { return openProject ? null : roomRequest(state?.session_id); }
+function anyWork() { return auxiliaryBusy || roomRequests.size > 0 || serverRequests.size > 0 || Boolean(state?.busy); }
+function requestBadge(sid) {
+  const job = roomRequest(sid);
+  if (job) return job.finished ? (unreadRooms.has(sid) ? '새 답변' : '') : job.status === 'running' ? '생성 중' : '대기 중';
+  return unreadRooms.has(sid) ? '새 답변' : '';
+}
+function paintRequestBadges() {
+  document.querySelectorAll('[data-room-status]').forEach(el => {
+    const label = requestBadge(el.dataset.roomStatus);
+    el.textContent = label; el.hidden = !label;
+    el.classList.toggle('unread', label === '새 답변');
+  });
+}
 let settingsModelsRequest = 0;
 let pendingAttachments = [];
 // 여러 사람이 쓰기·프로젝트(2026-10-11): 열려 있는 프로젝트 화면과 그 내용
@@ -139,12 +179,12 @@ function appendLinked(el, text) {
 // 토큰을 붙여 받아 blob 주소로만 보인다(CSP img-src blob:) — 다른 주소의 그림은 그리지 않는다.
 const IMAGE_LINE = /^!\[([^\]\n]{0,200})\]\(alex-image:(\d{8}-\d{6}-\d{1,20}\.(?:png|jpg|webp))\)$/;
 const ATTACHMENT_LINE = /^!\[([^\]\n]{0,120})\]\(alex-attachment:([a-f0-9]{24}\.(?:png|jpg|webp))\)$/;
-function imageFigure(caption, name, attachment = false) {
+function imageFigure(caption, name, attachment = false, sessionId = state?.session_id) {
   const figure = node('figure', 'gen-image');
   const img = node('img'); img.alt = caption; img.title = '클릭하면 새 탭에서 크게 봅니다';
   const cap = node('figcaption', '', caption);
   figure.append(img, cap);
-  const path = attachment ? '/api/attachment?name=' + encodeURIComponent(name) + '&session_id=' + encodeURIComponent(state.session_id) : '/api/image?name=' + encodeURIComponent(name);
+  const path = attachment ? '/api/attachment?name=' + encodeURIComponent(name) + '&session_id=' + encodeURIComponent(sessionId) : '/api/image?name=' + encodeURIComponent(name);
   fetch(path, {headers})
     .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.blob(); })
     .then(blob => { const url = URL.createObjectURL(blob); img.src = url; img.addEventListener('click', () => window.open(url, '_blank', 'noopener')); })
@@ -182,39 +222,45 @@ function documentDownload(name) {
   });
   return button;
 }
-function appendWithImages(el, text) {
+function appendWithImages(el, text, sessionId = state?.session_id) {
   let buffer = [];
   const flush = () => { if (buffer.length) { appendLinked(el, buffer.join('\n')); buffer = []; } };
   for (const line of text.split('\n')) {
     const m = line.match(IMAGE_LINE), a = line.match(ATTACHMENT_LINE), v = line.match(VIDEO_LINE), d = line.match(DOCUMENT_LINE);
-    if (m) { flush(); el.append(imageFigure(m[1], m[2])); } else if (a) { flush(); el.append(imageFigure(a[1], a[2], true)); } else if (v) { flush(); el.append(videoFigure(v[1], v[2])); } else if (d) { flush(); el.append(documentDownload(d[1])); } else buffer.push(line);
+    if (m) { flush(); el.append(imageFigure(m[1], m[2])); } else if (a) { flush(); el.append(imageFigure(a[1], a[2], true, sessionId)); } else if (v) { flush(); el.append(videoFigure(v[1], v[2])); } else if (d) { flush(); el.append(documentDownload(d[1])); } else buffer.push(line);
   }
   flush();
 }
-function mediaLine(line) {
+function mediaLine(line, sessionId = state?.session_id) {
   const m = line.match(IMAGE_LINE), a = line.match(ATTACHMENT_LINE), v = line.match(VIDEO_LINE), d = line.match(DOCUMENT_LINE);
   if (m) return imageFigure(m[1], m[2]);
-  if (a) return imageFigure(a[1], a[2], true);
+  if (a) return imageFigure(a[1], a[2], true, sessionId);
   if (v) return videoFigure(v[1], v[2]);
   if (d) return documentDownload(d[1]);
   return null;
 }
-function renderContent(el, text, markdown = false) {
+function renderContent(el, text, markdown = false, sessionId = state?.session_id) {
   el.replaceChildren();
   // ALEX 답은 굵게·목록·표·코드 블록을 꾸며 보인다(markdown.js — HTML 은 실행하지 않고 글자로만 그린다).
   if (markdown && window.AlexMarkdown) {
     el.classList.add('markdown');
-    try { window.AlexMarkdown.render(el, text, mediaLine); return; } catch { el.replaceChildren(); }
+    try { window.AlexMarkdown.render(el, text, line => mediaLine(line, sessionId)); return; } catch { el.replaceChildren(); }
   }
   el.classList.remove('markdown');
   // Deliberately small formatter: no HTML evaluation or external markdown scripts.
   const chunks = text.split(/(```[^\n]*\n[\s\S]*?```)/g);
   for (const chunk of chunks) {
     if (chunk.startsWith('```') && chunk.endsWith('```')) {
+      const raw = chunk.slice(chunk.indexOf('\n') + 1, -3);
+      const value = raw.endsWith('\n') ? raw.slice(0, -1) : raw;
+      if (window.AlexMarkdown?.codeBlock) {
+        el.append(window.AlexMarkdown.codeBlock(value, chunk.slice(3, chunk.indexOf('\n')).trim()));
+        continue;
+      }
       const pre = node('pre');
-      const code = node('code', '', chunk.slice(chunk.indexOf('\n') + 1, -3).trimEnd());
+      const code = node('code', '', value);
       pre.append(code); el.append(pre);
-    } else appendWithImages(el, chunk);
+    } else appendWithImages(el, chunk, sessionId);
   }
 }
 function imageLoadingCard(phase, prompt) {
@@ -245,6 +291,7 @@ function imageProgressInfo(partial, requested) {
 }
 // 대화 한 줄: 내 말은 오른쪽 말풍선, ALEX 답은 말풍선 없이. 복사 등은 아래 줄에(마우스를 올리면 보인다).
 function message(role, text, parent = $('messages')) {
+  const sessionId = state?.session_id;
   const el = node('article', 'message ' + (role === 'user' ? 'user' : 'assistant'));
   const content = node('div', 'message-content');
   const actions = node('div', 'message-actions');
@@ -254,7 +301,7 @@ function message(role, text, parent = $('messages')) {
   actions.append(copy); el.append(content, actions); parent.append(el);
   const result = {el, content, actions, update(t, formatted = false) {
     value = t;
-    if (formatted) renderContent(content, t, role === 'assistant'); else content.textContent = t;
+    if (formatted) renderContent(content, t, role === 'assistant', sessionId); else content.textContent = t;
     el.querySelector('.learned-actions')?.remove();
     if (formatted && role === 'assistant') {
       const ids = [...t.matchAll(/^— (?:바로잡아 주신 내용을|찾은 내용을) 배웠습니다\(([0-9a-f]{8})/gm)]
@@ -273,28 +320,34 @@ function message(role, text, parent = $('messages')) {
   }, status(textValue) { content.replaceChildren(node('span', 'queue-note', textValue)); }};
   result.update(text, true); return result;
 }
-function lock(value) {
-  busy = value;
+function lock(value) { auxiliaryBusy = value; updateControls(); }
+function updateControls() {
+  const job = viewedRequest();
+  busy = auxiliaryBusy || navigating || Boolean(job);
+  requestId = job?.request_id || null;
   if (appStopped) {
     document.querySelectorAll('button, input, textarea, select').forEach(el => { el.disabled = true; });
     return;
   }
   // 토큰이 만료된 뒤에는 lock(false) 가 전송 버튼을 되살리면 안 된다.
   // 새로고침 전까지 어떤 요청도 성공하지 않는다.
-  $('send').disabled = value || tokenExpired || appStopped;
-  $('send').hidden = value;
+  $('send').disabled = busy || tokenExpired || appStopped;
+  $('send').hidden = Boolean(job);
   $('input').disabled = tokenExpired || appStopped;
-  $('new-chat').disabled = value;
-  $('attach').disabled = value || tokenExpired || appStopped;
-  $('screenshot').disabled = value || tokenExpired || appStopped;
-  $('knowledge-upload').disabled = value || tokenExpired || appStopped;
-  $('knowledge-form').querySelectorAll('input,button').forEach(b => { b.disabled = value || tokenExpired || appStopped; });
-  $('attachments').querySelectorAll('button').forEach(button => { button.disabled = value || tokenExpired || appStopped; });
-  $('media-prompt-open').disabled = value || tokenExpired || appStopped;
-  $('stop').hidden = !value;
-  $('stop').disabled = false;
-  $('stop').title = '생성 중단';
-  document.querySelectorAll('#sessions button, #projects button, #project-sessions .psession-row, #file-form button, [data-command]').forEach(b => { b.disabled = value; });
+  $('new-chat').disabled = auxiliaryBusy || tokenExpired;
+  $('attach').disabled = busy || tokenExpired || appStopped;
+  $('screenshot').disabled = busy || tokenExpired || appStopped;
+  $('knowledge-upload').disabled = busy || tokenExpired || appStopped;
+  $('knowledge-form').querySelectorAll('input,button').forEach(b => { b.disabled = busy || tokenExpired || appStopped; });
+  $('attachments').querySelectorAll('button').forEach(button => { button.disabled = busy || tokenExpired || appStopped; });
+  $('media-prompt-open').disabled = busy || tokenExpired || appStopped;
+  $('stop').hidden = !job;
+  $('stop').disabled = !requestId || Boolean(job?.cancelRequested);
+  $('stop').title = job?.cancelRequested ? '중단 요청 중…' : '이 대화의 생성 중단';
+  document.querySelectorAll('#sessions .session-item, #projects button').forEach(b => { b.disabled = auxiliaryBusy || tokenExpired; });
+  document.querySelectorAll('#sessions .session-delete').forEach(b => { b.disabled = auxiliaryBusy || Boolean(roomRequest(b.dataset.sessionId)); });
+  document.querySelectorAll('#file-form button, [data-command]').forEach(b => { b.disabled = busy || tokenExpired; });
+  paintRequestBadges();
 }
 // 대화 목록은 날짜별로 묶는다(Claude·ChatGPT 처럼).
 function dayGroup(iso) {
@@ -308,8 +361,18 @@ function dayGroup(iso) {
   return `${d.getFullYear()}년 ${d.getMonth() + 1}월`;
 }
 function paintState(s, history = false) {
-  if (state && state.session_id !== s.session_id) clearAttachments();
+  const changed = state && state.session_id !== s.session_id;
+  if (changed) { saveComposer(); saveRoomView(); }
+  const previousRequests = serverRequests;
+  serverRequests = new Map((s.queue?.requests || []).map(job => [job.session_id, job]));
+  for (const sid of previousRequests.keys()) {
+    if (!serverRequests.has(sid) && !roomRequests.has(sid)) {
+      if (sid === s.session_id && !openProject) history = true;
+      else unreadRooms.add(sid);
+    }
+  }
   state = s;
+  if (changed) restoreComposer();
   document.body.classList.toggle('member', !s.is_admin);
   $('account-name').textContent = ACCOUNTS_UI ? s.user.name : '이 PC';
   $('account-role').textContent = ACCOUNTS_UI ? `${s.is_admin ? '관리자' : '사용자'} · ${s.user.login}` : '기억 · 할 일 · 설정';
@@ -323,7 +386,7 @@ function paintState(s, history = false) {
   $('sessions').replaceChildren();
   let group = null;
   for (const item of s.sessions) {
-    if (!item.message_count && item.session_id !== s.session_id) continue;  // 빈 대화는 목록에 쌓지 않는다
+    if (!item.message_count && item.session_id !== s.session_id && !roomRequest(item.session_id)) continue;
     const title = item.title || '새 대화';
     const label = dayGroup(item.updated_at);
     if (label !== group) { group = label; const g = node('div', 'session-group', label); g.dataset.group = label; $('sessions').append(g); }
@@ -334,10 +397,12 @@ function paintState(s, history = false) {
     b.title = `${title} · ${item.message_count}개 메시지`;
     b.addEventListener('click', () => openSession(item.session_id));
     b.addEventListener('dblclick', () => renameSession(item.session_id, title));
+    const badge = node('small', 'room-status'); badge.dataset.roomStatus = item.session_id;
     const remove = node('button', 'session-delete', '×');
     remove.type = 'button'; remove.title = '이 대화 삭제'; remove.setAttribute('aria-label', `${title} 대화 삭제`);
     remove.addEventListener('click', () => deleteSession(item));
-    row.append(b, remove);
+    remove.dataset.sessionId = item.session_id;
+    row.append(b, badge, remove);
     $('sessions').append(row);
   }
   if (!s.sessions.length) $('sessions').append(node('div', 'side-empty', '아직 대화가 없습니다.'));
@@ -361,23 +426,56 @@ function paintState(s, history = false) {
   paintTasks(s.tasks || []);
   if (history) {
     $('messages').replaceChildren();
-    for (const m of s.messages) message(m.role, m.content);
-    oldest = s.messages[0]?.id;
-    $('older').hidden = !s.has_more;
-    $('welcome').hidden = s.messages.length > 0;
+    const job = roomRequests.get(s.session_id);
+    const cached = roomViews.get(s.session_id);
+    if (cached && cached.latestMessageId === (s.messages.at(-1)?.id || 0)) {
+      $('messages').append(...cached.nodes);
+      oldest = cached.oldest;
+      $('older').hidden = !cached.hasMore;
+    } else {
+      roomViews.delete(s.session_id);
+      for (const m of s.messages) {
+        if (!job || m.id <= job.beforeMessageId) message(m.role, m.content);
+      }
+      oldest = s.messages[0]?.id;
+      $('older').hidden = !s.has_more;
+    }
+    if (job) $('messages').append(job.user.el, job.answer.el);
+    $('welcome').hidden = $('messages').children.length > 0;
     scrollBottom();
   }
-  lock(busy);
+  updateControls();
 }
-async function refresh(history = false, sid = state?.session_id) {
-  paintState(await api('/api/state' + (sid ? '?session_id=' + encodeURIComponent(sid) : '')), history);
+async function refresh(history = false, sid = desiredSession || state?.session_id) {
+  const revision = ++snapshotRequest;
+  const s = await api('/api/state' + (sid ? '?session_id=' + encodeURIComponent(sid) : ''));
+  if (revision !== snapshotRequest || (desiredSession && sid !== desiredSession)) return;
+  paintState(s, history);
+}
+async function refreshVisible(history = false) {
+  if (navigating || appStopped || tokenExpired) return;
+  await refresh(history);
+  const id = openProject;
+  if (id) {
+    const data = await api('/api/project?id=' + encodeURIComponent(id));
+    if (openProject === id) paintProject(data);
+  }
 }
 // 대화 고르기·새 대화는 모델을 쓰지 않는다 — 다른 사람의 답을 기다리지 않고 바로 바뀐다.
 async function openSession(sid) {
-  if (busy) return;
+  if (auxiliaryBusy || tokenExpired || appStopped) return;
+  saveComposer();
+  saveRoomView();
   closeProject();
   setSidebar(false);
-  try { await refresh(true, sid); } catch (e) { notice(e.message); }
+  desiredSession = sid;
+  const version = ++navigationVersion;
+  navigating = true; updateControls();
+  try {
+    await refresh(true, sid);
+    if (version === navigationVersion) { unreadRooms.delete(sid); paintRequestBadges(); }
+  } catch (e) { if (version === navigationVersion) { desiredSession = state?.session_id; notice(e.message); } }
+  finally { if (version === navigationVersion) { navigating = false; updateControls(); } }
 }
 // 제목 직접 바꾸기: 위쪽 제목을 누르거나 목록에서 두 번 누른다. 모델을 쓰지 않으니 바로 바뀐다.
 async function renameSession(sid, current) {
@@ -388,22 +486,32 @@ async function renameSession(sid, current) {
 }
 $('title').addEventListener('click', () => { if (!openProject && state) renameSession(state.session_id, state.title); });
 async function newChat(projectId = '') {
-  const r = await api('/api/session/new', projectId ? {project_id: projectId} : {});
-  closeProject();
-  await refresh(true, r.session_id);
-  return r.session_id;
+  saveComposer();
+  const version = ++navigationVersion;
+  navigating = true; updateControls();
+  try {
+    const r = await api('/api/session/new', projectId ? {project_id: projectId} : {});
+    if (version !== navigationVersion) return null;
+    await openSession(r.session_id);
+    return r.session_id;
+  } finally { if (version === navigationVersion) { navigating = false; updateControls(); } }
 }
 // 대화 목록의 [×] (2026-09-26 사용자: "대화목록 제거 기능도 필요할거 같은데"). /delete-session 명령을 치지 않아도
 // 되게 하고, 확인 창 없이는 보내지 않는다. 보던 대화를 지우면 서버가 새 대화를 만들어 그 ID 를 돌려준다.
 async function deleteSession(item) {
-  if (busy || !state) return;
+  if (auxiliaryBusy || roomRequest(item.session_id) || !state) return;
   const title = item.title || '새 대화';
   if (!confirm(`“${title}” 대화를 삭제할까요?\n메시지 ${item.message_count}개가 지워지고 되돌릴 수 없습니다.`)) return;
   const current = state.session_id;
   lock(true);
   try {
     const r = await api('/api/session/delete', {session_id: current, target: item.session_id, confirmed: true});
-    await refresh(r.session_id !== current, r.session_id);
+    roomDrafts.delete(`session:${item.session_id}`); roomViews.delete(item.session_id); unreadRooms.delete(item.session_id);
+    if (state.session_id === current && r.session_id !== current) {
+      desiredSession = r.session_id;
+      await refresh(true, r.session_id);
+    }
+    else await refresh(false);
     if (openProject) await showProject(openProject);
     notice(`“${title}” 대화를 삭제했습니다.`);
   } catch (e) { notice(e.message); } finally { lock(false); }
@@ -424,9 +532,10 @@ async function models() {
 }
 async function submit(text = $('input').value.trim()) {
   if (busy || !state) return;
+  if (roomRequests.size >= 4) { notice('동시에 최대 4개 대화의 요청을 받을 수 있습니다. 하나가 끝난 뒤 보내 주세요.'); return; }
   // 프로젝트 화면에서 쓰면 그 프로젝트 안에 새 대화를 만들고 보낸다(Claude 프로젝트처럼).
   if (openProject && !text.trim().startsWith('/') && text.trim()) {
-    try { await newChat(openProject); } catch (e) { notice(e.message); return; }
+    try { if (!await newChat(openProject)) return; } catch (e) { notice(e.message); return; }
   }
   const selected = text.trim().startsWith('/') ? [] : pendingAttachments.slice();
   if (!text.trim() && selected.length) text = '첨부한 이미지의 내용을 설명해 주세요.';
@@ -434,12 +543,17 @@ async function submit(text = $('input').value.trim()) {
   const body = {message: text, session_id: state.session_id, attachments: selected.map(image => image.name)};
   if (new TextEncoder().encode(JSON.stringify(body)).length > 64000) { notice('요청이 너무 큽니다. 64KB 이하로 줄여 주세요.'); return; }
   const oldSession = state.session_id;
-  lock(true); notice(''); $('input').value = ''; fitInput(); $('welcome').hidden = true;
+  notice(''); $('input').value = ''; fitInput(); $('welcome').hidden = true;
   if (openProject) closeProject();
   const displayed = text + (selected.length ? '\n' + selected.map(image => `![첨부 이미지 ${image.width}×${image.height}](alex-attachment:${image.name})`).join('\n') : '');
-  message('user', displayed);
+  const user = message('user', displayed);
   clearAttachments(new Set(selected.map(image => image.name)));
   const answer = message('assistant', '');
+  const job = {session_id: oldSession, request_id: null, status: 'queued', finished: false,
+    beforeMessageId: state.messages.at(-1)?.id || 0, user, answer};
+  roomRequests.set(oldSession, job);
+  unreadRooms.delete(oldSession);
+  saveComposer(); updateControls();
   answer.status('생각하는 중…');
   answer.actions.hidden = true;  // 답이 오기 전에는 복사할 것이 없다
   const imageCommand = text.match(/^\/(?:image-prompt|image)\s+([\s\S]+)/);
@@ -462,26 +576,38 @@ async function submit(text = $('input').value.trim()) {
       for (const line of lines) {
         if (!line.trim()) continue;
         const event = JSON.parse(line);
-        if (event.type === 'start') requestId = event.request_id;
+        if (event.type === 'start') { job.request_id = event.request_id; updateControls(); }
         // 여러 사람이 쓸 때: 모델은 한 번에 한 사람의 답만 만든다. 기다리는 동안 순번을 보여 준다.
-        if (event.type === 'queue' && !partial) answer.status(`차례를 기다리는 중 · 앞에 ${event.position}명`);
+        if (event.type === 'queue' && !partial) {
+          job.status = 'queued'; job.position = event.position;
+          answer.status(`차례를 기다리는 중 · 앞에 ${event.position}명`); paintRequestBadges();
+        }
+        if (event.type === 'running') { job.status = 'running'; answer.status('생각하는 중…'); paintRequestBadges(); }
         if (event.type === 'chunk') {
-          const atBottom = $('chat-scroll').scrollHeight - $('chat-scroll').scrollTop - $('chat-scroll').clientHeight < 130;
+          job.status = 'running';
+          const atBottom = state?.session_id === oldSession && !openProject
+            && $('chat-scroll').scrollHeight - $('chat-scroll').scrollTop - $('chat-scroll').clientHeight < 130;
           if (event.text.startsWith('[그림 설명을 영어로 옮기는 중') || event.text.startsWith('[그리는 중: ')) imageProgressActive = true;
           partial += event.text;
           answer.update(partial);
           const imageProgress = imageProgressActive ? imageProgressInfo(partial, requestedImage) : null;
           if (imageProgress) answer.content.replaceChildren(imageLoadingCard(imageProgress.phase, imageProgress.prompt));
           if (atBottom) scrollBottom();
+          paintRequestBadges();
         }
         if (event.type === 'error') throw new Error(event.error);
         // 첫 답 뒤에 ALEX 가 지은 대화 제목(첫 메시지 그대로가 아니라 주제로)
         if (event.type === 'title') {
           if (state?.session_id === event.session_id && !openProject) $('title').textContent = event.title;
-          await refresh(false, event.session_id);
+          await refreshVisible(false);
         }
         if (event.type === 'done') {
-          finished = true; answer.update(event.response, true); answer.actions.hidden = false;
+          finished = true; job.finished = true;
+          const cached = roomViews.get(oldSession);
+          if (cached && event.session_id === oldSession && event.last_message_id !== undefined) cached.latestMessageId = event.last_message_id;
+          answer.update(event.response, true); answer.actions.hidden = false;
+          if (state?.session_id !== oldSession || openProject || navigating || desiredSession !== oldSession) unreadRooms.add(oldSession);
+          paintRequestBadges();
           const m = event.metrics || {}, meta = [];
           if (event.waited > 1) meta.push(`대기 ${event.waited}초`);
           if (event.elapsed !== undefined) meta.push(`${event.elapsed}초`);
@@ -499,7 +625,9 @@ async function submit(text = $('input').value.trim()) {
               row.append(apply, discard); answer.el.append(row);
             }
           }
-          await refresh(event.session_id !== oldSession || text === '/new', event.session_id);
+          if (event.session_id !== oldSession && state?.session_id === oldSession && !openProject && !navigating) {
+            await openSession(event.session_id);
+          } else await refreshVisible(false);
         }
       }
       if (done) break;
@@ -507,14 +635,23 @@ async function submit(text = $('input').value.trim()) {
     if (!finished) throw new Error('연결이 끊겼습니다. 새로고침해 저장된 응답을 확인하세요.');
   } catch (e) {
     answer.update((partial ? partial + '\n\n' : '') + '오류: ' + e.message); answer.actions.hidden = false;
-    notice('전송한 요청: ' + text.slice(0, 120) + '\n' + e.message);
+    if (state?.session_id === oldSession && !openProject) notice('전송한 요청: ' + text.slice(0, 120) + '\n' + e.message);
+    else unreadRooms.add(oldSession);
     // Keep the original request available for manual retry, never resend automatically.
-    if (!$('input').value) { $('input').value = text; fitInput(); }
-  } finally { requestId = null; lock(false); $('input').focus(); }
+    const draftKey = `session:${oldSession}`;
+    const draft = roomDrafts.get(draftKey) || {text: '', attachments: []};
+    if (!draft.text) { draft.text = text; roomDrafts.set(draftKey, draft); }
+    if (state?.session_id === oldSession && !openProject && !$('input').value) restoreComposer();
+  } finally {
+    roomRequests.delete(oldSession); serverRequests.delete(oldSession);
+    updateControls();
+    if (state?.session_id === oldSession && !openProject && !navigating) $('input').focus();
+    refreshVisible(false).catch(() => {});
+  }
 }
 // 입력창은 글이 길어지면 늘어난다(최대 240px).
 function fitInput() { const el = $('input'); el.style.height = 'auto'; el.style.height = Math.min(el.scrollHeight, 240) + 'px'; }
-$('input').addEventListener('input', fitInput);
+$('input').addEventListener('input', () => { fitInput(); saveComposer(); });
 $('chat-form').addEventListener('submit', e => { e.preventDefault(); submit(); });
 // Direct mode sends the prompt exactly as entered to ComfyUI; the chat model does not rewrite it.
 const mediaPromptDialog = $('media-prompt-dialog');
@@ -562,6 +699,7 @@ function clearAttachments(names = null) {
     return false;
   });
   renderAttachments();
+  saveComposer();
 }
 async function attachScreenshots(files) {
   if (busy || tokenExpired || appStopped || !state) return;
@@ -632,15 +770,17 @@ $('attach-file').addEventListener('change', async e => {
 });
 $('input').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); submit(); } });
 $('new-chat').addEventListener('click', async () => {
-  if (busy) return;
+  if (auxiliaryBusy || tokenExpired || appStopped) return;
   setSidebar(false);
   try { await newChat(); $('input').focus(); } catch (e) { notice(e.message); }
 });
 $('connection').addEventListener('click', models);
 $('stop').addEventListener('click', async () => {
-  if (!requestId) return;
-  $('stop').disabled = true; $('stop').title = '중단 요청 중…';
-  try { await api('/api/cancel', {request_id: requestId}); } catch (e) { notice(e.message); }
+  const job = viewedRequest();
+  if (!job?.request_id) return;
+  job.cancelRequested = true; updateControls();
+  try { await api('/api/cancel', {request_id: job.request_id}); }
+  catch (e) { job.cancelRequested = false; updateControls(); notice(e.message); }
 });
 document.querySelectorAll('[data-prompt]').forEach(b => b.addEventListener('click', () => submit(b.dataset.prompt)));
 document.querySelectorAll('[data-command]').forEach(b => b.addEventListener('click', () => submit(b.dataset.command)));
@@ -671,8 +811,10 @@ $('knowledge-file').addEventListener('change', async e => {
 $('older').addEventListener('click', async () => {
   if (!oldest || busy) return;
   const button = $('older'); button.disabled = true;
+  const sid = state.session_id, version = navigationVersion;
   try {
-    const page = await api(`/api/history?session_id=${encodeURIComponent(state.session_id)}&before=${oldest}`);
+    const page = await api(`/api/history?session_id=${encodeURIComponent(sid)}&before=${oldest}`);
+    if (state.session_id !== sid || version !== navigationVersion) return;
     const fragment = document.createDocumentFragment();
     for (const m of page.messages) message(m.role, m.content, fragment);
     $('messages').prepend(fragment); oldest = page.messages[0]?.id; button.hidden = !page.has_more;
@@ -729,21 +871,30 @@ $('task-form').addEventListener('submit', async e => {
 
 // ── 프로젝트(Gemini Gems·Claude Projects 처럼): 이름 + 지침 + 자료 + 그 안의 대화
 async function showProject(id) {
-  if (busy) return;
+  if (auxiliaryBusy || tokenExpired || appStopped) return;
+  saveComposer();
+  saveRoomView();
+  const version = ++navigationVersion;
+  navigating = true; updateControls();
   try {
     const data = await api('/api/project?id=' + encodeURIComponent(id));
+    if (version !== navigationVersion) return;
     openProject = id;
+    restoreComposer();
     paintProject(data);
     $('project-view').hidden = false; $('chat-view').hidden = true;
     $('title').textContent = data.project.name; $('title-project').hidden = true;
     $('input').placeholder = `“${data.project.name}” 안에서 새 대화 시작`;
     setSidebar(false);
     if (state) paintState(state);
-  } catch (e) { notice(e.message); }
+  } catch (e) { if (version === navigationVersion) notice(e.message); }
+  finally { if (version === navigationVersion) { navigating = false; updateControls(); } }
 }
 function closeProject() {
   if (!openProject) return;
+  saveComposer();
   openProject = null; projectData = null;
+  restoreComposer();
   $('project-view').hidden = true; $('chat-view').hidden = false;
   $('input').placeholder = 'ALEX 에게 메시지 보내기';
   if (state) paintState(state);
@@ -773,11 +924,14 @@ function paintProject(data) {
     const row = node('div', 'psession-row');
     row.tabIndex = 0;
     row.append(node('span', '', item.title || '새 대화'), node('small', 'muted', dayGroup(item.updated_at)));
+    const badge = node('small', 'room-status'); badge.dataset.roomStatus = item.session_id;
+    row.append(badge);
     row.addEventListener('click', () => openSession(item.session_id));
     row.addEventListener('keydown', e => { if (e.key === 'Enter') openSession(item.session_id); });
     $('project-sessions').append(row);
   }
   if (!data.sessions.length) $('project-sessions').append(node('small', 'muted', '아직 대화가 없습니다. 아래 입력창에 쓰면 시작됩니다.'));
+  paintRequestBadges();
 }
 $('title-project').addEventListener('click', () => { if (state?.project) showProject(state.project.id); });
 $('project-new').addEventListener('click', () => {
@@ -805,12 +959,13 @@ $('project-form').addEventListener('submit', async e => {
   } catch (err) { $('project-error').textContent = err.message; }
 });
 $('project-delete').addEventListener('click', async () => {
-  if (!projectData || busy) return;
+  if (!projectData || anyWork()) return;
   const {project, sessions} = projectData;
   if (!confirm(`“${project.name}” 프로젝트를 삭제할까요?\n안의 대화 ${sessions.length}개와 이 프로젝트에만 올린 자료도 지워지고 되돌릴 수 없습니다.`)) return;
   try {
     const r = await api('/api/project', {action: 'delete', id: project.id, confirmed: true});
     closeProject();
+    desiredSession = r.session_id;
     await refresh(true, r.session_id);
     notice(`“${project.name}” 프로젝트를 삭제했습니다.`);
   } catch (e) { notice(e.message); }
@@ -899,7 +1054,7 @@ async function openSettings() {
       ];
     }),
   ].join('\n') : '실제 적용 설정은 앱을 다시 시작한 뒤 확인할 수 있습니다.';
-  if (busy) { $('settings-error').textContent = '응답이 끝난 뒤 모델 설정을 바꿀 수 있습니다.'; return; }
+  if (anyWork()) { $('settings-error').textContent = '모든 대화의 요청이 끝난 뒤 모델 설정을 바꿀 수 있습니다.'; return; }
   await populateSettingsModels();
 }
 $('settings-open').addEventListener('click', openSettings);
@@ -1013,7 +1168,7 @@ $('password-form').addEventListener('submit', async e => {
 });
 $('logout').addEventListener('click', async () => {
   closeMenu();
-  if (busy) { notice('응답이 끝난 뒤 바꾸세요.'); return; }
+  if (anyWork()) { notice('모든 대화의 요청이 끝난 뒤 바꾸세요.'); return; }
   try { await api('/api/logout', {}); } catch { /* 이미 로그아웃 */ }
   location.reload();
 });
@@ -1052,11 +1207,11 @@ function filterSessions() {
   for (const label of $('sessions').querySelectorAll('.session-group')) label.hidden = !rows.some(row => row.dataset.group === label.dataset.group && !row.hidden);
 }
 $('session-search').addEventListener('input', filterSessions);
-$('workspace-change').addEventListener('click', () => { if (busy) return; $('workspace-path').value = state.project_root; $('workspace-error').textContent = ''; $('workspace-dialog').showModal(); });
+$('workspace-change').addEventListener('click', () => { if (anyWork()) { notice('모든 대화의 요청이 끝난 뒤 프로젝트 폴더를 바꾸세요.'); return; } $('workspace-path').value = state.project_root; $('workspace-error').textContent = ''; $('workspace-dialog').showModal(); });
 $('workspace-close').addEventListener('click', () => $('workspace-dialog').close());
-$('workspace-form').addEventListener('submit', async e => { e.preventDefault(); if (busy) return; try { await api('/api/workspace', {path: $('workspace-path').value, confirmed: true, session_id: state.session_id}); await refresh(); $('workspace-dialog').close(); notice('프로젝트 폴더를 변경했습니다. 기존의 미적용 수정안은 폐기됩니다.'); } catch (e) { $('workspace-error').textContent = e.message; } });
+$('workspace-form').addEventListener('submit', async e => { e.preventDefault(); if (anyWork()) { $('workspace-error').textContent = '모든 대화의 요청이 끝난 뒤 바꾸세요.'; return; } try { await api('/api/workspace', {path: $('workspace-path').value, confirmed: true, session_id: state.session_id}); await refresh(); $('workspace-dialog').close(); notice('프로젝트 폴더를 변경했습니다. 기존의 미적용 수정안은 폐기됩니다.'); } catch (e) { $('workspace-error').textContent = e.message; } });
 $('shutdown').addEventListener('click', async () => {
-  if (busy) { notice('생성 완료 또는 중단 후 종료하세요.'); return; }
+  if (anyWork()) { notice('모든 대화의 요청을 완료 또는 중단한 뒤 종료하세요.'); return; }
   if (appStopped) return;
   if (!confirm('ALEX를 종료할까요?\n대화와 작업 기록은 저장됩니다. ALEX 서버와 직접 시작한 이미지·영상 엔진을 종료합니다.\nOllama와 따로 실행한 이미지·영상 엔진은 별도 서비스로 계속 실행됩니다.')) return;
   lock(true);
@@ -1163,7 +1318,7 @@ function renderCatalog(data) {
                 }
                 return;
             }
-            if (busy) return;
+            if (anyWork()) { notice('모든 대화의 요청이 끝난 뒤 모델을 다운로드하세요.'); return; }
             const free = data.storage?.free_gb == null ? '확인 불가' : `${data.storage.free_gb}GiB`;
             if (!confirm(`예상 크기 ${cand.download_size_gb ?? '확인 불가'}GB · 저장 공간 여유 ${free}\n${cand.memory_estimate?.label || '메모리 추정 불가'}입니다. 다운로드하시겠습니까?`)) return;
             downloading = true;
@@ -1237,10 +1392,18 @@ async function pullModel(tag, btn) {
   try {
     const who = await api('/api/me');
     if (!who.user) { showLogin(who.can_use_owner); return; }
-    await refresh(true); await models();
-    if (state.queue?.position != null) notice('보낸 요청이 아직 처리 중입니다. 끝나면 대화에 저장됩니다 — 잠시 뒤 새로고침하세요.');
+    await refresh(true); desiredSession = state.session_id; await models();
+    if (serverRequests.size) notice('처리 중인 대화가 있습니다. 다른 방으로 이동할 수 있고, 완료되면 저장된 답변을 표시합니다.');
   } catch (e) { if (!tokenExpired && $('login-screen').hidden) notice('서버에 연결하지 못했습니다: ' + e.message); }
 })();
+// 다른 탭의 요청과 대기열 순서를 확인한다. 모델을 추가로 호출하지 않는다.
+setInterval(async () => {
+  if (polling || navigating || auxiliaryBusy || !state || appStopped || tokenExpired
+      || !roomRequests.size && !serverRequests.size) return;
+  polling = true;
+  try { await refreshVisible(false); } catch { /* 스트림 자체가 오류를 안내한다 */ }
+  finally { polling = false; }
+}, 1500);
 // 홈 화면에 설치하는 앱(PWA, 2026-10-11): HTTPS(휴대폰·노트북의 Tailscale 주소)에서만 서비스 워커를 쓴다.
 // 워커는 페이지·API 를 저장하지 않고, 연결이 끊겼을 때 안내만 보여 준다(sw.js).
 if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('/sw.js').catch(() => {});

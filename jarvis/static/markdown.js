@@ -12,6 +12,40 @@ window.AlexMarkdown = (() => {
   const sourceLine = /^\[(\d+)\] (.+) — (https?:\/\/\S+)$/;
   const listLine = /^(\s*)([-+*]|\d+[.)])\s+(.+)$/;
 
+  function codeBlock(text, language = '') {
+    const block = make('div'), toolbar = make('div'), pre = make('pre'), content = make('code', text);
+    block.className = 'code-block'; toolbar.className = 'code-toolbar';
+    const label = make('span', /^[\w+-]{1,30}$/.test(language) ? language : '코드');
+    if (/^[\w+-]{1,30}$/.test(language)) content.dataset.language = language;
+    const copy = make('button', '코드 전체 복사');
+    copy.type = 'button'; copy.className = 'code-copy';
+    copy.setAttribute('aria-label', '코드 전체 복사'); copy.setAttribute('aria-live', 'polite');
+    let reset;
+    copy.addEventListener('click', async () => {
+      clearTimeout(reset); copy.disabled = true;
+      let copied = false;
+      try { await navigator.clipboard.writeText(content.textContent); copied = true; } catch {
+        // Clipboard API may be unavailable on HTTP or denied by browser settings.
+        const active = document.activeElement, area = make('textarea');
+        area.value = content.textContent; area.className = 'code-copy-buffer';
+        area.setAttribute('aria-hidden', 'true'); area.tabIndex = -1;
+        block.append(area); area.select();
+        try { copied = document.execCommand('copy'); } catch { /* select code below */ }
+        area.remove(); active?.focus({preventScroll: true});
+      }
+      copy.disabled = false;
+      copy.textContent = copied ? '복사됨' : '코드를 선택했습니다';
+      copy.title = copied ? '' : 'Ctrl+C 또는 기기의 복사 기능을 사용해 주세요.';
+      if (!copied) {
+        const range = document.createRange(); range.selectNodeContents(content);
+        const selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(range);
+      }
+      reset = setTimeout(() => { copy.textContent = '코드 전체 복사'; copy.title = ''; }, 2000);
+    });
+    toolbar.append(label, copy); pre.append(content); block.append(toolbar, pre);
+    return block;
+  }
+
   function link(label, raw) {
     try {
       const url = new URL(raw);
@@ -80,10 +114,8 @@ window.AlexMarkdown = (() => {
         const code = [], closer = new RegExp('^\\s{0,3}' + fence[1][0] + '{' + fence[1].length + ',}\\s*$');
         while (i < lines.length && !closer.test(lines[i])) code.push(lines[i++]);
         if (i < lines.length) i++;
-        const pre = make('pre'), content = make('code', code.join('\n'));
         const language = fence[2].trim().split(/\s+/)[0];
-        if (/^[\w+-]{1,30}$/.test(language)) content.dataset.language = language;
-        pre.append(content); element.append(pre); continue;
+        element.append(codeBlock(code.join('\n'), language)); continue;
       }
       const picture = media(line);
       if (picture) { flush(); element.append(picture); i++; continue; }
@@ -144,5 +176,5 @@ window.AlexMarkdown = (() => {
     }
     flush();
   }
-  return {render};
+  return {render, codeBlock};
 })();

@@ -108,10 +108,11 @@ class Viewer:
 
 @dataclass
 class Ticket:
-    """대기열의 요청 하나. 모델은 한 번에 하나만 답하므로 사람들은 차례를 기다린다."""
+    """채팅방 하나의 요청. 화면 이동과 무관하게 같은 방의 요청을 식별한다."""
     user_id: str
     request_id: str = field(default_factory=lambda: secrets.token_hex(12))
     cancel: threading.Event = field(default_factory=threading.Event)
+    session_id: str = ""
 
 
 def _provider_backend(provider: object) -> str:
@@ -146,7 +147,8 @@ class WebAppState:
     queue_cv: threading.Condition = field(default_factory=threading.Condition)
     running: Ticket | None = None
     exchange_owner: str = OWNER
-    exchanges: dict[str, tuple[Any, Any]] = field(default_factory=dict)
+    exchange_session: str = ""
+    exchanges: dict[tuple[str, str], tuple[Any, Any]] = field(default_factory=dict)
     login_failures: dict[str, tuple[int, float]] = field(default_factory=dict)
 
     def owner_viewer(self) -> Viewer:
@@ -172,27 +174,36 @@ class WebAppState:
             self.current[viewer.id] = session_id
             self.core.storage.set_state(f"web.current_session.{viewer.id}", session_id)
 
-    def ticket_for(self, user_id: str) -> Ticket | None:
+    def ticket_for(self, user_id: str, session_id: str | None = None) -> Ticket | None:
         with self.queue_cv:
-            return next((t for t in self.queue if t.user_id == user_id), None)
+            return next((t for t in self.queue if t.user_id == user_id
+                         and (session_id is None or t.session_id == session_id)), None)
 
-    def queue_info(self, viewer: Viewer) -> dict[str, Any]:
+    def queue_info(self, viewer: Viewer, session_id: str | None = None) -> dict[str, Any]:
         with self.queue_cv:
-            mine = next((i for i, t in enumerate(self.queue) if t.user_id == viewer.id), None)
+            mine = next((i for i, t in enumerate(self.queue) if t.user_id == viewer.id
+                         and (session_id is None or t.session_id == session_id)), None)
             return {"running": self.running is not None or self.active_id is not None,
                     "waiting": max(0, len(self.queue) - (1 if self.running is not None else 0)),
-                    "position": mine}
+                    "position": mine,
+                    "requests": [{"request_id": t.request_id, "session_id": t.session_id,
+                                  "status": "running" if t is self.running else "queued",
+                                  "position": 0 if t is self.running else max(i, 1)}
+                                 for i, t in enumerate(self.queue) if t.user_id == viewer.id]}
 
     @contextmanager
-    def acting_as(self, viewer: Viewer):
+    def acting_as(self, viewer: Viewer, session_id: str = ""):
         """한 사람의 요청을 처리하는 동안만 그 사람의 문맥으로 바꾼다. 모델은 한 번에 한 요청만 처리하므로(state.lock)
-        코어 하나를 차례로 나눠 쓴다. 직전 문답(교정·그림 고치기에 쓰는)은 사람마다 따로 두고, 관리자가 아니면
+        코어 하나를 차례로 나눠 쓴다. 직전 문답(교정·그림 고치기에 쓰는)은 사람과 방마다 따로 두고, 관리자가 아니면
         이 PC 의 파일·명령에 닿는 길과 자동 학습·코드 실행 확인을 끈다."""
         core = self.core
-        if self.exchange_owner != viewer.id:
-            self.exchanges[self.exchange_owner] = (core.last_exchange, core.last_route_event_id)
-            core.last_exchange, core.last_route_event_id = self.exchanges.pop(viewer.id, (None, None))
-            self.exchange_owner = viewer.id
+        key = (viewer.id, session_id)
+        previous = (self.exchange_owner, self.exchange_session)
+        if previous != key:
+            if self.exchange_session:
+                self.exchanges[previous] = (core.last_exchange, core.last_route_event_id)
+            core.last_exchange, core.last_route_event_id = self.exchanges.pop(key, (None, None))
+            self.exchange_owner, self.exchange_session = key
         saved = (core.member_mode, core.auto_lessons, core.code_check)
         if not viewer.is_admin:
             core.member_mode, core.auto_lessons, core.code_check = True, False, False
@@ -240,7 +251,7 @@ class WebAppState:
             sid = self.current_session(viewer)
         storage = self.core.storage
         providers = [self.core.providers[d] for d in (Destination.LOCAL_GENERAL, Destination.LOCAL_CODER)]
-        mine = self.ticket_for(viewer.id)
+        mine = self.ticket_for(viewer.id, sid)
         data = {
             "session_id": sid, "title": storage.session_title(sid), "cloud_web_approval": False, "local_only": True,
             "user": viewer.public(), "is_admin": viewer.is_admin,
@@ -262,8 +273,8 @@ class WebAppState:
             "mock": not isinstance(providers[0], OllamaProvider),
             "busy": self.active_id is not None,
             # 다른 사람의 요청 번호는 내주지 않는다 — 중단은 자기 요청만
-            "request_id": self.active_id if viewer.is_admin else (mine.request_id if mine else None),
-            "queue": self.queue_info(viewer),
+            "request_id": mine.request_id if mine else None,
+            "queue": self.queue_info(viewer, sid),
             "active_kind": self.active_kind, "shutting_down": self.shutting_down,
         }
         if not viewer.is_admin:
@@ -482,9 +493,12 @@ class WebAppState:
         target = target.strip()
         current = viewing if self.owns(viewer, viewing) else self.current_session(viewer)
         # 다른 사람의 대화는 없는 것과 같다
-        if not self.owns(viewer, target) or not self.core.storage.delete_session(target):
-            raise ValueError("대화를 찾을 수 없습니다. 새로고침해 주세요.")
-        for exchange in (self.core.last_exchange, *(e[0] for e in self.exchanges.values())):
+        with self.queue_cv:
+            if self.ticket_for(viewer.id, target) is not None:
+                raise ValueError("이 대화에 처리 중인 요청이 있습니다. 완료 또는 중단 후 삭제하세요.")
+            if not self.owns(viewer, target) or not self.core.storage.delete_session(target):
+                raise ValueError("대화를 찾을 수 없습니다. 새로고침해 주세요.")
+        for exchange in (self.core.last_exchange, *(e[0] for e in self.exchanges.copy().values())):
             if (exchange or {}).get("session_id") == target:
                 exchange.clear()  # 지운 대화의 질문·답을 메모리에도 남기지 않는다
         if not self.core.last_exchange:
@@ -507,10 +521,20 @@ class WebAppState:
         if len(text) > 32_000:
             raise ValueError("메시지가 너무 깁니다. 32000자 이하로 줄여 주세요.")
 
-        with self.lock, self.acting_as(viewer):
+        with self.lock:
+            user = self.core.storage.get_user(viewer.id)
+            if user is None or user.disabled:
+                raise PermissionError("사용 중지된 계정입니다. 다시 로그인해 주세요.")
+            viewer = Viewer(user, viewer.remote)
             sid = session_id or self.current_session(viewer)
             if not self.owns(viewer, sid):
                 raise ValueError("대화를 찾을 수 없습니다. 새로고침해 주세요.")
+            return self._process_in_session(message, attachments, viewer, sid)
+
+    def _process_in_session(self, message: str, attachments: list[str] | None, viewer: Viewer,
+                            sid: str) -> dict[str, Any]:
+        text = message.strip()
+        with self.acting_as(viewer, sid):
             before_count = self.core.storage.message_count(sid)
             if attachments:
                 if text.startswith("/"):
@@ -519,17 +543,26 @@ class WebAppState:
                 response, decision = self.core.handle_images(sid, text, images)
                 if before_count == 0:
                     self.core.storage.rename_session(sid, provisional_title(text))
-                self.set_current(viewer, sid)
                 result = {"response": response, "route": decision.destination.value, "session_id": sid,
                           "attachment_error": self.core._answer_failed, "new_conversation": before_count == 0}
             elif text.startswith("/"):
+                if text.startswith("/delete-session ") and text.endswith(" --yes"):
+                    target = text.removeprefix("/delete-session ")[:-6].strip()
+                    target = sid if target == "current" else target
+                    with self.queue_cv:
+                        if any(t.user_id == viewer.id and t.session_id == target and t is not self.running
+                               for t in self.queue):
+                            return {"response": "이 대화에 처리 중인 요청이 있습니다. 완료 또는 중단 후 삭제하세요.",
+                                    "route": "command", "session_id": sid}
                 if not viewer.is_admin and text.split(None, 1)[0] not in MEMBER_COMMANDS:
                     output, keep_running, new_session = "이 명령은 관리자만 쓸 수 있습니다.", True, sid
                 else:
                     output, keep_running, new_session = handle_command(self.core, sid, text)
                 if not self.owns(viewer, new_session):
                     new_session = sid
-                self.set_current(viewer, new_session)
+                # 다른 방을 보는 동안 끝난 요청이 현재 대화 선택을 되돌리지 않는다.
+                if new_session != sid and self.current_session(viewer) == sid:
+                    self.set_current(viewer, new_session)
                 if not keep_running:  # Web server 자체를 /exit 로 종료하지 않는다.
                     output = "Web UI에서는 /exit로 서버를 종료하지 않습니다. 터미널에서 Ctrl+C를 사용하세요."
                 result = {"response": output, "route": "command", "session_id": new_session}
@@ -537,7 +570,6 @@ class WebAppState:
                 response, decision = self.core.handle(sid, text)
                 if before_count == 0:
                     self.core.storage.rename_session(sid, provisional_title(text))
-                self.set_current(viewer, sid)
                 result = {"response": response, "route": decision.destination.value, "session_id": sid,
                           "new_conversation": before_count == 0}
             # 이 답에 나온 그림·영상·문서는 이 사람 것이다 — 다른 사람이 이름을 맞혀도 받지 못한다
@@ -855,7 +887,7 @@ def _handler_factory(state: WebAppState):
                     self._json(HTTPStatus.CONFLICT, {"error": "응답 생성 중입니다. 완료 또는 중단 후 다시 시도하세요."})
                     return
                 try:
-                    with state.acting_as(viewer):
+                    with state.acting_as(viewer, sid):
                         reply = state.core.add_reference_picture(sid, data, unquote(self.headers.get("X-File-Name", ""))[:120])
                 finally:
                     state.lock.release()
@@ -1079,8 +1111,9 @@ def _handler_factory(state: WebAppState):
         def _stream(self, message: str, attachments: list[str] | None = None, viewer: Viewer | None = None,
                     session_id: str | None = None, ticket: Ticket | None = None) -> None:
             viewer = viewer or state.owner_viewer()
+            session_id = session_id or state.current_session(viewer)
             if ticket is None:
-                ticket = Ticket(viewer.id)
+                ticket = Ticket(viewer.id, session_id=session_id)
                 with state.queue_cv:
                     state.queue.append(ticket)
             disconnected = False
@@ -1096,11 +1129,8 @@ def _handler_factory(state: WebAppState):
                     disconnected = True
                     ticket.cancel.set()
 
-            previous = state.core.response_chunk_callback
-            previous_command_cancel_event = getattr(state.core, "command_cancel_event", None)
-            local = {p for p in state.core.providers.values() if isinstance(p, OllamaProvider)}
-            if isinstance(state.core.local_summarizer, OllamaProvider):
-                local.add(state.core.local_summarizer)
+            previous = previous_command_cancel_event = None
+            local: set[OllamaProvider] = set()
             acquired = False
             waited_from = time.monotonic()
             try:
@@ -1109,7 +1139,7 @@ def _handler_factory(state: WebAppState):
                 self.send_header("Connection", "close")
                 self.end_headers()
                 self.close_connection = True
-                emit({"type": "start", "request_id": ticket.request_id})
+                emit({"type": "start", "request_id": ticket.request_id, "session_id": session_id})
                 acquired = self._wait_turn(ticket, emit)
                 if not acquired:
                     emit({"type": "done", "cancelled": True, "session_id": session_id or state.current_session(viewer),
@@ -1119,16 +1149,24 @@ def _handler_factory(state: WebAppState):
                 state.running = ticket
                 state.active_id, state.active_kind = ticket.request_id, "chat"
                 state.cancel_event = ticket.cancel
+                # 대기 중인 요청의 취소/끊김은 실행 중인 다른 방의 콜백과 취소 신호를 건드리지 않는다.
+                previous = state.core.response_chunk_callback
+                previous_command_cancel_event = getattr(state.core, "command_cancel_event", None)
+                local = {p for p in state.core.providers.values() if isinstance(p, OllamaProvider)}
+                if isinstance(state.core.local_summarizer, OllamaProvider):
+                    local.add(state.core.local_summarizer)
                 started = time.monotonic()
+                emit({"type": "running", "request_id": ticket.request_id, "session_id": session_id})
                 state.core.response_chunk_callback = lambda chunk: emit({"type": "chunk", "text": chunk})
                 state.core.command_cancel_event = state.cancel_event
                 for p in local:
                     p.cancel_event = state.cancel_event
                     p.last_metrics = {}
                 result = state.process(message, attachments, viewer=viewer, session_id=session_id)
+                saved = state.core.storage.message_page(result["session_id"], limit=1)["messages"]
                 metrics = next((p.last_metrics for p in local if p.last_metrics), {})
                 emit({"type": "done", **result, "metrics": metrics, "elapsed": round(time.monotonic() - started, 2),
-                      "waited": round(started - waited_from, 1)})
+                      "waited": round(started - waited_from, 1), "last_message_id": saved[-1]["id"] if saved else 0})
                 if not disconnected and (title := state.auto_title(result, message)):
                     emit({"type": "title", "session_id": result["session_id"], "title": title})
             except GenerationCancelled:
@@ -1137,11 +1175,11 @@ def _handler_factory(state: WebAppState):
             except Exception:
                 emit({"type": "error", "error": "요청을 완료하지 못했습니다. 새로고침해 저장된 대화를 확인하세요."})
             finally:
-                state.core.response_chunk_callback = previous
-                state.core.command_cancel_event = previous_command_cancel_event
-                for p in local:
-                    p.cancel_event = None
                 if acquired:
+                    state.core.response_chunk_callback = previous
+                    state.core.command_cancel_event = previous_command_cancel_event
+                    for p in local:
+                        p.cancel_event = None
                     state.running = None
                     state.active_id = None
                     state.active_kind = None
@@ -1234,8 +1272,11 @@ def _handler_factory(state: WebAppState):
                     project_id = str(body.get("project_id") or "")
                     if project_id and state.core.storage.get_project(project_id, owner=viewer.id) is None:
                         raise ValueError("프로젝트를 찾을 수 없습니다.")
-                    sid = (state.core.storage.empty_session(viewer.id, project_id)
-                           or state.core.storage.create_session(viewer.id, project_id=project_id))
+                    with state.queue_cv:
+                        sid = state.core.storage.empty_session(viewer.id, project_id)
+                        if sid and any(t.session_id == sid for t in state.queue):
+                            sid = None  # 아직 메시지를 쓰기 전인 대기 중 방을 '새 대화'로 재사용하지 않는다
+                        sid = sid or state.core.storage.create_session(viewer.id, project_id=project_id)
                     state.set_current(viewer, sid)
                     self._json(HTTPStatus.OK, {"session_id": sid})
                     return
@@ -1253,11 +1294,13 @@ def _handler_factory(state: WebAppState):
                     self._json(HTTPStatus.OK, self._personal(viewer, body))
                     return
                 if self.path == "/api/session/delete":
-                    # 이 사람의 답이 만들어지는 중이거나, 누가 잡고 있는지 모르는 작업(엔진 전환 등) 중이면 기다리게 한다
-                    mine, running = state.ticket_for(viewer.id), state.running
+                    # 실행/대기 중인 방을 지워 요청이 갈 곳을 잃지 않게 한다. 다른 방의 삭제는 허용한다.
+                    mine, running = state.ticket_for(viewer.id, body.get("target")), state.running
                     locked = running is None and state.lock.acquire(blocking=False)
-                    if (mine is not None and mine is running) or (running is None and not locked):
-                        self._json(HTTPStatus.CONFLICT, {"error": "응답 생성 중입니다. 완료 또는 중단 후 다시 시도하세요."})
+                    if mine is not None or (running is None and not locked):
+                        if locked:
+                            state.lock.release()
+                        self._json(HTTPStatus.CONFLICT, {"error": "이 대화에 처리 중인 요청이 있습니다. 완료 또는 중단 후 삭제하세요."})
                         return
                     try:
                         self._json(HTTPStatus.OK, state.delete_session(body.get("target"), body.get("confirmed"),
@@ -1271,18 +1314,29 @@ def _handler_factory(state: WebAppState):
                     self._json(HTTPStatus.CONFLICT, {"error": "다른 탭에서 대화가 바뀌었습니다. 새로고침 후 전송하세요."})
                     return
                 if self.path == "/api/chat/stream":
+                    # 접수할 때 방을 고정한다. 기다리는 동안 사용자가 다른 방을 골라도 바뀌지 않는다.
+                    session_id = session_id or state.current_session(viewer)
                     message, attachments = self._chat_body(body, viewer, session_id)
                     if state.shutting_down:
                         self._json(HTTPStatus.CONFLICT, {"error": "앱을 종료하는 중입니다."})
                         return
                     with state.queue_cv:
-                        if any(t.user_id == viewer.id for t in state.queue):
+                        if not state.owns(viewer, session_id):
+                            self._json(HTTPStatus.CONFLICT, {"error": "대화가 삭제되었습니다. 새 대화를 열어 주세요."})
+                            return
+                        mine = [t for t in state.queue if t.user_id == viewer.id]
+                        if any(t.session_id == session_id for t in mine):
                             ticket = None
+                            rejection = "이 대화의 앞선 요청이 끝난 뒤 보내 주세요. 다른 대화에서는 전송할 수 있습니다."
+                        elif len(mine) >= 4:
+                            ticket = None
+                            # HTTP/1.1 브라우저 연결을 전부 긴 스트림으로 채우면 방 이동·중단도 막힌다.
+                            rejection = "동시에 최대 4개 대화의 요청을 받을 수 있습니다. 하나가 끝난 뒤 다시 보내 주세요."
                         else:
-                            ticket = Ticket(viewer.id)
+                            ticket = Ticket(viewer.id, session_id=session_id)
                             state.queue.append(ticket)
                     if ticket is None:
-                        self._json(HTTPStatus.CONFLICT, {"error": "앞의 요청이 끝난 뒤 보내 주세요. 중단하려면 ■ 를 누르세요."})
+                        self._json(HTTPStatus.CONFLICT, {"error": rejection})
                         return
                     self._stream(message, attachments, viewer, session_id, ticket)
                     return
