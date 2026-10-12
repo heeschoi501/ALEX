@@ -1,4 +1,23 @@
-# TEST RESULTS — Project ALEX (구 JARVIS) v0.2.0
+# TEST RESULTS — Project ALEX (구 JARVIS)
+
+## 2026-10-12 — 공개본 대기열·PWA 보완
+
+기준: `main`의 `4a39bf4aeb77e07bd87ead5dd5af32de834ede0f`에서 수정. Linux / Python 3.12.14, 모델·GPU 호출 없이 임시 DB와 테스트 서버 사용.
+
+| 검사 | 결과 |
+|---|---|
+| 전체 단위·통합, ResourceWarning 포함 | 1,323개: 1,318 PASS·5 SKIP·0 FAIL; 51.928초 |
+| 스트리밍 상태 회귀 | 7/7 PASS; 새 테스트 5개는 수정 전 실패 확인(오류·생성 취소 subTest 포함 6개 실패) |
+| 사용자 분리·프로젝트 HTTP 검사 | 15/15 PASS |
+| Python 3.10 문법 감사 | PASS, 160개 파일; 실제 3.10 실행과는 별개 |
+| 의존성 / compileall / alpha / beta | 모두 PASS |
+| 라우터 / 보안 스모크 | 83/83 / 13/13 PASS |
+| wheel 설치 검증 | 정적 파일 8개 바이트 일치; manifest·서비스 워커·아이콘 2개 HTTP 200·MIME 확인 |
+| 릴리스 종합 | PASS |
+
+이번 공개본 통과는 개발 PC의 별도 pygame 게임을 포함한 원본 검사 결과와 구별한다. 실제 GPU/LLM의 중단 동작·Windows 런타임·Tailscale 원격은 이번에 재검증하지 않았다. 상세 및 롤백은 [보완 기록](docs/CODEX_HARDENING_20261012.md).
+
+아래는 이전 버전의 검증 기록이다.
 
 ## 2026-09-19 — 경험 저장소
 

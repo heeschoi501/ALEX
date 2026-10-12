@@ -1096,11 +1096,9 @@ def _handler_factory(state: WebAppState):
                     disconnected = True
                     ticket.cancel.set()
 
-            previous = state.core.response_chunk_callback
-            previous_command_cancel_event = getattr(state.core, "command_cancel_event", None)
-            local = {p for p in state.core.providers.values() if isinstance(p, OllamaProvider)}
-            if isinstance(state.core.local_summarizer, OllamaProvider):
-                local.add(state.core.local_summarizer)
+            previous = None
+            previous_command_cancel_event = None
+            previous_provider_cancel_events = {}
             acquired = False
             waited_from = time.monotonic()
             try:
@@ -1116,6 +1114,15 @@ def _handler_factory(state: WebAppState):
                           "response": "앱을 종료하는 중이라 요청을 보내지 못했습니다." if state.shutting_down
                           else "기다리던 요청을 취소했습니다."})
                     return
+                # A queued request does not own these shared fields until it gets
+                # the model lock. Snapshot the current providers here too: an
+                # engine/settings operation may have replaced them while waiting.
+                previous = state.core.response_chunk_callback
+                previous_command_cancel_event = getattr(state.core, "command_cancel_event", None)
+                local = {p for p in state.core.providers.values() if isinstance(p, OllamaProvider)}
+                if isinstance(state.core.local_summarizer, OllamaProvider):
+                    local.add(state.core.local_summarizer)
+                previous_provider_cancel_events = {p: p.cancel_event for p in local}
                 state.running = ticket
                 state.active_id, state.active_kind = ticket.request_id, "chat"
                 state.cancel_event = ticket.cancel
@@ -1137,11 +1144,11 @@ def _handler_factory(state: WebAppState):
             except Exception:
                 emit({"type": "error", "error": "요청을 완료하지 못했습니다. 새로고침해 저장된 대화를 확인하세요."})
             finally:
-                state.core.response_chunk_callback = previous
-                state.core.command_cancel_event = previous_command_cancel_event
-                for p in local:
-                    p.cancel_event = None
                 if acquired:
+                    state.core.response_chunk_callback = previous
+                    state.core.command_cancel_event = previous_command_cancel_event
+                    for p, previous_cancel_event in previous_provider_cancel_events.items():
+                        p.cancel_event = previous_cancel_event
                     state.running = None
                     state.active_id = None
                     state.active_kind = None
