@@ -16,11 +16,18 @@ import unittest
 
 # 레지스트리는 읽기만 허용한다. pygame 의 SysFont 와 표준 mimetypes 가 글꼴·형식 목록을 레지스트리에서 읽는다
 # (2026-10-05: pygame 테트리스 6개 중 5개가 winreg.OpenKey 차단으로 실행 확인을 못 했다). 만들기·쓰기·지우기는 계속 막는다.
+# 실행마다 부모가 비워서 주는 임시 폴더(TEMP·TMP·TMPDIR). 이 안에서만 지우기·이름 바꾸기·권한 바꾸기를 허용한다 —
+# tempfile.mkdtemp 는 쓸 수 있는지 보려고 시험 파일을 만들고 지우고, TemporaryDirectory 는 끝날 때 지운다(2026-10-12 사용자 승인:
+# 임시 파일을 쓰는 올바른 코드가 실패로 보이던 문제). 작업 파일·폴더 밖 지우기는 계속 금지, 생성 코드의 명시적 지우기는 정적 검사가 거절.
+SCRATCH_DIR = ".alex-tmp"
+SCRATCH_EVENTS = {"os.remove", "os.rmdir", "os.chmod", "os.truncate", "os.rename"}
+
 READ_ONLY_WINREG = {"winreg.OpenKey", "winreg.OpenKey/result", "winreg.EnumKey", "winreg.EnumValue", "winreg.QueryInfoKey",
                     "winreg.QueryValue", "winreg.ExpandEnvironmentStrings", "winreg.PyHKEY.Detach"}
 
 
 def install_guard(workspace: Path) -> None:
+    scratch = workspace / SCRATCH_DIR
     fonts = Path(os.environ.get("WINDIR") or os.environ.get("SYSTEMROOT") or r"C:\Windows") / "Fonts"
     readable = (workspace, Path(sys.base_prefix).resolve(), Path(sys.prefix).resolve(), fonts)
     if os.name != "nt":
@@ -48,8 +55,17 @@ def install_guard(workspace: Path) -> None:
         elif event == "os.mkdir":
             if not inside(args[0], (workspace,)):
                 raise PermissionError("ALEX 실행 보호: 작업 폴더 밖 폴더 생성")
-        elif event in {"os.remove", "os.rmdir", "os.rename", "os.link", "os.symlink", "os.chmod",
-                       "os.truncate", "os.system", "os.exec", "os.posix_spawn", "os.fork",
+        elif event in SCRATCH_EVENTS:
+            # 경로 인수는 모두 임시 폴더 안이어야 한다(rename 은 양쪽). dir_fd 를 쓰는 상대 경로는 받지 않는다.
+            paths = args[:2] if event == "os.rename" else args[:1]
+            # 감사 사건 인수: remove·rmdir(path, dir_fd), chmod(path, mode, dir_fd), rename(src, dst, src_dir_fd, dst_dir_fd),
+            # truncate(path 또는 fd, length) — dir_fd 를 주지 않으면 -1 이다.
+            dir_fds = {"os.rename": args[2:4], "os.chmod": args[2:3], "os.truncate": ()}.get(event, args[1:2])
+            if (not paths or any(isinstance(path, int) for path in paths)
+                    or any(fd not in (None, -1) for fd in dir_fds)
+                    or not all(inside(path, (scratch,)) for path in paths)):
+                raise PermissionError(f"ALEX 실행 보호: {event} 금지(실행용 임시 폴더 밖)")
+        elif event in {"os.link", "os.symlink", "os.system", "os.exec", "os.posix_spawn", "os.fork",
                        "os.forkpty", "os.kill", "os.killpg", "os.startfile", "os.startfile/2"}:
             raise PermissionError(f"ALEX 실행 보호: {event} 금지")
         elif event.startswith(("socket.", "subprocess.", "winreg.", "ctypes.")):

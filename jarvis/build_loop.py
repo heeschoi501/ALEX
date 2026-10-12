@@ -20,12 +20,14 @@ import hashlib
 import importlib.metadata
 import json
 from pathlib import Path, PureWindowsPath
+import shutil
 import sys
 import tempfile
 import threading
 import time
 from typing import Callable
 
+from .build_runner import SCRATCH_DIR
 from .providers import ContextExhausted, GenerationCancelled, Message, ProviderError
 
 # 2026-10-05 실측(Q4 테트리스): 16번 호출·15.7분에 검사 6개 중 5개 통과 상태로 상한에 걸렸다(읽기·고치기에 호출을 썼다).
@@ -194,7 +196,8 @@ class BuildWorkspace:
 
     def files(self) -> list[str]:
         names = sorted(p.relative_to(self.root).as_posix() for p in self.root.rglob("*")
-                       if p.is_file() and p.suffix.lower() in ALLOWED_SUFFIXES and "__pycache__" not in p.parts)
+                       if p.is_file() and p.suffix.lower() in ALLOWED_SUFFIXES and "__pycache__" not in p.parts
+                       and SCRATCH_DIR not in p.relative_to(self.root).parts)
         for name in names:
             self.resolve(name)
         return names
@@ -259,16 +262,24 @@ class BuildWorkspace:
         if python.name.lower() == "pythonw.exe" and (python.parent / "python.exe").is_file():
             python = python.parent / "python.exe"
         runner = Path(__file__).with_name("build_runner.py")
-        with tempfile.TemporaryDirectory(prefix="alex-build-evidence-") as tmp:
-            evidence = Path(tmp) / "checks.json"
-            command = [str(python), "-I", "-X", "utf8", "-B", str(runner), str(target), str(self.root), str(evidence)]
-            status, output = _run_bounded(command, self.root, cancel_event, "실행", limit_seconds=limit_seconds or RUN_SECONDS,
-                                          extra_env=HEADLESS_ENV, inherit_environment=False)
-            try:
-                checks = json.loads(evidence.read_text(encoding="utf-8")).get("checks", 0)
-                self.last_run_checks = checks if type(checks) is int and checks > 0 else 0
-            except (OSError, ValueError, AttributeError):
-                pass
+        # 실행마다 빈 임시 폴더를 TEMP 로 준다 — 그 안에서만 지우기가 허용된다(build_runner.SCRATCH_DIR). 끝나면 부모가 치운다.
+        scratch = self.root / SCRATCH_DIR
+        shutil.rmtree(scratch, ignore_errors=True)
+        scratch.mkdir()
+        scratch_env = {"TEMP": str(scratch), "TMP": str(scratch), "TMPDIR": str(scratch)}
+        try:
+            with tempfile.TemporaryDirectory(prefix="alex-build-evidence-") as tmp:
+                evidence = Path(tmp) / "checks.json"
+                command = [str(python), "-I", "-X", "utf8", "-B", str(runner), str(target), str(self.root), str(evidence)]
+                status, output = _run_bounded(command, self.root, cancel_event, "실행", limit_seconds=limit_seconds or RUN_SECONDS,
+                                              extra_env={**HEADLESS_ENV, **scratch_env}, inherit_environment=False)
+                try:
+                    checks = json.loads(evidence.read_text(encoding="utf-8")).get("checks", 0)
+                    self.last_run_checks = checks if type(checks) is int and checks > 0 else 0
+                except (OSError, ValueError, AttributeError):
+                    pass
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
         if status == 124:
             output += f"\n[{RUN_SECONDS}초 안에 끝나지 않아 멈췄다. 게임 루프처럼 계속 도는 프로그램은 검사 파일에서 " \
                       "몇 프레임만 돌리거나 로직만 따로 검사한다.]"

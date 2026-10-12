@@ -18,7 +18,7 @@ import time
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from jarvis.build_runner import install_guard
+from jarvis.build_runner import SCRATCH_DIR, install_guard
 from jarvis.providers import Message, OllamaProvider, OpenAIResponsesProvider, ProviderError, StrataProvider
 from scripts.grade_python import TASKS, HARD_TASKS, EXPERT_TASKS, extract_code
 
@@ -75,7 +75,9 @@ def score_reply(reply: str, task_name: str, timeout: int = 15):
         try:
             child_env = {key: value for key, value in os.environ.items()
                          if key.upper() in {"PATH", "SYSTEMROOT", "WINDIR", "LANG", "LC_ALL"}}
-            child_env.update(TMPDIR=str(workspace), TEMP=str(workspace), TMP=str(workspace))
+            scratch = workspace / SCRATCH_DIR  # ALEX 실행 확인과 같은 임시 폴더 규칙
+            scratch.mkdir()
+            child_env.update(TMPDIR=str(scratch), TEMP=str(scratch), TMP=str(scratch))
             result = subprocess.run([sys.executable, "-I", str(Path(__file__).resolve()),
                                      "--worker", str(request), str(evidence)], cwd=workspace,
                                     env=child_env, capture_output=True, timeout=timeout)

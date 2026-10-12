@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from jarvis import build_loop  # noqa: E402
+from jarvis.build_runner import SCRATCH_DIR  # noqa: E402
 from jarvis.build_loop import (BuildWorkspace, answer_text, is_build_followup, is_build_request,  # noqa: E402
                                run_build, unsafe_reason)
 from jarvis.core import JarvisCore  # noqa: E402
@@ -206,6 +207,49 @@ class RunTests(unittest.TestCase):
             self.assertIn("class Game: hard_drop()", observation)  # 실제로 있는 것
             self.assertIn("def add(a, b)", observation)
             self.assertNotIn("test_logic.py:", observation.split("실제로 있는")[1])  # 검사 파일은 목록에 넣지 않는다
+
+    def test_programs_can_use_temporary_files(self):
+        """2026-10-12: 임시 파일을 쓰는 올바른 코드가 실행 보호의 지우기 금지에 걸려 실패로 보였다(tempfile.mkdtemp 는 시험 파일을
+        만들고 지우고, TemporaryDirectory 는 끝날 때 지운다). 실행마다 주는 임시 폴더 안에서만 지우기를 허용하고, 끝나면 치운다."""
+        program = (
+            "import tempfile, os\n"
+            "d = tempfile.mkdtemp()\n"
+            "open(os.path.join(d, 'a.txt'), 'w').write('x')\n"
+            "with tempfile.TemporaryDirectory() as t:\n"
+            "    open(os.path.join(t, 'b.csv'), 'w').write('1,2')\n"
+            "with tempfile.NamedTemporaryFile('w', delete=False, suffix='.py') as f:\n"
+            "    f.write('print(1)')\n"
+            "assert os.path.exists(os.path.join(d, 'a.txt'))\n"
+            "print('OK')\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = BuildWorkspace(Path(tmp))
+            workspace.write("uses_temp.py", program)
+            status, output = workspace.run("uses_temp.py", None)
+            self.assertEqual(status, 0, output)
+            self.assertIn("OK", output)
+            self.assertFalse((Path(tmp) / SCRATCH_DIR).exists())  # 실행이 끝나면 임시 폴더를 치운다
+            self.assertEqual(workspace.files(), ["uses_temp.py"])  # 임시 파일은 작업 파일 목록에 섞이지 않는다
+
+    def test_work_files_still_cannot_be_deleted_or_replaced_at_runtime(self):
+        """정적 검사를 피한 지우기·이름 바꾸기(getattr)도 실행 중 감시가 막는다 — 허용은 실행용 임시 폴더 안뿐이다."""
+        snippets = [
+            "import os\ngetattr(os, 're' + 'move')('logic.py')",
+            "import os, tempfile\np = tempfile.mkdtemp()\nf = os.path.join(p, 'x.py')\nopen(f, 'w').write('x = 2')\n"
+            "getattr(os, 're' + 'place')(f, 'logic.py')",
+            "import os\ngetattr(os, 'rm' + 'dir')('sub')",
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = BuildWorkspace(Path(tmp))
+            (Path(tmp) / "sub").mkdir()
+            for code in snippets:
+                with self.subTest(code=code):
+                    workspace.write("logic.py", "x = 1\n")
+                    workspace.write("evil_runtime.py", code)
+                    status, output = workspace.run("evil_runtime.py", None)
+                    self.assertNotEqual(status, 0, output)
+                    self.assertIn("ALEX 실행 보호", output)
+                    self.assertEqual((Path(tmp) / "logic.py").read_text(), "x = 1\n")
+                    self.assertTrue((Path(tmp) / "sub").is_dir())
 
     def test_blocked_code_is_not_run(self):
         with tempfile.TemporaryDirectory() as tmp:
