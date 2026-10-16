@@ -1,0 +1,352 @@
+diff --git a/src/qwen35/q36_engine.cu b/src/qwen35/q36_engine.cu
+index c49bd71..277c02a 100644
+--- a/src/qwen35/q36_engine.cu
++++ b/src/qwen35/q36_engine.cu
+@@ -1927,6 +1927,244 @@ struct Engine {
+     }
+ };
+ 
++// ------------------------------------------------------------------------------------------------ expert file, profile
++// Two opt-in helpers for the hybrid mode on a PC whose RAM is short (an 8 GB card with 32 GB: every expert does not
++// fit beside the system).  Both are off unless their variable is set, so the default placement is unchanged.
++//
++// STRATA_Q36_EXPERT_FILE=1 (or a path): the host copy of every expert blob is a file next to the GGUF
++// (<gguf>.q36experts), written once - streamed, without a host allocation of its size - and mapped read-only at every
++// later start, instead of an 18-19 GiB allocation filled from the GGUF at every start.  The bytes are the same as the
++// allocation's, so the outputs are the same.  The OS may drop those pages under memory pressure and read them again
++// from the file without writing them to the page file, and a start skips the repack.  The file's header holds a layout
++// key (the GGUF's size and time, the engine's blob layout): when it does not match, the file is written again.
++//
++// STRATA_Q36_PROFILE=1 (or a path): the routing scores the rebalance keeps are saved after every request
++// (<gguf>.q36profile, a few KB) and read at the next start, so the VRAM slots start with the experts used most instead
++// of experts 0..S-1.  Which experts the GPU computes changes the rounding, as the rebalance's own swaps do.
++namespace q36file {
++constexpr size_t kHeader = 4096;
++constexpr const char* kMagic = "STRATA-Q36-EXPERTS 1\n";
++constexpr const char kProfileMagic[17] = "STRATA-Q36-PROF1";
++
++std::string env_path(const char* var, const std::string& def) {
++    const char* v = std::getenv(var);
++    if (v == nullptr || *v == 0 || std::strcmp(v, "0") == 0) return "";
++    if (std::strcmp(v, "1") == 0) return def;
++    return v;
++}
++
++std::string gguf_path(const Model& m) { return m.file->shard(0).path(); }
++
++std::string file_stamp(const std::string& path) {
++#ifdef _WIN32
++    WIN32_FILE_ATTRIBUTE_DATA a{};
++    if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &a)) return "";
++    const unsigned long long size = ((unsigned long long) a.nFileSizeHigh << 32) | a.nFileSizeLow;
++    const unsigned long long t =
++        ((unsigned long long) a.ftLastWriteTime.dwHighDateTime << 32) | a.ftLastWriteTime.dwLowDateTime;
++    return std::to_string(size) + " " + std::to_string(t);
++#else
++    struct stat st{};
++    if (stat(path.c_str(), &st) != 0) return "";
++    return std::to_string((unsigned long long) st.st_size) + " " + std::to_string((long long) st.st_mtime);
++#endif
++}
++
++struct Mapped {
++    uint8_t* base = nullptr;
++    size_t size = 0;
++#ifdef _WIN32
++    HANDLE file = INVALID_HANDLE_VALUE, map = nullptr;
++#else
++    int fd = -1;
++#endif
++};
++Mapped g_experts;   // the layers point into it for the life of the process
++
++bool map_readonly(const std::string& path, Mapped& out) {
++#ifdef _WIN32
++    HANDLE h = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
++                           nullptr);
++    if (h == INVALID_HANDLE_VALUE) return false;
++    LARGE_INTEGER li{};
++    HANDLE mh = GetFileSizeEx(h, &li) && li.QuadPart > 0 ? CreateFileMappingA(h, nullptr, PAGE_READONLY, 0, 0, nullptr)
++                                                          : nullptr;
++    void* p = mh ? MapViewOfFile(mh, FILE_MAP_READ, 0, 0, 0) : nullptr;
++    if (p == nullptr) {
++        if (mh) CloseHandle(mh);
++        CloseHandle(h);
++        return false;
++    }
++    out.base = (uint8_t*) p;
++    out.size = (size_t) li.QuadPart;
++    out.file = h;
++    out.map = mh;
++#else
++    const int fd = ::open(path.c_str(), O_RDONLY);
++    if (fd < 0) return false;
++    struct stat st{};
++    void* p = fstat(fd, &st) == 0 && st.st_size > 0
++                  ? mmap(nullptr, (size_t) st.st_size, PROT_READ, MAP_SHARED, fd, 0) : MAP_FAILED;
++    if (p == MAP_FAILED) {
++        ::close(fd);
++        return false;
++    }
++    out.base = (uint8_t*) p;
++    out.size = (size_t) st.st_size;
++    out.fd = fd;
++#endif
++    return true;
++}
++
++void unmap(Mapped& m) {
++#ifdef _WIN32
++    if (m.base) UnmapViewOfFile(m.base);
++    if (m.map) CloseHandle(m.map);
++    if (m.file != INVALID_HANDLE_VALUE) CloseHandle(m.file);
++#else
++    if (m.base) munmap(m.base, m.size);
++    if (m.fd >= 0) ::close(m.fd);
++#endif
++    m = Mapped{};
++}
++
++/// The blobs exactly as place_experts lays them out in host memory: per layer `stride` bytes per expert (the blob,
++/// then zeros), then kMmqTail zeros.  Written to <path>.tmp and renamed at the end, so a stopped write leaves no file.
++bool write_experts(const std::string& path, const std::string& key, const std::vector<Layer*>& layers, int64_t ne,
++                   std::string& err) {
++    const std::string tmp = path + ".tmp";
++    std::FILE* f = std::fopen(tmp.c_str(), "wb");
++    if (f == nullptr) {
++        err = "cannot write " + tmp;
++        return false;
++    }
++    std::vector<char> io((size_t) 16 << 20);
++    std::setvbuf(f, io.data(), _IOFBF, io.size());
++    std::vector<uint8_t> head(kHeader, 0);
++    std::memcpy(head.data(), key.data(), key.size());
++    bool ok = std::fwrite(head.data(), 1, head.size(), f) == head.size();
++    const std::vector<uint8_t> tail(kMmqTail, 0);
++    std::vector<uint8_t> blob;
++    for (const Layer* L : layers) {
++        blob.assign(L->stride, 0);
++        for (int64_t e = 0; ok && e < ne; ++e) {
++            std::fill(blob.begin(), blob.end(), (uint8_t) 0);
++            expert_blob(*L, e, blob.data());
++            ok = std::fwrite(blob.data(), 1, blob.size(), f) == blob.size();
++        }
++        ok = ok && std::fwrite(tail.data(), 1, tail.size(), f) == tail.size();
++    }
++    ok = std::fclose(f) == 0 && ok;
++    if (!ok) {
++        std::remove(tmp.c_str());
++        err = "writing " + tmp + " failed (disk full?)";
++        return false;
++    }
++    std::remove(path.c_str());
++    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
++        std::remove(tmp.c_str());
++        err = "cannot rename " + tmp;
++        return false;
++    }
++    return true;
++}
++
++/// The mapped expert blobs for `layers` (bytes == their host size), writing the file first when it is missing or
++/// stale; nullptr (with err) when the file cannot be used - the caller then allocates as before.
++uint8_t* experts_mapped(const std::string& path, const std::string& gguf, const std::vector<Layer*>& layers, int64_t ne,
++                        size_t bytes, std::string& err) {
++    const std::string stamp = file_stamp(gguf);
++    if (stamp.empty()) {
++        err = "cannot read " + gguf;
++        return nullptr;
++    }
++    std::string key = std::string(kMagic) + "gguf " + stamp + "\nexperts " + std::to_string(ne) + " tail " +
++                      std::to_string(kMmqTail) + "\n";
++    for (const Layer* L : layers)
++        key += "layer " + std::to_string(L->stride) + " " + std::to_string(L->L.bytes) + " " +
++               std::to_string(L->L.up_off) + " " + std::to_string(L->L.down_off) + " " + std::to_string(L->L.gu_type) +
++               " " + std::to_string(L->L.d_type) + "\n";
++    if (key.size() >= kHeader) {
++        err = "the layout key does not fit the header";
++        return nullptr;
++    }
++    for (int attempt = 0; attempt < 2; ++attempt) {
++        Mapped mp;
++        if (map_readonly(path, mp)) {
++            if (mp.size == kHeader + bytes && std::memcmp(mp.base, key.data(), key.size()) == 0 &&
++                mp.base[key.size()] == 0) {
++                g_experts = mp;
++                return mp.base + kHeader;
++            }
++            unmap(mp);
++            if (attempt == 1) {
++                err = "the written file " + path + " does not match its layout";
++                return nullptr;
++            }
++            std::fprintf(stderr, "strata-q36: %s is from another model or engine layout: written again\n", path.c_str());
++        }
++        if (attempt == 0) {
++            const auto t0 = Clock::now();
++            std::fprintf(stderr, "strata-q36: writing the expert file %s (%.2f GiB, once) ...\n", path.c_str(),
++                         (double) bytes / (1 << 30));
++            if (!write_experts(path, key, layers, ne, err)) return nullptr;
++            std::fprintf(stderr, "strata-q36: expert file written in %.1f s\n", ms_since(t0) / 1000.0);
++        }
++    }
++    err = "cannot map " + path;
++    return nullptr;
++}
++
++/// The saved routing scores, one row per state index (the layers, then the MTP block); empty rows for states that kept
++/// no scores.  Empty when there is no file or it is from another model shape.
++std::vector<std::vector<double>> load_profile(const std::string& path, size_t states, int64_t ne) {
++    std::vector<std::vector<double>> out;
++    if (path.empty()) return out;
++    std::FILE* f = std::fopen(path.c_str(), "rb");
++    if (f == nullptr) return out;
++    char magic[16];
++    uint32_t s = 0, n = 0;
++    bool ok = std::fread(magic, 1, 16, f) == 16 && std::memcmp(magic, kProfileMagic, 16) == 0 &&
++              std::fread(&s, 4, 1, f) == 1 && std::fread(&n, 4, 1, f) == 1 && s == states && n == (uint32_t) ne;
++    if (ok) {
++        out.resize(states);
++        for (auto& row : out) {
++            uint32_t k = 0;
++            ok = ok && std::fread(&k, 4, 1, f) == 1 && (k == 0 || k == n);
++            if (!ok) break;
++            row.resize(k);
++            ok = k == 0 || std::fread(row.data(), sizeof(double), k, f) == k;
++        }
++    }
++    std::fclose(f);
++    if (!ok) out.clear();
++    return out;
++}
++
++void save_profile(const Engine& E) {
++    if (E.m == nullptr || !E.m->hybrid) return;
++    const std::string path = env_path("STRATA_Q36_PROFILE", gguf_path(*E.m) + ".q36profile");
++    if (path.empty()) return;
++    const std::string tmp = path + ".tmp";
++    std::FILE* f = std::fopen(tmp.c_str(), "wb");
++    if (f == nullptr) return;
++    const uint32_t states = (uint32_t) E.hy.size(), ne = (uint32_t) E.m->g.n_expert;
++    bool ok = std::fwrite(kProfileMagic, 1, 16, f) == 16 && std::fwrite(&states, 4, 1, f) == 1 &&
++              std::fwrite(&ne, 4, 1, f) == 1;
++    for (const auto& H : E.hy) {
++        const uint32_t k = H.score.size() == ne ? ne : 0;
++        ok = ok && std::fwrite(&k, 4, 1, f) == 1 && (k == 0 || std::fwrite(H.score.data(), sizeof(double), k, f) == k);
++    }
++    ok = std::fclose(f) == 0 && ok;
++    if (!ok) {
++        std::remove(tmp.c_str());
++        return;
++    }
++    std::remove(path.c_str());
++    if (std::rename(tmp.c_str(), path.c_str()) != 0) std::remove(tmp.c_str());
++}
++}  // namespace q36file
++
+ // ------------------------------------------------------------------------------------------------ expert placement
+ /// The routed experts after the engine's buffers: all in VRAM when they fit in `vram_gib` (< 0: the free VRAM less a
+ /// reserve), else the hybrid mode - every expert in host memory, the same number of VRAM slots per layer, a decode
+@@ -2044,15 +2282,36 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
+     for (Layer* L : all)
+         if (!mtp_only || L == &m.mtp) host += L->stride * (size_t) ne + kMmqTail;
+     uint8_t* arena = nullptr;
+-    bool pinned = cudaHostAlloc((void**) &arena, host, cudaHostAllocDefault) == cudaSuccess;
+-    if (!pinned) {
+-        (void) cudaGetLastError();
+-        arena = (uint8_t*) std::malloc(host);
+-        if (!arena) {
+-            err = "no host memory for the experts (" + std::to_string(host >> 20) + " MiB)";
+-            return false;
++    bool pinned = false, mapped = false;
++    std::vector<Layer*> host_layers;
++    for (Layer* L : all)
++        if (!mtp_only || L == &m.mtp) host_layers.push_back(L);
++    const std::string xpath = q36file::env_path("STRATA_Q36_EXPERT_FILE", q36file::gguf_path(m) + ".q36experts");
++    if (!xpath.empty()) {
++        std::string xerr;
++        arena = q36file::experts_mapped(xpath, q36file::gguf_path(m), host_layers, ne, host, xerr);
++        mapped = arena != nullptr;
++        if (mapped)
++            std::fprintf(stderr, "strata-q36: experts mapped from %s (STRATA_Q36_EXPERT_FILE)\n", xpath.c_str());
++        else
++            std::fprintf(stderr, "strata-q36: the expert file is not used (%s): the experts are copied into host "
++                         "memory as before\n", xerr.c_str());
++    }
++    if (!mapped) {
++        pinned = cudaHostAlloc((void**) &arena, host, cudaHostAllocDefault) == cudaSuccess;
++        if (!pinned) {
++            (void) cudaGetLastError();
++            arena = (uint8_t*) std::malloc(host);
++            if (!arena) {
++                err = "no host memory for the experts (" + std::to_string(host >> 20) + " MiB)";
++                return false;
++            }
+         }
+     }
++    const std::vector<std::vector<double>> prof =
++        q36file::load_profile(q36file::env_path("STRATA_Q36_PROFILE", q36file::gguf_path(m) + ".q36profile"),
++                              all.size(), ne);
++    if (!prof.empty()) std::fprintf(stderr, "strata-q36: VRAM slots start from the saved routing profile\n");
+     size_t off = 0;
+     E.hy.resize(all.size());
+     for (size_t li = 0; li < all.size(); ++li) {
+@@ -2070,22 +2329,35 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
+         }
+         L.hblobs = arena + off;
+         off += L.stride * (size_t) ne + kMmqTail;
+-        std::memset(L.hblobs, 0, L.stride * (size_t) ne + kMmqTail);
+-        for (int64_t e = 0; e < ne; ++e) expert_blob(L, e, L.hblobs + (size_t) e * L.stride);
++        if (!mapped) {   // a mapped expert file holds these bytes already
++            std::memset(L.hblobs, 0, L.stride * (size_t) ne + kMmqTail);
++            for (int64_t e = 0; e < ne; ++e) expert_blob(L, e, L.hblobs + (size_t) e * L.stride);
++        }
++        // the first slots: the experts the saved profile ranks highest (STRATA_Q36_PROFILE), else experts 0..S-1
++        const bool ranked = li < prof.size() && prof[li].size() == (size_t) ne;
++        std::vector<int> first((size_t) ne);
++        for (int x = 0; x < ne; ++x) first[(size_t) x] = x;
++        if (ranked)
++            std::stable_sort(first.begin(), first.end(),
++                             [&](int a, int b) { return prof[li][(size_t) a] > prof[li][(size_t) b]; });
++        first.resize((size_t) S);
+         L.n_slots = S;
+         if (S > 0) {
+             CK(cudaMalloc(&L.blobs, L.stride * (size_t) S + kMmqTail));
+             CK(cudaMemset(L.blobs, 0, L.stride * (size_t) S + kMmqTail));
+-            CK(cudaMemcpy(L.blobs, L.hblobs, L.stride * (size_t) S, cudaMemcpyHostToDevice));
++            for (int s = 0; s < S; ++s)
++                CK(cudaMemcpy(L.blobs + (size_t) s * L.stride, L.hblobs + (size_t) first[(size_t) s] * L.stride,
++                              L.stride, cudaMemcpyHostToDevice));
+         }
+         Engine::Hy& H = E.hy[li];
+         H.slot_of.assign((size_t) ne, -1);
+         H.exp_in_slot.assign((size_t) S, 0);
+         for (int s = 0; s < S; ++s) {
+-            H.slot_of[(size_t) s] = s;
+-            H.exp_in_slot[(size_t) s] = s;
++            H.slot_of[(size_t) first[(size_t) s]] = s;
++            H.exp_in_slot[(size_t) s] = first[(size_t) s];
+         }
+-        H.score.assign((size_t) ne, 0.0);
++        if (ranked) H.score = prof[li];
++        else H.score.assign((size_t) ne, 0.0);
+         CK(cudaMalloc(&H.slot_of_d, (size_t) ne * 4));
+         CK(cudaMemcpy(H.slot_of_d, H.slot_of.data(), (size_t) ne * 4, cudaMemcpyHostToDevice));
+         if (!C::native_fmt(L.L.gu_type, L.L.d_type, g.n_embd, g.n_ff, H.fmt, err)) return false;
+@@ -2124,7 +2396,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
+     std::fprintf(stderr, "strata-q36: hybrid experts: %d of %lld per layer in VRAM (%.2f GiB), all %.2f GiB in %s host "
+                  "memory, the rest of a batch of <= %d rows on %d CPU threads, bigger prompt chunks streamed (%.2f GiB "
+                  "staging); %.1f s\n", S, (long long) ne, (double) S * per_slot / (1 << 30), (double) host / (1 << 30),
+-                 pinned ? "pinned" : "pageable", E.hybrid_t, E.pool->workers() + (E.pool->host_works() ? 1 : 0),
++                 pinned ? "pinned" : mapped ? "file-mapped" : "pageable", E.hybrid_t, E.pool->workers() + (E.pool->host_works() ? 1 : 0),
+                  (double) staging / (1 << 30), ms_since(t0) / 1000.0);
+     return true;
+ #endif
+@@ -2338,6 +2610,7 @@ int serve(Engine& E) {
+         std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0 0 0 0.0 %lld 0\n", produced, ids.size(), prompt_ms,
+                     decode_ms, finish, accepted, offered, reuse, (long long) fresh);
+         std::fflush(stdout);
++        q36file::save_profile(E);   // STRATA_Q36_PROFILE: the routing scores for the next start
+     }
+ }
+ 
