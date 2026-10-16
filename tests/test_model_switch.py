@@ -173,10 +173,13 @@ class EngineSwitchTests(unittest.TestCase):
     def test_same_engine_output_save_does_not_unload_again(self):
         self.state.inactive_providers = [OllamaProvider("other:7b")]
         with patch.object(model_switch, "start_backend") as start, patch.object(model_switch, "release_current") as release:
-            self.state.save_settings({"local_backend": "strata", "strata_max_output_tokens": 5120})
+            self.state.save_settings({"local_backend": "strata", "strata_max_output_tokens": 5120,
+                                      "strata_reasoning_budget_tokens": 1024})
         start.assert_not_called()
         release.assert_not_called()
         self.assertEqual(self.state.core.providers[Destination.LOCAL_GENERAL].num_predict, 5120)
+        self.assertEqual(self.state.core.providers[Destination.LOCAL_GENERAL].reasoning_budget_tokens, 1024)
+        self.assertEqual(load_settings().strata_reasoning_budget_tokens, 1024)
 
     def test_startup_tracks_an_existing_other_engine_for_gpu_guard(self):
         with patch.object(model_switch, "backend_available", return_value=True):

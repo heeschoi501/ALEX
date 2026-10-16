@@ -512,16 +512,16 @@ class ProfileAwareModelSelectionTests(unittest.TestCase):
             settings = Settings(file_search_root=Path(td))
             self.assertEqual(
                 effective_local_models(settings, PerformanceProfile.LAPTOP),
-                ("qwen3:8b-q4_K_M", "qwen2.5-coder:7b"),
+                ("qwen3:8b-q4_K_M", "qwen3:8b-q4_K_M"),
             )
 
-    def test_desktop_automatically_selects_14b_models(self):
+    def test_desktop_automatically_selects_desktop_models(self):
         from jarvis.app import effective_local_models
         with tempfile.TemporaryDirectory() as td:
             settings = Settings(file_search_root=Path(td))
             self.assertEqual(
                 effective_local_models(settings, PerformanceProfile.DESKTOP),
-                ("qwen3:14b-q4_K_M", "qwen2.5-coder:14b"),
+                ("gpt-oss:20b", "gpt-oss:20b"),
             )
 
     def test_profile_model_auto_selection_can_be_disabled(self):

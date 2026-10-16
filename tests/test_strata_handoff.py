@@ -54,10 +54,18 @@ class StrataHandoffTests(unittest.TestCase):
 
     def test_only_an_explicit_boolean_false_means_unloaded(self):
         provider = StrataProvider("fake", host="http://127.0.0.1:9")
-        for loaded, expected in ((False, []), (True, ["fake"])):
+        for loaded, expected in ((False, []), (True, ["actual"])):
             with self.subTest(loaded=loaded), \
-                    patch.object(provider, "_health", return_value={"service": "strata", "loaded": loaded}):
+                    patch.object(provider, "_health", return_value={"service": "strata", "loaded": loaded, "model": "actual"}):
                 self.assertEqual(provider.loaded_models(), expected)
+
+    def test_model_name_is_required_only_when_a_model_is_loaded(self):
+        provider = StrataProvider("fake", host="http://127.0.0.1:9")
+        with patch.object(provider, "_health", return_value={"service": "strata", "loaded": False}):
+            self.assertEqual(provider.loaded_models(), [])
+        with patch.object(provider, "_health", return_value={"service": "strata", "loaded": True}):
+            with self.assertRaisesRegex(ProviderError, "모델 이름"):
+                provider.loaded_models()
 
     def _make_strata_install(self, folder):
         for relative in (".venv/Scripts/python.exe", ".venv/bin/python"):

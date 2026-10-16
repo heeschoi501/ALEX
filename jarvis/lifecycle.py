@@ -14,14 +14,15 @@ import urllib.error
 import urllib.request
 
 from .config import load_settings
-from .launcher import WEB, instance_id, launch
+from .launcher import instance_id, launch, web_url
 
 
 class LifecycleError(RuntimeError):
     pass
 
 
-def health(base_url: str = WEB) -> dict | None:
+def health(base_url: str | None = None) -> dict | None:
+    base_url = base_url or web_url(load_settings())
     try:
         with urllib.request.urlopen(base_url + "/health", timeout=3) as response:
             result = json.load(response)
@@ -35,9 +36,10 @@ def _verify_own_server(result: dict, expected_instance: str) -> None:
         raise LifecycleError("이 포트의 서버는 현재 ALEX 인스턴스가 아닙니다. 종료하지 않았습니다.")
 
 
-def stop_server(base_url: str = WEB, *, expected_instance: str | None = None,
+def stop_server(base_url: str | None = None, *, expected_instance: str | None = None,
                 timeout: float = 30) -> bool:
     """Ask the authenticated web server to shut down; refuse while it is busy."""
+    base_url = base_url or web_url(load_settings())
     result = health(base_url)
     if result is None:
         return False

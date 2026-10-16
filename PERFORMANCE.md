@@ -1929,3 +1929,54 @@ think off, 48토큰, temperature 0. 결과 `logs/claude-ctx64k-20261003.json`·`
 - 전력(nvidia-smi 5초): 생성 GPU 76W·사용률 35%(CPU 60% — CPU 층 대기), 읽기 239W·88%, 테스트 단계 66W, 쉼 13W. 벽 전력·CPU 전력은 미측정(추정 250~300W).
 - 남은 실패: outcomes(과제 정의 — 합격 테스트 밖 명령), characters(세 설정 모두 실패, 범위 밖 web.py 필요 추정). 보고서 `docs/ALEX_CODING_STATUS_REPORT_20261004.md`.
 
+
+## 40. 노트북에서 깃허브 ALEX 첫 측정 — 20b 기준선 (2026-10-16 17:31~17:37, 노트북의 claude)
+
+깃허브(`heeschoi501/ALEX`, 35b755b)를 노트북 `C:\Users\karse\local ai project\ALEX` 에 새로 받았다.
+`runtime` 은 옛 노트북 폴더(`jarvis\runtime`)로 잇는 디렉터리 연결이라 모델 86GB 를 다시 받지 않았다.
+`jarvis.local.json` 은 9월 노트북 실측값으로 새로 썼다(깃 제외 파일).
+
+조건: 단독 실행. 실효 설정(앱이 읽는 값): LAPTOP / general=coder=`gpt-oss:20b` / think on / ctx 8192 /
+output 6144 / timeout 360 / num_gpu 0 / web on / coding_worker alex(노트북엔 OpenCode 없음). Ollama 0.34.0,
+`launcher.ollama_environment` 로 띄웠다(노트북은 KV·FA 기본값). 20b 는 CPU 57% / GPU 43% 로 올라갔다.
+replay 원본은 옛 노트북 DB(`jarvis\data`, 읽기 전용 → 복사본). 데스크톱 26절의 고정 ZIP DB 와 요약이
+같지 않다. 문맥은 6471자 → 예산 6000자로 잘려 16개 중 15개 메시지가 들어갔다.
+웹 서버는 띄우지 못했다(8765 를 STRATA 스튜디오가 쓰고 있다) — 측정은 `build_core` 로 직접 했다.
+
+판정은 26절의 (a)~(d) 를 답을 읽고 적용했다.
+
+| 과제 | 결과 | 벽시계 |
+|---|---|---|
+| replay n=3 ("코드 수정됐을텐데 다시 확인해봐", local_coder) | **0/3** | 83.8 / 40.8 / 35.2초 |
+| fresh 4문항 n=1 (local_general) | 2/4 | 77.2 / 34.6 / 52.8 / 22.4초 |
+
+- replay #1·#2: "외부 네트워크 접근이 차단돼 있다", "방화벽/프록시 확인" — 앞선 오답을 되풀이(a·b 실패).
+  #2·#3: "변경이 없었습니다", "코드가 변동된 것은 없습니다" — 확인할 수 없는 것을 단정(c 실패).
+- fresh 인터넷 두 문항은 바르다("금지돼 있지 않습니다", "찾아 드릴 수 있습니다").
+  클라우드 두 문항은 "연결 코드는 꺼져 있다"까지는 맞지만 없는 `--cloud` 옵션, `cloud_llm_enabled=true`
+  플래그를 지어냈다(d 실패). 실제 설정은 `local_only` 와 `JARVIS_CLOUD_PROVIDER` 등이다.
+- 대화형 7건 중앙값 40.8초, 360초 제한 초과 0건. 첫 요청(모델 적재)이 77~84초.
+
+결론: 새 코드에서도 노트북 20b 는 데스크톱 20b 와 같은 약점을 가진다(오염 replay 0/3). 이 과제를 통과한
+모델은 dense 27b(3/3)뿐인데, 데스크톱에서도 GPU 에 다 못 올리면 6.8 tok/s 였다(36절). 노트북 8GB VRAM 에서는
+대화로 못 쓴다. 노트북은 20b 를 그대로 두고, 어려운 일은 데스크톱 ALEX 에 원격(`REMOTE_SETUP.md`)으로 붙는다.
+기록: `logs/laptop-baseline-20261016.txt`, `logs/replay-laptop-*-gpt-oss_20b.json`(깃 제외).
+
+## 41. 노트북에서 Strata 돌려 보기 — Flash-Next Coder IQ1_M (2026-10-16 18:25, 노트북의 claude)
+
+목적은 "돌아가는가"만(품질 시험은 데스크톱에서 — 같은 파일이면 답 품질은 같다). 전원 모드 "최고 성능", 충전기 연결.
+- 설치: Strata(github Niko1221/Strata, 296b59d, 엔진 0.1.44.1)를 `C:\Users\karse\local ai project\tools\strata`(ALEX 기본 strata_dir),
+  모델은 `tools\Strata-data`. 드라이버 572.70 이 기본 엔진의 580 미만이라 `--cuda 12`(실험용 CUDA 12.9 엔진, sm_89 포함) —
+  `setup.py --setup --family coder --model IQ1_M --cuda 12 --vision no --yes --no-start`. setup 의 검사: 31GB RAM 에 들어가는 것은
+  IQ1_M(Coder) 하나뿐(저RAM 모드, GPU 가 전문가 ~13%), Q2_0 이상은 RAM ~48GB 이상. 다운로드 58GB 16분(~43MB/s), 전체 설치 ~31분.
+  문맥 32K, KV int8, 이미지 끔, 거절 줄이는 실험 옵션 끔.
+- 실행: 첫 적재 약 30초. GPU 전문가 캐시 309개(0.60GiB), 실행 중 VRAM 6,957MiB, strata.exe 작업 집합 14.4GB,
+  **윈도우 여유 RAM 0.2GB / 31.2GB** — 다른 프로그램과 20b 를 함께 쓸 수 없다.
+- 속도(생각 끔, 1회씩): 한국어 78토큰 7.7 tok/s · 193토큰 15.8 tok/s, 코드 263토큰 14.6 tok/s. 첫 글자 1.7~2.8초.
+- 눈으로 본 답: 코드(피보나치)는 정상. **한국어는 깨진다** — 짧은 자기소개는 한국어·영어가 섞였고, 다섯 줄 설명은
+  "의의의…" 반복으로 무너졌다(Strata 문서가 적은 Coder 의 약점, #438 과 같은 모양). n=1.
+- 결론: 노트북에서 Strata 는 돌아간다. 다만 Coder 는 한국어 대화용이 아니고 RAM 을 다 쓴다. 시험 뒤 Strata 를 끄고 20b 로 되돌렸다.
+- **Qwen3.6-35B-A3B UD-Q4_K_XL 켜지는지 (2026-10-16 23:0x, 재부팅 뒤):** 배터리 사용 중·전원 "최고 성능", 다른 프로그램(ChatGPT·크롬·VS Code·
+  Steam·WSL)이 약 20GB 를 써서 시작 전 여유 RAM 11.5GB. 켜는 데 **275초**(Coder 30초) — 여유 RAM 이 최저 0.1GB 까지 떨어졌다(감시
+  스크립트: 0.5GB 밑 60초면 끄기, 걸리지 않음). 켜진 뒤 VRAM 7,771MiB. 한국어 한 문장 자기소개 29토큰: 첫 글자 1.8초, 15.3 tok/s,
+  문장 정상(n=1, 품질 판정 아님). 확인 뒤 바로 껐다(여유 RAM 19.9GB 로 복귀). 다른 프로그램을 닫은 상태의 적재 시간은 아직 모른다.

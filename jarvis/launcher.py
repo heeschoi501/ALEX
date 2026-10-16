@@ -22,11 +22,17 @@ from .app import effective_local_models
 from .config import load_settings
 from .hardware import PerformanceProfile, detect_hardware
 from .runtime import install
+from .strata_runtime import validate_strata_health
 
 ROOT = Path(__file__).resolve().parent.parent
 WEB = "http://127.0.0.1:8765"
 OLLAMA = "http://127.0.0.1:11434"
 FULL_NAME = "Adaptive Learning & Evolving eXperience"
+
+
+def web_url(settings) -> str:
+    """이 PC 의 ALEX 주소. 포트는 설정의 web_port(기본 8765, 곧 WEB)."""
+    return f"http://127.0.0.1:{settings.web_port}"
 
 
 class NeedsDownload(RuntimeError):
@@ -94,12 +100,15 @@ def strata_dir() -> Path:
     return Path(os.getenv("JARVIS_STRATA_DIR") or (ROOT.parent / "tools" / "strata"))
 
 
-def strata_command(folder: Path, port: int) -> list[str]:
-    """Strata 서버를 띄우는 명령 — Strata 설치가 만든 run-<모델>.bat 과 같은 것(설정 파일 strata-<모델>.json, ADR-086)."""
+def strata_command(folder: Path, port: int, selected: str = "") -> list[str]:
+    """Strata 서버를 띄우는 명령 — Strata 설치가 만든 run-<모델>.bat 과 같은 것(설정 파일 strata-<모델>.json, ADR-086).
+
+    selected 는 설정의 strata_config(모델이 여럿일 때 고른 것). 비우면 JARVIS_STRATA_CONFIG, 그것도 없으면 하나뿐인 설정.
+    """
     python = folder / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     if not python.is_file():
         raise RuntimeError(f"Strata 가 설치되어 있지 않습니다({folder}). START-HERE.bat 으로 먼저 설치하세요.")
-    selected = os.getenv("JARVIS_STRATA_CONFIG", "").strip()
+    selected = (selected or os.getenv("JARVIS_STRATA_CONFIG", "")).strip()
     if selected:
         config = Path(selected)
         if not config.is_absolute():
@@ -112,20 +121,25 @@ def strata_command(folder: Path, port: int) -> list[str]:
             raise RuntimeError(f"Strata 가 설치되어 있지 않습니다({folder}). START-HERE.bat 으로 먼저 설치하세요.")
         if len(configs) > 1:
             raise RuntimeError("Strata 모델이 여러 개 설치되어 있습니다: " + ", ".join(c.name for c in configs)
-                               + " — JARVIS_STRATA_CONFIG 로 하나를 고르세요.")
+                               + " — jarvis.local.json 의 strata_config 에 켤 것을 하나 적으세요"
+                               + f" (예: \"strata_config\": \"{configs[0].name}\").")
         config = configs[0]
     return [str(python), str(folder / "serve" / "server.py"), "--engine", "strata", "--config", str(config),
             "--port", str(port)]
 
 
-def ensure_strata(host: str, report, log_dir: Path, flags: int, wait_seconds: float = 900) -> None:
+def ensure_strata(host: str, report, log_dir: Path, flags: int, wait_seconds: float = 900, config: str = "",
+                  model: str = "", num_ctx: int = 0) -> None:
     """Strata 모드면 Strata 서버가 떠 있게 한다. 처음 올릴 때 35~55GB 를 RAM 에 올리느라 1~3분 PC 가 느려진다(Strata 안내)."""
+    health = None
     try:
-        if get_json(host + "/health").get("service") == "strata":
-            return
+        health = get_json(host + "/health")
     except (OSError, ValueError):
         pass
-    command = strata_command(strata_dir(), int(host.rsplit(":", 1)[1]))
+    if health is not None:
+        validate_strata_health(health, model, num_ctx)
+        return
+    command = strata_command(strata_dir(), int(host.rsplit(":", 1)[1]), config)
     report("큰 모델(Strata)을 올리는 중… 처음에는 1~3분 걸리고 그동안 PC 가 느릴 수 있습니다.")
     with (log_dir / "strata-server.log").open("a", encoding="utf-8") as log:
         process = subprocess.Popen(command, cwd=strata_dir(), stdout=log, stderr=log, stdin=subprocess.DEVNULL,
@@ -136,10 +150,12 @@ def ensure_strata(host: str, report, log_dir: Path, flags: int, wait_seconds: fl
     while time.monotonic() < deadline:
         try:
             health = get_json(host + "/health")
-            if health.get("service") == "strata" and health.get("loaded"):
-                return
         except (OSError, ValueError):
-            pass
+            health = None
+        if health is not None:
+            validate_strata_health(health, model, num_ctx)
+            if health.get("loaded"):
+                return
         if process.poll() is not None:
             raise RuntimeError("Strata 가 시작되지 않았습니다. logs/strata-server.log 를 확인하세요.")
         time.sleep(1)
@@ -157,15 +173,17 @@ def launch(allow_download: bool = False, report=print) -> str:
     os.environ["JARVIS_OLLAMA_HOST"] = OLLAMA
     os.environ["PYTHONUTF8"] = "1"
     settings = load_settings()
+    web = web_url(settings)
     try:
-        existing = get_json(WEB + "/health")
+        existing = get_json(web + "/health")
     except urllib.error.HTTPError as exc:
-        raise RuntimeError("8765 포트를 다른 프로그램이 사용합니다. 해당 프로그램을 종료해 주세요.") from exc
+        raise RuntimeError(f"{settings.web_port} 포트를 다른 프로그램이 사용합니다. 해당 프로그램을 종료하거나 "
+                           "jarvis.local.json 의 web_port 를 다른 번호로 바꿔 주세요.") from exc
     except (OSError, ValueError):
         existing = None
     if existing:
         if existing.get("app") != "jarvis" or existing.get("instance") != instance_id(settings.data_dir):
-            raise RuntimeError("8765 포트에 다른 프로젝트가 실행 중입니다. 먼저 그 창에서 앱 종료를 누르세요.")
+            raise RuntimeError(f"{settings.web_port} 포트에 다른 프로젝트가 실행 중입니다. 먼저 그 창에서 앱 종료를 누르세요.")
         if not existing.get("local_only"):
             raise RuntimeError("기존 서버가 로컬 전용 모드가 아닙니다. 종료 후 다시 실행하세요.")
         # 재사용은 의도다(두 개 띄우지 않는다). 다만 그 뒤에 코드가 바뀌었으면 조용히 옛 버전을
@@ -176,13 +194,14 @@ def launch(allow_download: bool = False, report=print) -> str:
                 "열려 있는 ALEX 화면에서 '앱 종료' 를 누른 뒤 다시 실행하세요.\n"
                 "그대로 쓰면 새 기능이 빠진 옛 버전입니다."
             )
-        return WEB
+        return web
     flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     log_dir = ROOT / "logs"
     log_dir.mkdir(exist_ok=True)
     if settings.local_backend == "strata":
         report("로컬 모델 서버(Strata) 확인 중…")
-        ensure_strata(settings.strata_host, report, log_dir, flags)
+        ensure_strata(settings.strata_host, report, log_dir, flags, config=settings.strata_config,
+                      model=settings.strata_model, num_ctx=settings.strata_num_ctx)
     else:
         # 프로필은 Ollama 를 띄우기 전에 정한다 — Ollama 환경이 프로필에 따라 다르다(ADR-054).
         hardware = detect_hardware()
@@ -240,12 +259,12 @@ def launch(allow_download: bool = False, report=print) -> str:
                     raise RuntimeError("모델 다운로드가 완료되지 않았습니다. 다시 실행하면 이어받습니다.")
     report("채팅창을 시작합니다…")
     with (log_dir / "web-server.log").open("a", encoding="utf-8") as log:
-        web_process = subprocess.Popen([sys.executable, "-m", "jarvis.web", "--port", "8765"], cwd=ROOT, env=os.environ.copy(), stdout=log, stderr=log, creationflags=flags)
+        web_process = subprocess.Popen([sys.executable, "-m", "jarvis.web", "--port", str(settings.web_port)], cwd=ROOT, env=os.environ.copy(), stdout=log, stderr=log, creationflags=flags)
     for _ in range(100):
         try:
-            health = get_json(WEB + "/health")
+            health = get_json(web + "/health")
             if health.get("instance") == instance_id(settings.data_dir):
-                return WEB
+                return web
         except (OSError, ValueError):
             pass
         if web_process.poll() is not None:

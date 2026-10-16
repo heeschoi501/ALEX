@@ -346,6 +346,10 @@ def provider_runtime_settings(provider: BaseLLMProvider) -> dict:
             num_predict=provider.num_predict, timeout=provider.timeout,
             num_gpu=provider.num_gpu, keep_alive=provider.keep_alive,
         )
+    if isinstance(provider, StrataProvider):
+        result.update(backend="strata", host=provider.host,
+                      reasoning_effort=provider.reasoning_effort if provider.think else "none",
+                      reasoning_budget_tokens=provider.reasoning_budget_tokens if provider.think else 0)
     return result
 
 
@@ -389,6 +393,7 @@ def build_providers(
             model=settings.strata_model, host=settings.strata_host, timeout=timeout, num_ctx=settings.strata_num_ctx,
             think=settings.ollama_think, num_predict=settings.strata_max_output_tokens,
             reasoning_effort=settings.strata_reasoning_effort,
+            reasoning_budget_tokens=settings.strata_reasoning_budget_tokens,
         )
         notes.append(f"Strata 모드: {settings.strata_host} ({settings.strata_model}, num_ctx={settings.strata_num_ctx}, "
                      f"num_predict={settings.strata_max_output_tokens}, "

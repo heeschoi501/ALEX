@@ -1,3 +1,20 @@
+## 2026-10-17 — 노트북 Qwen3.6 실행 최적화와 Strata 연결 검증
+
+- 이 노트북의 Strata에만 `STRATA_Q36_NO_MMQ=1` 적용: GPU 전문가 층당 4→19개. 예열 혼합 입력 2131토큰의 첫 내용 도착 8.719→6.000초(각 1회, RAM 상태 차이 있음). 품질 평가는 하지 않음.
+- ALEX에 `strata_reasoning_budget_tokens` 추가(기본 0, 노트북 1024). 설정 화면·실효 설정·서버 요청에 연결. Strata 타이밍으로 생성 속도 과대 표시 수정, 실제 모델·문맥 일치 검사, 비활성 서버 GPU 반환 추적 유지.
+- Strata setup의 엔진 지원 모델 확인에도 CUDA 라이브러리 경로를 전달. 설치 검사 14개, 서버 생각 경로 검사 33개 OK. ALEX 릴리스 1372개 OK(7 skip), 후속 영향 검사 48개 OK. ALEX 8767·Strata 8080 재시작/응답 확인.
+- 측정·복구·경험(raw 2건) 기록: [노트북 적용 문서](docs/STRATA_QWEN36_LAPTOP_20261017.md). 커밋·푸시 없음.
+
+## 2026-10-16 — 노트북에서 깃허브 ALEX 첫 실행: 웹 포트 설정(web_port)·노트북 20b 기준선
+
+- 노트북 Strata Qwen3.6 이 느린 원인(엔진 로그): "hybrid experts: 0 of 256 per layer in VRAM" — 기본 가중치 2.6GB·32K 문맥 캐시·한 번에 2048토큰 입력용 작업 공간(1.1GB)을 잡고 나니 VRAM 0.67GB 만 남아(엔진은 768MB 를 여유로 뺀다) 전문가가 하나도 GPU 에 못 올라가 MoE 를 전부 CPU 가 계산했다. 전문가 18.75GiB 는 고정되지 못해(pageable) RAM 이 모자라면 디스크로 밀린다. Strata 설정 strata-qwen36-ud-q4_k_xl.json 을 --max-context 16384·--prefill 512 로(원본 .orig-20261016), ALEX strata_num_ctx 16384(입력 예산 5,529자). 효과는 아직 재지 않았다(사용자: 수정만).
+- 설정 화면의 Strata 전환이 노트북에서 막히던 것: Strata 모델이 둘(Coder·Qwen3.6) 설치되면 ALEX 가 "여러 개" 오류로 거절했고, 고를 곳이 환경변수 JARVIS_STRATA_CONFIG 뿐이었다. jarvis.local.json 의 strata_config(켤 strata-<모델>.json)로 고르게 했다 — 런처·전환 확인·전환 시작이 모두 이 값을 쓴다. 전환 때 Strata 를 기다리는 시간 240초 → 900초(런처와 같게; 노트북 Qwen3.6 이 275초 걸렸다). 노트북 설정: strata_config=Qwen3.6, strata_num_ctx 32768(설치값), strata_max_output_tokens 6144. 검사 2개 추가, 릴리스 검사 1,365개 PASS.
+- 노트북의 8765 를 STRATA 레이아웃 스튜디오가 써서 ALEX 가 켜지지 않았다(logs/autostart.log). 포트가 런처·웹 서버·종료 명령에 따로 박혀 있었다. jarvis.local.json 의 `web_port`(또는 JARVIS_WEB_PORT)로 바꿀 수 있게 했다. 기본은 8765 그대로 — 데스크톱의 원격 연결과 Tailscale Serve 가 이 번호를 본다. 1024 미만과 데스크톱 연결 창 포트(remote_local_port, 8766)는 거절한다. 다른 프로그램이 포트를 쓰면 오류에 번호와 설정 이름을 보인다.
+- 노트북은 `web_port: 8767` 로 켰다(STRATA 8765 는 그대로). tests/test_web_port.py 8개 추가. 릴리스 검사 PASS(윈도우 파이썬 3.11).
+- 노트북 20b 기준선(PERFORMANCE.md 40절): 오염 replay 0/3, fresh 2/4(클라우드 질문에서 없는 옵션을 지어냄), 대화 중앙값 40.8초. 데스크톱 20b 와 같은 약점이라 노트북 모델은 20b 를 유지하고 어려운 일은 데스크톱 원격으로.
+- 노트북 Ollama 모델 정리(사용자 결정): gpt-oss:20b·qwen3:8b 만 남기고 7개 삭제(약 73GB). 코드 기본값도 남은 모델로 — 노트북 general=coder=qwen3:8b(첫 설치는 작은 모델 하나), 데스크톱 기본 gpt-oss:20b(26절 실측). 실제 사용 모델은 jarvis.local.json 이 정한다. 테스트 3곳·README·스크립트 사용 예시를 맞춤. 릴리스 검사 1,364개 PASS.
+- 노트북 Strata 시험(PERFORMANCE.md 41절): Flash-Next Coder IQ1_M 이 CUDA 12 엔진으로 돈다 — 적재 30초, 약 15 tok/s, 여유 RAM 0.2GB, 한국어는 깨짐. Qwen3.6-35B-A3B UD-Q4_K_XL(22.9GB)은 내려받아 Strata 에 설치만 함(run-qwen36-ud-q4_k_xl.bat, 문맥 32K). 켜진다 — 여유 RAM 11.5GB 에서 275초, 15 tok/s(41절). setup 이 CUDA 12 엔진의 지원 모델을 물을 때 CUDA 라이브러리 경로를 넣지 않아 "이 엔진은 Qwen3.6 을 못 돌린다"로 멈췄다 — 엔진에 직접 물으면 qwen35moe 지원. PATH 에 라이브러리 경로를 넣고 setup 을 다시 돌려 설치(Strata 코드는 그대로).
+
 ## 2026-10-13 — GPQA Diamond 실측: ALEX 로컬 모델 171/198 = 86.4%
 
 - 박사 수준 과학 객관식 198문제를 ALEX 와 같은 조건(생각 medium·답 최대 32,768토큰)으로 한 번씩: 물리 83/86, 화학 73/93, 생물 15/19. 발표 점수 Qwen 원본 91.7·GPT-5.6 Luna 약 92·Claude Sonnet 5 88.9 와 비교(docs/EVAL_GPQA_20261012.md).

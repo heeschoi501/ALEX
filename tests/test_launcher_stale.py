@@ -72,7 +72,7 @@ class ExistingServerTests(unittest.TestCase):
         return data
 
     def test_current_server_is_reused(self):
-        self.assertEqual(self.launch_against(self.health()), launcher.WEB)
+        self.assertEqual(self.launch_against(self.health()), launcher.web_url(load_settings()))
 
     def test_server_running_older_code_is_not_silently_reused(self):
         with self.assertRaises(RuntimeError) as ctx:

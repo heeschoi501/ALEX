@@ -82,8 +82,16 @@ class ModelSetupTests(unittest.TestCase):
         from jarvis.hardware import PerformanceProfile
         from scripts.setup_models import required_models
         with tempfile.TemporaryDirectory() as td:
+            s = Settings(file_search_root=Path(td), desktop_general_model="general:test", desktop_coder_model="coder:test")
+            self.assertEqual(required_models(s, PerformanceProfile.DESKTOP), ["general:test", "coder:test"])
+
+    def test_desktop_default_shares_one_model(self):
+        from jarvis.config import Settings
+        from jarvis.hardware import PerformanceProfile
+        from scripts.setup_models import required_models
+        with tempfile.TemporaryDirectory() as td:
             s = Settings(file_search_root=Path(td))
-            self.assertEqual(required_models(s, PerformanceProfile.DESKTOP), [s.desktop_general_model, s.desktop_coder_model])
+            self.assertEqual(required_models(s, PerformanceProfile.DESKTOP), ["gpt-oss:20b"])
 
 class ArchiveAuditTests(unittest.TestCase):
     def _write_zip(self, path: Path, files: dict[str, str]):

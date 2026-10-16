@@ -42,6 +42,10 @@ class Settings:
     web_enabled: bool = True
     # 웹 읽기가 켜져 있을 때 모델이 web_search 도구를 스스로 부를 수 있게 한다(ADR-056).
     web_tool_enabled: bool = True
+    # 이 PC 의 ALEX 웹 포트(127.0.0.1 전용). 기본 8765 — 데스크톱의 원격 연결(remote_alex_port)과 Tailscale Serve 가
+    # 이 번호를 본다. 이 PC 에서 다른 프로그램이 8765 를 쓸 때만 jarvis.local.json 으로 바꾼다(2026-10-16, 노트북에서
+    # STRATA 레이아웃 스튜디오가 8765 를 써서 ALEX 가 켜지지 않았다).
+    web_port: int = 8765
     # 노트북에서 데스크톱 ALEX 에 붙기(ADR-052). SSH 터널이 노트북 127.0.0.1:remote_local_port 를
     # 데스크톱 127.0.0.1:remote_alex_port 로 잇는다. ALEX 는 여전히 127.0.0.1 에서만 듣는다.
     remote_host: str = ""
@@ -55,11 +59,14 @@ class Settings:
     remote_web_users: str = ""     # 허용할 Tailscale 로그인, 쉼표로 여러 개
     ollama_host: str = "http://127.0.0.1:11434"
     allow_remote_ollama: bool = False
+    # 기본 모델은 이 장비들에 남아 있는 것만 쓴다(2026-10-16 노트북 정리: gpt-oss:20b·qwen3:8b 만 남김).
+    # 노트북 첫 설치는 작은 qwen3:8b 하나(코딩도 같은 모델), 데스크톱은 실측한 gpt-oss:20b(PERFORMANCE 26절, 16GB 에 전부).
+    # 실제로 쓰는 모델은 jarvis.local.json 이 정한다(노트북 gpt-oss:20b, 데스크톱 qwen3.8:27b).
     general_model: str = "qwen3:8b-q4_K_M"
-    coder_model: str = "qwen2.5-coder:7b"
+    coder_model: str = "qwen3:8b-q4_K_M"
     auto_profile_models: bool = True
-    desktop_general_model: str = "qwen3:14b-q4_K_M"
-    desktop_coder_model: str = "qwen2.5-coder:14b"
+    desktop_general_model: str = "gpt-oss:20b"
+    desktop_coder_model: str = "gpt-oss:20b"
     request_timeout: int = 120
     local_max_output_tokens: int = 1024
     # 0 = Hardware Profile 자동값. 실측으로 VRAM 여유가 확인된 장비만 직접 올린다.
@@ -148,11 +155,17 @@ class Settings:
     strata_model: str = "qwen3.8-flash-next"
     strata_num_ctx: int = 65536            # Strata 설치 때 고른 문맥 창(이 PC: 64K)과 맞춘다
     strata_reasoning_effort: str = "medium"  # 생각을 켤 때(ollama_think) 쓰는 정도: low|medium|high
+    # 0: 기존 클라이언트 상한. 양수: 서버가 이 토큰 수에서 생각을 마치고 같은 요청으로 답을 이어 쓴다.
+    strata_reasoning_budget_tokens: int = 0
     # Strata 를 고르면 쓰는 상한(2026-10-11 사용자 "선택에 따라서 자동으로 설정을 바뀌게끔"). Ollama 로 바꾸면 위의
     # Desktop/전역 값(16K 문맥 기준)으로 돌아간다. 문맥 글자 예산 0 = 문맥 창에서 계산(app.engine_context_limits).
     strata_max_output_tokens: int = 16384   # 생각 토큰 포함. 실측 초당 59~76토큰 → 다 쓰면 약 4분
     strata_context_char_budget: int = 0
     strata_history_limit: int = 24
+    # Strata 에 모델이 여럿 설치됐을 때 켤 설정 파일(strata-<모델>.json, Strata 폴더 기준 또는 절대 경로). 비우면 하나뿐일 때 그것.
+    # 2026-10-16 노트북: Coder 와 Qwen3.6 을 둘 다 설치하자 설정 화면의 Strata 전환이 "여러 개" 오류로 막혔다 — 고를 곳이
+    # 환경변수(JARVIS_STRATA_CONFIG)뿐이었다.
+    strata_config: str = ""
     # RTL 모드(2026-10-10, ADR-087): /rtl 프로젝트 폴더의 뿌리(비우면 C:\ALEX\fabless)와 칩 도구(oss-cad-suite) 위치
     rtl_root: str = ""
     rtl_tools_dir: str = ""
@@ -288,11 +301,17 @@ def validate(settings: Settings) -> Settings:
         raise ConfigError("strata_num_ctx 는 4096~1048576 사이여야 합니다.")
     if settings.strata_reasoning_effort not in ("low", "medium", "high"):
         raise ConfigError("strata_reasoning_effort 는 low, medium, high 중 하나여야 합니다.")
+    if not 0 <= settings.strata_reasoning_budget_tokens <= settings.strata_max_output_tokens // 2:
+        raise ConfigError("strata_reasoning_budget_tokens 는 0(기존 동작) 이상, strata_max_output_tokens의 절반 이하여야 합니다.")
     if settings.remote_web_host:
         if not re.fullmatch(r"[a-z0-9-]+(?:\.[a-z0-9-]+)*\.ts\.net", settings.remote_web_host):
             raise ConfigError("remote_web_host 는 Tailscale 주소(…ts.net)만 허용합니다. 예: my-pc.tail1234.ts.net")
         if not [u for u in settings.remote_web_users.split(",") if u.strip()]:
             raise ConfigError("remote_web_host 를 쓰려면 remote_web_users 에 허용할 Tailscale 로그인을 적어야 합니다.")
+    if not 1024 <= settings.web_port <= 65535:
+        raise ConfigError("web_port 는 1024~65535 사이여야 합니다.")
+    if settings.web_port == settings.remote_local_port:
+        raise ConfigError("web_port 가 remote_local_port(데스크톱 연결 창의 포트)와 같습니다. 다른 번호를 쓰십시오.")
     if not 64 <= settings.strata_max_output_tokens <= settings.strata_num_ctx // 2:
         raise ConfigError("strata_max_output_tokens 는 64 이상, 문맥 창(strata_num_ctx)의 절반 이하여야 합니다.")
     if settings.strata_context_char_budget != 0 and not 1000 <= settings.strata_context_char_budget <= 500_000:
@@ -404,11 +423,12 @@ LOCAL_FIELDS = {
     "ram_offload_budget_gb": float, "num_gpu_layers": int, "num_gpu_layers_model": str,
     "context_char_budget": int, "force_profile": str, "web_enabled": bool,
     "remote_host": str, "remote_user": str, "remote_local_port": int, "remote_alex_port": int,
-    "remote_web_host": str, "remote_web_users": str,
+    "remote_web_host": str, "remote_web_users": str, "web_port": int,
     "lesson_context_limit": int, "web_tool_enabled": bool, "auto_lessons_enabled": bool, "coding_insights_enabled": bool, "fact_reminder_enabled": bool, "coding_api_map_enabled": bool,
     "coding_num_ctx": int, "coding_num_gpu_layers": int, "coding_context_char_budget": int, "coding_auto_attempts": int, "coding_regression_check": bool, "coding_diagnostic_context": bool, "coding_build_loop_enabled": bool, "coding_code_check_enabled": bool, "coding_worker": str, "opencode_dir": str, "opencode_model": str, "opencode_context": int, "opencode_timeout": int,
     "local_backend": str, "strata_host": str, "strata_model": str, "strata_num_ctx": int, "strata_reasoning_effort": str,
-    "strata_max_output_tokens": int, "strata_context_char_budget": int, "strata_history_limit": int,
+    "strata_max_output_tokens": int, "strata_context_char_budget": int, "strata_history_limit": int, "strata_config": str,
+    "strata_reasoning_budget_tokens": int,
     "rtl_root": str, "rtl_tools_dir": str,
     "image_generation_enabled": bool, "comfyui_dir": str, "comfyui_url": str,
 }
@@ -436,11 +456,12 @@ def load_settings() -> Settings:
         web_tool_enabled=_env_flag("JARVIS_WEB_TOOL", _env_flag("JARVIS_WEB_TOOL_ENABLED", True)),
         ollama_host=os.getenv("JARVIS_OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/"),
         allow_remote_ollama=_env_flag("JARVIS_ALLOW_REMOTE_OLLAMA", False),
+        web_port=_env_int("JARVIS_WEB_PORT", 8765),
         general_model=os.getenv("JARVIS_GENERAL_MODEL", "qwen3:8b-q4_K_M"),
-        coder_model=os.getenv("JARVIS_CODER_MODEL", "qwen2.5-coder:7b"),
+        coder_model=os.getenv("JARVIS_CODER_MODEL", "qwen3:8b-q4_K_M"),
         auto_profile_models=_env_flag("JARVIS_AUTO_PROFILE_MODELS", True),
-        desktop_general_model=os.getenv("JARVIS_DESKTOP_GENERAL_MODEL", "qwen3:14b-q4_K_M"),
-        desktop_coder_model=os.getenv("JARVIS_DESKTOP_CODER_MODEL", "qwen2.5-coder:14b"),
+        desktop_general_model=os.getenv("JARVIS_DESKTOP_GENERAL_MODEL", "gpt-oss:20b"),
+        desktop_coder_model=os.getenv("JARVIS_DESKTOP_CODER_MODEL", "gpt-oss:20b"),
         request_timeout=_env_int("JARVIS_REQUEST_TIMEOUT", 120),
         local_max_output_tokens=_env_int("JARVIS_LOCAL_MAX_OUTPUT_TOKENS", 1024),
         num_ctx=_env_int("JARVIS_NUM_CTX", 0),
@@ -479,9 +500,11 @@ def load_settings() -> Settings:
         strata_model=os.getenv("JARVIS_STRATA_MODEL", "qwen3.8-flash-next").strip(),
         strata_num_ctx=_env_int("JARVIS_STRATA_NUM_CTX", 65536),
         strata_reasoning_effort=os.getenv("JARVIS_STRATA_REASONING_EFFORT", "medium").strip().lower(),
+        strata_reasoning_budget_tokens=_env_int("JARVIS_STRATA_REASONING_BUDGET_TOKENS", 0),
         strata_max_output_tokens=_env_int("JARVIS_STRATA_MAX_OUTPUT_TOKENS", 16384),
         strata_context_char_budget=_env_int("JARVIS_STRATA_CONTEXT_CHAR_BUDGET", 0),
         strata_history_limit=_env_int("JARVIS_STRATA_HISTORY_LIMIT", 24),
+        strata_config=os.getenv("JARVIS_STRATA_CONFIG", "").strip(),
         rtl_root=os.getenv("JARVIS_RTL_ROOT", ""),
         rtl_tools_dir=os.getenv("JARVIS_RTL_TOOLS_DIR", ""),
         image_generation_enabled=_env_flag("JARVIS_IMAGE_GENERATION_ENABLED", False),

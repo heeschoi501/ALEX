@@ -1,0 +1,22 @@
+[
+  {
+    "kind": "edit",
+    "situation": "8GB RTX 4070 Laptop, RAM 31.18GiB에서 Strata CUDA 12 엔진 0.1.44.1로 Qwen3.6-35B-A3B UD-Q4_K_XL을 사용했다. Flash-Next의 최적화 경로를 그대로 적용할 수 있다고 가정하면 안 되는 상황이었다.",
+    "judgment": "현재 모델의 실제 엔진 경로를 먼저 확인하고, 모델·문맥·입력·출력 조건을 기록한 순차 측정으로 설정을 골라야 한다.",
+    "rationale": "q36_engine.cu는 전문가 18.75GiB를 호스트 RAM에 복사한다. MMQ 입력 작업 공간 1.10GiB 때문에 GPU 전문가 슬롯은 층당 4개였다. STRATA_Q36_NO_MMQ를 설정하면 슬롯은 19개가 된다. Flash-Next의 pack·저RAM 모드는 이 경로에서 쓰이지 않는다.",
+    "choice": "문맥 16384, prefill 512, MTP 2, CPU 16개를 유지하고 이 노트북의 Strata 설정에만 STRATA_Q36_NO_MMQ=1을 적용했다. 실행 중 모델 이름·문맥을 ALEX 설정과 대조하도록 런처와 provider도 수정했다.",
+    "outcome": "예열 후 합성 혼합 입력 2131토큰, 출력 64토큰에서 첫 내용 도착 8.719초에서 6.000초, 전체 10.235초에서 7.359초를 관측했다. 각 조합 1회이며 RAM 여유가 달라 통제 실험이 아니다. 짧은 요청의 생성 속도가 모두 개선되지는 않았다. 품질 평가·원어민 평가·코딩 정답 평가는 하지 않았다. 근거: docs/STRATA_QWEN36_LAPTOP_20261017.md 및 logs/strata-*-mixed-warm-20261017.json.",
+    "verdict": "unrated",
+    "source": "codex:20261017:strata-qwen36-laptop-measured-config"
+  },
+  {
+    "kind": "edit",
+    "situation": "Qwen3.6의 지연을 줄이려고 reasoning_effort를 medium에서 low로 바꾸거나 권장 샘플링 값을 추가하는 방안이 있었다. ALEX는 생각 토큰까지 포함한 개수를 화면에 답변이 나타난 뒤 시간으로 나누고 있었다.",
+    "judgment": "설정 이름이 있다고 실제 모델이 처리한다고 가정하지 말고, 토큰화된 프롬프트와 엔진의 실행 분기를 확인해야 한다. 속도는 생성 전체 시간과 표시 시간을 구분해야 한다.",
+    "rationale": "설치된 Qwen 템플릿을 low, medium, xhigh로 각각 렌더링한 SHA-256이 모두 같았다. enable_thinking=false는 프롬프트를 바꿨다. Qwen 엔진의 sampled 경로는 MTP를 사용하지 않는다. Strata는 별도의 reasoning_budget_tokens를 실제 토큰 수로 처리한다.",
+    "choice": "greedy와 MTP를 유지하고 ALEX에 서버 생각 상한 설정을 추가했다. 이 노트북에서만 1024로 적용하고 코드 기본값 0은 유지했다. 정확한 속도에는 서버의 predicted_per_second, prompt_ms, predicted_ms를 사용한다. 서버 상한은 생각 종료 후 같은 요청에서 답변을 이어 쓰게 한다.",
+    "outcome": "설정 화면에서 생각 상한을 바꿀 수 있고 /status의 실효 설정에도 표시된다. 생각 상한을 낮추면 복잡한 문제의 답변에 영향을 줄 수 있으며 품질 향상을 주장하지 않는다. 템플릿 확인: logs/strata-qwen-template-check-20261017.json. 승인이나 학습용 내보내기는 하지 않고 검토용 raw 경험으로 보관한다.",
+    "verdict": "unrated",
+    "source": "codex:20261017:strata-qwen36-effort-mtp-and-timings"
+  }
+]

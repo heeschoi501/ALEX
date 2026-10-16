@@ -27,6 +27,7 @@ from typing import Callable
 import urllib.request
 
 from .providers import GenerationCancelled
+from .strata_runtime import validate_strata_health
 
 SKIP_PARTS = {"__pycache__", ".git", ".opencode", "node_modules", ".pytest_cache"}
 TEXT_SUFFIXES = {".py", ".md", ".txt", ".json", ".toml", ".cfg", ".ini", ".yml", ".yaml", ".js", ".html", ".css"}
@@ -96,6 +97,10 @@ class OpenCodeWorker:
                 health = None
             if not isinstance(health, dict) or health.get("service") != "strata":
                 return f"Strata 서버({self.host})에 연결하지 못했습니다 — Strata 를 켰는지 확인하세요"
+            try:
+                validate_strata_health(health, self.model, self.context)
+            except ValueError as exc:
+                return str(exc)
             return ""
         try:
             request = urllib.request.Request(f"{self.host}/api/show", data=json.dumps({"model": self.model}).encode(),

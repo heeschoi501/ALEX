@@ -231,10 +231,10 @@ unified diff + proposal id
 
 ### Desktop
 
-- General: `qwen3:14b-q4_K_M`
-- Coder: `qwen2.5-coder:14b`
+- General / Coder: `gpt-oss:20b` (한 모델 공유)
 - Context: 16384 (프로필 기본값)
 
+코드 기본값은 처음 설치용이다. 실제로 쓰는 모델은 `jarvis.local.json` 이 정한다 — 노트북 `gpt-oss:20b`, 데스크톱 `qwen3.8:27b`.
 환경변수로 전부 변경 가능하다. 실제 성능값은 `scripts/benchmark_local.py`로 사용자 4070/5080에서 측정해야 한다.
 
 ## Cloud 경계

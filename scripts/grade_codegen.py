@@ -23,7 +23,7 @@ Examples:
   python scripts/grade_codegen.py --dry-run          # show prompt/cases, generate nothing
   python scripts/grade_codegen.py --execute          # 1 run, current config
   python scripts/grade_codegen.py --execute -n 5     # 5 runs, report mean
-  python scripts/grade_codegen.py --execute --no-coding-prompt --model qwen2.5-coder:7b
+  python scripts/grade_codegen.py --execute --no-coding-prompt --model qwen3:8b-q4_K_M
   python scripts/grade_codegen.py --execute -n 10 --think --repeat-penalty 1.2
 """
 from __future__ import annotations

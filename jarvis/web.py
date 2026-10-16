@@ -224,7 +224,7 @@ class WebAppState:
         if self.settings is not None and self.settings.use_ollama:
             from .model_switch import backend_available
             other = "ollama" if self.settings.local_backend == "strata" else "strata"
-            if backend_available(replace(self.settings, local_backend=other)):
+            if backend_available(replace(self.settings, local_backend=other), validate_config=False):
                 provider = OllamaProvider(self.settings.general_model, host=self.settings.ollama_host) if other == "ollama" else StrataProvider(self.settings.strata_model, host=self.settings.strata_host)
                 self.inactive_providers.append(provider)
                 self.core.local_engine_guard = self._check_inactive_engines
@@ -387,14 +387,15 @@ class WebAppState:
             raise ValueError("설정 변경을 지원하지 않는 실행 모드입니다.")
         allowed = {"general_model", "coder_model", "desktop_general_model", "desktop_coder_model",
                    "auto_profile_models", "single_model_on_laptop", "local_max_output_tokens",
-                   "desktop_max_output_tokens", "ollama_think", "num_ctx", "local_backend", "strata_max_output_tokens"}
+                   "desktop_max_output_tokens", "ollama_think", "num_ctx", "local_backend", "strata_max_output_tokens",
+                   "strata_reasoning_budget_tokens"}
         if not isinstance(changes, dict) or not changes or any(k not in allowed or type(v) is not LOCAL_FIELDS[k] for k, v in changes.items()):
             raise ValueError("지원하지 않는 설정 또는 잘못된 형식입니다.")
         if changes.get("local_backend", self.settings.local_backend) == "strata" and any(k not in {
                 "local_max_output_tokens", "desktop_max_output_tokens", "ollama_think", "local_backend",
-                "strata_max_output_tokens"} for k in changes):
+                "strata_max_output_tokens", "strata_reasoning_budget_tokens"} for k in changes):
             raise ValueError("Strata는 서버에 설정된 모델 하나를 대화·코딩에 공유합니다. "
-                             "여기서는 출력 길이와 Thinking만 변경할 수 있습니다. "
+                             "여기서는 출력 길이와 Thinking·생각 상한만 변경할 수 있습니다. "
                              "다른 모델 선택은 Ollama 모드에서 지원합니다.")
         for k in changes:
             if "JARVIS_" + k.upper() in os.environ:
@@ -1543,7 +1544,7 @@ def make_server(state: WebAppState, port: int = DEFAULT_PORT) -> ThreadingHTTPSe
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Project ALEX loopback-only Local Web Alpha")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--port", type=int, default=None, help=f"비우면 설정의 web_port(기본 {DEFAULT_PORT})")
     parser.add_argument("--open", action="store_true", help="서버 준비 후 브라우저 열기")
     args = parser.parse_args(argv)
 
@@ -1561,7 +1562,7 @@ def main(argv: list[str] | None = None) -> None:
     saved = core.storage.get_state("web.current_session")
     session_id = saved if saved and core.storage.session_exists(saved) else core.get_or_create_session(resume=True)
     state = WebAppState(core=core, session_id=session_id, settings=settings)
-    server = make_server(state, args.port)
+    server = make_server(state, settings.web_port if args.port is None else args.port)
     host, port = server.server_address[:2]
     print(f"Project ALEX Local Web: http://{host}:{port}")
     print("Cloud approval: DISABLED in Web Alpha (Cloud route -> Local fallback)")

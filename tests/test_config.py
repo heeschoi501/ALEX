@@ -169,7 +169,7 @@ class CurrentLocalModelDefaultsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             settings = validate(Settings(file_search_root=Path(td)))
             self.assertEqual(settings.general_model, "qwen3:8b-q4_K_M")
-            self.assertEqual(settings.coder_model, "qwen2.5-coder:7b")
+            self.assertEqual(settings.coder_model, "qwen3:8b-q4_K_M")
             self.assertFalse(settings.ollama_think)
 
 class OllamaRuntimeConfigTests(unittest.TestCase):

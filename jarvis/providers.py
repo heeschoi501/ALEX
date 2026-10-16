@@ -10,12 +10,14 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 import json
+import math
 import time
 import threading
 from typing import Callable, Iterator, Sequence
 import urllib.error
 import urllib.request
 from .http_control import interrupt_on_cancel
+from .strata_runtime import validate_strata_health
 
 
 class ProviderError(RuntimeError):
@@ -580,7 +582,7 @@ def loaded_ollama_models(host: str, timeout: float = 10) -> list[str]:
 
 
 class StrataProvider(OllamaProvider):
-    """이 PC 의 Strata 서버로 Qwen3.8-Flash-Next(125B MoE)를 쓰는 Local Provider (2026-10-10, ADR-086).
+    """이 PC 의 Strata 서버로 Flash-Next/Qwen3.6 등을 쓰는 Local Provider (ADR-086).
 
     Strata(github.com/Niko1221/Strata)는 전문가 가중치를 RAM 에 두고 자주 쓰는 것만 그래픽카드에 올려 16GB 로 125B 를 돌린다.
     API 는 OpenAI 호환 `/v1/chat/completions`(SSE 스트림, 생각은 `reasoning_content`). 도구 호출 루프·생각 상한·중단·빈 답 판정은
@@ -590,11 +592,13 @@ class StrataProvider(OllamaProvider):
 
     def __init__(self, model: str, host: str = "http://127.0.0.1:8080", timeout: int = 120, num_ctx: int = 65536,
                  name: str | None = None, health_ttl: float = 30.0, think: bool = False, num_predict: int = 1024,
-                 num_gpu: int = 0, keep_alive: str = "10m", reasoning_effort: str = "medium") -> None:
+                 num_gpu: int = 0, keep_alive: str = "10m", reasoning_effort: str = "medium",
+                 reasoning_budget_tokens: int = 0) -> None:
         super().__init__(model, host=host, timeout=timeout, num_ctx=num_ctx, name=name or f"strata:{model}",
                          health_ttl=health_ttl, think=think, num_predict=num_predict, num_gpu=num_gpu,
                          keep_alive=keep_alive)
         self.reasoning_effort = reasoning_effort
+        self.reasoning_budget_tokens = reasoning_budget_tokens
 
     # ── 통신 형식 ──────────────────────────────────────────────────────────────
     @staticmethod
@@ -640,6 +644,11 @@ class StrataProvider(OllamaProvider):
             "max_tokens": self.num_predict,
             "reasoning_effort": self.reasoning_effort if self.think else "none",
         }
+        if self.think and self.reasoning_budget_tokens:
+            # A server-side wrap-up preserves generated thinking and the model's live prefix. The existing
+            # client limit remains a backstop; hitting that limit would abort and retry the entire prompt.
+            payload["reasoning_budget_tokens"] = min(self.reasoning_budget_tokens, self._thinking_budget(messages),
+                                                      max(1, self.num_predict // 2))
         if tools:
             payload["tools"] = tools
         return payload
@@ -664,12 +673,20 @@ class StrataProvider(OllamaProvider):
     def generate_stream(self, messages: Sequence[Message], **kwargs: object) -> Iterator[str]:
         """`/v1/chat/completions` SSE 를 읽어 답 조각을 낸다. 생각·도구 호출은 OllamaProvider 와 같은 규칙으로 다룬다."""
         self._check_cancelled()
-        if self.before_generate is not None:
-            self.before_generate()
         self.last_metrics = {}
         self.last_tool_calls = []
+        if self.before_generate is not None:
+            self.before_generate()
+        health = self._health()
+        if health is None:
+            raise ProviderError(f"Strata 서버에 연결할 수 없습니다: {self.host}")
+        try:
+            validate_strata_health(health, self.model, self.num_ctx)
+        except ValueError as exc:
+            raise ProviderError(str(exc)) from exc
         started = time.monotonic()
         first = None
+        first_generated = None
         completed = False
         tools = kwargs.get("tools")
         payload = self._chat_payload(messages, stream=True, tools=tools if isinstance(tools, list) else None)
@@ -708,6 +725,8 @@ class StrataProvider(OllamaProvider):
                         slot["name"] = function.get("name") or slot["name"]
                         slot["arguments"] += function.get("arguments") or ""
                     thinking = delta.get("reasoning_content")
+                    if first_generated is None and (thinking or delta.get("content") or delta.get("tool_calls")):
+                        first_generated = time.monotonic() - started
                     if budget and first is None and isinstance(thinking, str) and thinking:
                         thought += max(1, len(thinking) // 4)
                         if thought > budget:
@@ -725,14 +744,28 @@ class StrataProvider(OllamaProvider):
                         usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
                         total = time.monotonic() - started
                         count = usage.get("completion_tokens")
-                        writing = total - (first or 0.0)
+                        decoding = total - first_generated if first_generated is not None else 0.0
+                        timings = data.get("timings") if isinstance(data.get("timings"), dict) else {}
+
+                        def number(key):
+                            value = timings.get(key)
+                            return value if type(value) in (int, float) and math.isfinite(value) and value >= 0 else None
+
+                        rate = number("predicted_per_second")
+                        if rate is None and type(count) is int and count > 1 and decoding > 0:
+                            rate = (count - 1) / decoding
                         self.last_metrics = {
                             "first_token_seconds": round(first, 3) if first is not None else None,
                             "total_seconds": round(total, 3),
                             "output_tokens": count,
-                            "tokens_per_second": round(count / writing, 2) if isinstance(count, int) and writing > 0 else None,
+                            "tokens_per_second": round(rate, 2) if rate is not None else None,
                             "done_reason": "length" if finish == "length" else "stop",
                             "prompt_tokens": usage.get("prompt_tokens"),
+                            "generation_first_token_seconds": round(first_generated, 3) if first_generated is not None else None,
+                            "prompt_seconds": number("prompt_ms") / 1000 if number("prompt_ms") is not None else None,
+                            "decode_seconds": number("predicted_ms") / 1000 if number("predicted_ms") is not None else None,
+                            "cached_prompt_tokens": number("cache_n"),
+                            "prompt_tokens_per_second": number("prompt_per_second"),
                         }
                 self._check_cancelled()
                 if not completed:
@@ -774,12 +807,18 @@ class StrataProvider(OllamaProvider):
         now = time.monotonic()
         if self.health_ttl > 0 and (now - self._last_health_at) < self.health_ttl:
             return self._last_health
-        self._last_health = self._health() is not None
+        health = self._health()
+        try:
+            validate_strata_health(health or {}, self.model, self.num_ctx)
+            self._last_health = True
+        except ValueError:
+            self._last_health = False
         self._last_health_at = now
         return self._last_health
 
     def _fetch_installed_models(self) -> set[str]:
-        return {self.model} if self._health() is not None else set()
+        health = self._health()
+        return {health["model"]} if health and isinstance(health.get("model"), str) else set()
 
     def supports_images(self) -> bool:
         health = self._health()
@@ -787,7 +826,7 @@ class StrataProvider(OllamaProvider):
 
     def _fetch_loaded_models(self) -> set[str]:
         health = self._health()
-        return {self.model} if health is not None and health.get("loaded") else set()
+        return {health["model"]} if health and health.get("loaded") and isinstance(health.get("model"), str) else set()
 
     def placement(self) -> dict | None:
         return None  # Strata 는 전문가를 그래픽카드·RAM·SSD 에 스스로 나눈다 — Ollama 의 size_vram 같은 값이 없다.
@@ -796,7 +835,11 @@ class StrataProvider(OllamaProvider):
         health = self._health(timeout)
         if health is None or health.get("error") or type(health.get("loaded")) is not bool:
             raise ProviderError(f"Strata 상태를 확인하지 못했습니다: {self.host}")
-        return [self.model] if health["loaded"] else []
+        if not health["loaded"]:
+            return []
+        if not isinstance(health.get("model"), str) or not health["model"]:
+            raise ProviderError(f"Strata 모델 이름을 확인하지 못했습니다: {self.host}")
+        return [health["model"]]
 
     def unload(self, timeout: float = 15) -> list[str]:
         """그래픽카드를 지금 돌려준다(`POST /unload`). 다음 요청 때 Strata 가 다시 올린다(첫 답이 늦어진다)."""

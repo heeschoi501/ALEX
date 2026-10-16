@@ -1043,6 +1043,7 @@ async function openSettings() {
   // 실측으로 정한 6144 가 목록(4096까지)에 없어서 실제로 그 상태가 나왔다. 없으면 만들어 넣는다.
   syncEngineLimits();
   $('think').checked = s.ollama_think;
+  syncReasoningBudget();
   const effective = state.effective_settings;
   $('effective-settings').textContent = effective ? [
     '현재 대화 모델: ' + backendLabel(liveBackend(state)) + ' · ' + effective.general.model,
@@ -1052,6 +1053,7 @@ async function openSettings() {
       const p = effective[k];
       return p.num_predict === undefined ? [] : [
         `${k === 'general' ? '대화' : '코딩'}: 실제 출력 한도 ${p.num_predict} 토큰 · Thinking ${p.think ? '켜짐' : '꺼짐'} · 시간 제한 ${p.timeout}초`
+          + (p.reasoning_budget_tokens ? ` · 생각 상한 ${p.reasoning_budget_tokens} 토큰` : '')
       ];
     }),
   ].join('\n') : '실제 적용 설정은 앱을 다시 시작한 뒤 확인할 수 있습니다.';
@@ -1066,11 +1068,22 @@ function syncEngineLimits() {
   const s = state.settings, strata = $('model-backend').value === 'strata', desktop = state.profile === 'DESKTOP';
   for (const o of $('output-limit').options) o.disabled = strata ? Number(o.value) > (s.strata_num_ctx || 65536) / 2 : Number(o.value) > 8192;
   setOutputLimit(strata ? s.strata_max_output_tokens || 16384 : (desktop && s.desktop_max_output_tokens) || s.local_max_output_tokens || 1024);
+  $('strata-reasoning-options').hidden = !strata;
+  $('reasoning-budget').value = s.strata_reasoning_budget_tokens || 0;
+  syncReasoningBudget();
   const limits = (state.engine_limits || {})[strata ? 'strata' : 'ollama'];
   $('output-scope').textContent = (strata ? `Strata(문맥 ${Math.round((s.strata_num_ctx || 65536) / 1024)}K)` : desktop ? 'Ollama · 이 데스크톱' : 'Ollama · 노트북')
     + '의 출력 길이입니다.' + (limits ? ` 이 엔진을 고르면 입력 ${limits.chars.toLocaleString()}자, 최근 대화 ${limits.history}개로 자동으로 맞춥니다.` : '');
 }
 $('model-backend').addEventListener('change', syncEngineLimits);
+function syncReasoningBudget() {
+  const input = $('reasoning-budget'), max = Math.floor(Number($('output-limit').value) / 2);
+  input.max = String(max);
+  input.value = Math.min(Number(input.value) || 0, max);
+  input.disabled = $('model-backend').value !== 'strata' || !$('think').checked;
+}
+$('output-limit').addEventListener('change', syncReasoningBudget);
+$('think').addEventListener('change', syncReasoningBudget);
 function updateSharedModel() {
   const strata = $('model-backend').value === 'strata';
   const shared = state.profile !== 'DESKTOP' && $('single-model').checked;
@@ -1103,6 +1116,8 @@ $('settings-form').addEventListener('submit', async e => {
     changes[profileModels ? 'desktop_general_model' : 'general_model'] = $('general-model').value;
     if (!desktop) changes.single_model_on_laptop = $('single-model').checked;
     if (!$('coder-model').disabled) changes[profileModels ? 'desktop_coder_model' : 'coder_model'] = $('coder-model').value;
+  } else {
+    changes.strata_reasoning_budget_tokens = Number($('reasoning-budget').value);
   }
   lock(true); $('model-backend').disabled = true; $('settings-close').disabled = true;
   $('settings-error').textContent = changes.local_backend !== liveBackend(state) ? '이전 모델의 GPU 반환을 확인하고 엔진을 준비하는 중입니다. Strata 첫 실행은 1~3분 걸릴 수 있습니다.' : '설정을 저장하는 중입니다…';

@@ -10,6 +10,7 @@ from .config import Settings
 from .hardware import PerformanceProfile
 from . import launcher
 from .providers import OllamaProvider, ProviderError, loaded_local_models, unload_local_models
+from .strata_runtime import validate_strata_health
 
 
 def stored_ollama_models(host: str) -> set[str]:
@@ -32,13 +33,19 @@ def stored_ollama_models(host: str) -> set[str]:
     return names
 
 
-def backend_available(settings: Settings) -> bool:
+def backend_available(settings: Settings, *, validate_config: bool = True) -> bool:
     host, endpoint = (settings.strata_host, "/health") if settings.local_backend == "strata" else (settings.ollama_host, "/api/tags")
     try:
         value = launcher.get_json(host + endpoint)
-        return value.get("service") == "strata" if settings.local_backend == "strata" else isinstance(value.get("models"), list)
     except (OSError, ValueError):
         return False
+    if settings.local_backend == "strata":
+        if not validate_config:
+            # An inactive server is tracked only to release its GPU. Its model need not match the selected one.
+            return value.get("service") == "strata" and not value.get("error")
+        validate_strata_health(value, settings.strata_model, settings.strata_num_ctx)
+        return True
+    return isinstance(value.get("models"), list)
 
 
 def check_backend_install(settings: Settings) -> None:
@@ -47,7 +54,7 @@ def check_backend_install(settings: Settings) -> None:
         return
     if settings.local_backend == "strata":
         try:
-            launcher.strata_command(launcher.strata_dir(), int(settings.strata_host.rsplit(":", 1)[1]))
+            launcher.strata_command(launcher.strata_dir(), int(settings.strata_host.rsplit(":", 1)[1]), settings.strata_config)
         except (RuntimeError, OSError) as exc:
             raise ValueError(str(exc)) from exc
     elif settings.ollama_host.rstrip("/") != launcher.OLLAMA:
@@ -65,7 +72,8 @@ def start_backend(settings: Settings, profile: PerformanceProfile, models: tuple
     log_dir.mkdir(exist_ok=True)
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
     strata = settings.local_backend == "strata"
-    command = launcher.strata_command(launcher.strata_dir(), int(settings.strata_host.rsplit(":", 1)[1])) if strata else [str(launcher.ROOT / "runtime" / "ollama" / "ollama.exe"), "serve"]
+    command = launcher.strata_command(launcher.strata_dir(), int(settings.strata_host.rsplit(":", 1)[1]),
+                                      settings.strata_config) if strata else [str(launcher.ROOT / "runtime" / "ollama" / "ollama.exe"), "serve"]
     environment = os.environ.copy() if strata else launcher.ollama_environment(profile, models)
     with (log_dir / ("strata-server.log" if strata else "ollama-server.log")).open("a", encoding="utf-8") as log:
         process = subprocess.Popen(command, cwd=launcher.strata_dir() if strata else launcher.ROOT, env=environment,
@@ -74,7 +82,9 @@ def start_backend(settings: Settings, profile: PerformanceProfile, models: tuple
     runtime.mkdir(exist_ok=True)
     (runtime / ("strata.pid" if strata else "ollama.pid")).write_text(str(process.pid), encoding="utf-8")
     try:
-        deadline = time.monotonic() + (240 if strata else 20)
+        # Strata 는 런처(ensure_strata)와 같이 15분까지 기다린다. 2026-10-16 노트북의 Qwen3.6-35B 는 다른 프로그램이
+        # 20GB 를 쓰는 상태에서 켜는 데 275초가 걸렸다 — 240초면 다 올라오기 직전에 끊긴다.
+        deadline = time.monotonic() + (900 if strata else 20)
         while time.monotonic() < deadline:
             if backend_available(settings):
                 if not strata:

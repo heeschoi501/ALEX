@@ -9,7 +9,7 @@ RAM 으로 스필하는데, 그것이 Ollama 가 명시적으로 CPU 층을 두�
 단조 증가가 아니라 **봉우리가 있는 곡선**이고, 직접 훑어야 꼭대기를 찾는다.
 
 사용:
-  python scripts/tune_gpu_layers.py --model qwen3:14b --num-ctx 8192
+  python scripts/tune_gpu_layers.py --model qwen3:8b-q4_K_M --num-ctx 8192
   python scripts/tune_gpu_layers.py --model gpt-oss:20b --num-ctx 8192 --layers 0,16,20,24,28
 """
 from __future__ import annotations

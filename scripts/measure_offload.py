@@ -14,7 +14,7 @@ Ollama 가 load_duration / prompt_eval_duration / eval_duration 을 나눠서 �
 
 사용:
   python scripts/measure_offload.py --model qwen3:8b-q4_K_M --num-ctx 8192 --turns 5
-  python scripts/measure_offload.py --model qwen3.5:9b-q4_K_M --num-ctx 8192 --turns 5
+  python scripts/measure_offload.py --model gpt-oss:20b --num-ctx 8192 --turns 5
 """
 from __future__ import annotations
 
