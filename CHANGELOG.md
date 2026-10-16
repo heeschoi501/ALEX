@@ -1,3 +1,10 @@
+## 2026-10-17 (클로드) — 노트북 Strata Qwen3.6 엔진: 전문가 파일 매핑·라우팅 순위 저장(빌드됨, 아직 꺼 둠)
+
+- Strata q36_engine.cu 에 옵트인 두 기능: STRATA_Q36_EXPERT_FILE(묶은 전문가를 <gguf>.q36experts 에 한 번 써서 읽기 전용 매핑 — 켤 때마다의 18.75GiB 복사·재묶음 제거), STRATA_Q36_PROFILE(요청마다 라우팅 점수 저장, 다음 시작 때 점수 높은 전문가로 VRAM 칸 채움). 패치 docs/patches/strata-296b59d-q36-expert-file-profile.patch.
+- CUDA 12.9(구성 요소만, 드라이버 572.70 유지)·VS 2022 Build Tools 설치, 엔진 빌드 162초. 새 엔진(기능 끔)과 원래 엔진의 생성 32토큰이 완전히 같음. 원래 방식은 엔진 혼자 private 27.1GiB.
+- 전문가 파일 20.1GB 완성. 매핑 상태의 생성 비교는 다음에(사용자 결정). 그때까지 Strata 설정은 검증된 쪽(NO_MMQ 만)으로 되돌림.
+- 드러난 문제: 첫 작성으로 Strata 가 몇 분 응답하지 않을 때 런처를 다시 누르면 두 번째 Strata 가 뜬다(실제 발생, 정리함). 첫 작성 중 쓰기 캐시로 여유 RAM 0.4GB. 고칠 방법은 docs/HANDOFF_20261017_STRATA_ENGINE_WIP.md 6절.
+
 ## 2026-10-17 — 노트북 Qwen3.6 실행 최적화와 Strata 연결 검증
 
 - 이 노트북의 Strata에만 `STRATA_Q36_NO_MMQ=1` 적용: GPU 전문가 층당 4→19개. 예열 혼합 입력 2131토큰의 첫 내용 도착 8.719→6.000초(각 1회, RAM 상태 차이 있음). 품질 평가는 하지 않음.
