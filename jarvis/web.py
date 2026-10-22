@@ -99,7 +99,7 @@ def provisional_title(text: str) -> str:
     return (cut[:space] if space >= 20 else cut) + "…"
 
 
-ADMIN_PATHS = frozenset({"/api/settings", "/api/workspace", "/api/shutdown", "/api/pull", "/api/users"})
+ADMIN_PATHS = frozenset({"/api/settings", "/api/workspace", "/api/shutdown", "/api/restart", "/api/pull", "/api/users", "/api/coding"})
 
 
 @dataclass(frozen=True)
@@ -133,6 +133,8 @@ class Ticket:
 
 
 MAX_SERVED_DOWNLOAD = 2_000_000_000  # 화면으로 내주는 받은 파일 상한(그보다 크면 폴더에서 직접)
+AUTO_LEARN_EVERY = 600       # 쉬는 중 자동 학습을 살피는 간격(초)
+AUTO_LEARN_MIN = 3           # 아직 안 배운 코딩 기록이 이만큼 쌓이면
 JOB_KEEP = 20                # 사람마다 남겨 두는 뒤 작업 기록 수
 JOB_PROGRESS_CHARS = 1500    # 진행 중 화면에 보이는 마지막 글자 수
 JOB_RESULT_CHARS = 600       # 끝난 작업 목록에 보이는 답 앞부분
@@ -579,18 +581,72 @@ class WebAppState:
             threading.Thread(target=hub.start, daemon=True, name="alex-mcp-start").start()
         self.code = CodeSessions(lambda: self.core.providers.get(Destination.LOCAL_CODER), model_turn=self.code_turn,
                                  store=data_dir / "code_sessions", fetch=self._code_fetch, search=self._code_search,
-                                 mcp=hub, logger=logger)
+                                 mcp=hub, timeout=getattr(self.settings, 'opencode_timeout', 900), logger=logger,
+                                 lessons=getattr(self.core, "coding_insight_text", None),  # 절차 교훈(ADR-070, 켤 때만)
+                                 outcome=self._record_code_outcome,
+                                 opencode_home=Path(self.settings.opencode_dir) if getattr(self.settings, "opencode_dir", "") else None)
+        if self.settings is not None:  # 실제 앱에서만(시험의 상태 객체는 빼고) — 쉬는 중 자동 학습
+            threading.Thread(target=self._auto_learn_loop, daemon=True, name="alex-auto-learn").start()
 
-    # ---------------------------------------------------------------- 코딩 세션(ADR-112)
-    @contextmanager
-    def code_turn(self, session):
-        """코딩 세션이 모델을 한 번 부르는 동안만 차례를 잡는다(대화 요청과 같은 대기열). 도구 실행·허락 기다리는 동안엔 내준다."""
-        ticket = Ticket(session.owner, session_id=session.id, cancel=session.cancel)
+    # ---------------------------------------------------------------- 코딩 기록으로 배우기(2026-10-23)
+    def _record_code_outcome(self, event: dict) -> None:
+        """코딩 세션 결과를 자동 수정 기록과 같은 곳(dev-outcomes.jsonl)에 — /dev-learn 이 함께 읽는다."""
+        storage = getattr(self.core, "storage", None)
+        if storage is not None:
+            from .developer import record_outcome
+            record_outcome(storage, event)
+
+    def _auto_learn_loop(self) -> None:
+        while not self.shutting_down:
+            time.sleep(AUTO_LEARN_EVERY)
+            try:
+                self.maybe_auto_learn()
+            except Exception:  # noqa: BLE001 — 다음 차례에 다시
+                self.core.logger.exception("auto learn failed")
+
+    def maybe_auto_learn(self) -> str:
+        """설정(coding_auto_learn_enabled)이 켜져 있고, 기다리는 요청이 없고, 아직 안 배운 기록이 AUTO_LEARN_MIN 건 이상이면
+        뒤 작업 차례(대화 요청이 오면 그쪽이 먼저)로 /dev-learn 을 한 번 돌린다. 모델 한 번 부르기 — GPU 긴 작업 아님."""
+        if not getattr(self.core, "coding_auto_learn", False) or self.shutting_down:
+            return ""
+        with self.queue_cv:
+            if self.queue or self.running is not None or self.active_id is not None:
+                return ""
+        from .developer import DeveloperMode
+        if DeveloperMode(self.core).learning_pending() < AUTO_LEARN_MIN:
+            return ""
+        ticket = Ticket(OWNER, background=True)
         with self.queue_cv:
             self.queue.append(ticket)
             self.queue_cv.notify_all()
         try:
             if not self.wait_turn(ticket):
+                return ""
+            with self.ticket_running(ticket, "learn", lambda _chunk: None):
+                reply = DeveloperMode(self.core).learn()
+            self.core.logger.info("auto learn: %s", reply.splitlines()[0] if reply else "")
+            return reply
+        finally:
+            with self.queue_cv:
+                if ticket in self.queue:
+                    self.queue.remove(ticket)
+                self.queue_cv.notify_all()
+
+    # ---------------------------------------------------------------- 코딩 세션(ADR-112)
+    @contextmanager
+    def code_turn(self, session):
+        """코딩 세션이 모델을 한 번 부르는 동안만 차례를 잡는다(대화 요청과 같은 대기열). 도구 실행·허락 기다리는 동안엔 내준다."""
+        from .http_control import RequestControl
+        from .providers import GenerationTimeout
+        control = RequestControl(session.cancel, deadline=session.deadline)
+        ticket = Ticket(session.owner, session_id=session.id, cancel=control)
+        with self.queue_cv:
+            self.queue.append(ticket)
+            self.queue_cv.notify_all()
+        try:
+            if not self.wait_turn(ticket):
+                if control.expired and not control.cancelled:
+                    raise GenerationTimeout('대기열에서 코딩 요청의 제한 시간이 끝났습니다.')
                 raise GenerationCancelled("코딩 작업을 중단했습니다.")
             with self.ticket_running(ticket, "code", lambda _chunk: None):
                 yield
@@ -633,6 +689,18 @@ class WebAppState:
         except WebError as exc:
             return f"Error: {exc}"
         return "\n\n".join(f"{i}. {r.title}\n{r.url}\n{r.snippet}" for i, r in enumerate(results, 1)) or "No results found."
+
+    def spawn_restarter(self) -> None:
+        """'다시 켜기' — 창 없는 실행기(launcher --restart)를 이 웹과 떨어진 프로세스로 띄운다. 실행기는 이 웹이 꺼지길
+        기다렸다가 새 코드로 웹만 다시 켠다(Strata·임베딩은 그대로)."""
+        import subprocess
+        import sys
+        python = Path(sys.executable)
+        windowed = python.with_name("pythonw.exe")
+        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+        subprocess.Popen([str(windowed if windowed.exists() else python), "-m", "jarvis.launcher", "--restart"],
+                         cwd=Path(__file__).resolve().parents[1], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, creationflags=flags, close_fds=True)
 
     def close_owned_services(self) -> dict[str, Any]:
         """Shared Ollama and pre-existing ComfyUI services remain independent."""
@@ -792,6 +860,52 @@ class WebAppState:
                 raise ProviderError("다른 엔진에 모델이 올라가 있어 생성을 중단했습니다. "
                                     "모델 설정에서 엔진 전환을 다시 시도하세요.")
 
+    def free_models(self) -> list[dict]:
+        """OpenCode 무료 모델(jarvis/freemodels.py) — 하루 한 번 새로 받아 data 에 둔다."""
+        from .freemodels import load_free_models
+        data_dir = self.settings.data_dir if self.settings is not None else self.core.storage.db_path.parent
+        return load_free_models(Path(data_dir) / "free-models.json")
+
+    def coding_status(self) -> dict:
+        """설정 화면의 '코딩 에이전트 · API' 칸(관리자) — 일꾼·교훈·자동 학습·배울 기록 수."""
+        from .developer import DeveloperMode
+        try:
+            pending = DeveloperMode(self.core).learning_pending()
+        except Exception:  # noqa: BLE001 — 기록 파일을 못 읽어도 화면은 뜬다
+            pending = 0
+        return {"worker": getattr(self.settings, "coding_worker", "opencode") if self.settings else "opencode",
+                "free_model": getattr(self.settings, "coding_free_model", "") if self.settings else "",
+                "free_models": self.free_models(),
+                "insights": bool(getattr(self.core, "coding_insights", False)),
+                "auto_learn": bool(getattr(self.core, "coding_auto_learn", False)), "pending": pending,
+                "auto_learn_min": AUTO_LEARN_MIN, "sessions": len(self.code.sessions) if self.code else 0}
+
+    def save_coding_settings(self, changes: dict) -> dict:
+        """교훈 붙이기·쉬는 중 자동 학습·코딩 모델(OpenCode 무료 모델) — 저장하고 바로 적용(다시 켤 필요 없음)."""
+        if self.settings is None:
+            raise ValueError("설정 변경을 지원하지 않는 실행 모드입니다.")
+        allowed = {"coding_insights_enabled": bool, "coding_auto_learn_enabled": bool, "coding_free_model": str}
+        if not isinstance(changes, dict) or not changes or any(k not in allowed or type(v) is not allowed[k] for k, v in changes.items()):
+            raise ValueError("지원하지 않는 설정 또는 잘못된 형식입니다.")
+        if "coding_free_model" in changes and (self.active_id is not None or self.queue):
+            raise ValueError("작업 중에는 코딩 모델을 바꿀 수 없습니다. 끝난 뒤 바꿔 주세요.")
+        for k in changes:
+            if "JARVIS_" + k.upper() in os.environ:
+                raise ValueError(f"{k}: 환경변수로 고정되어 있습니다. 환경변수를 해제하고 재시작하세요.")
+        candidate = validate(replace(self.settings, **changes))
+        path = local_config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + ".tmp")
+        temporary.write_text(json.dumps({k: getattr(candidate, k) for k in LOCAL_FIELDS}, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temporary, path)
+        self.settings = candidate
+        self.core.coding_insights = candidate.coding_insights_enabled
+        self.core.coding_auto_learn = candidate.coding_auto_learn_enabled
+        if "coding_free_model" in changes:
+            from .app import apply_coding_worker
+            apply_coding_worker(self.core, candidate)
+        return self.coding_status()
+
     def save_settings(self, changes: dict) -> dict:
         if self.settings is None:
             raise ValueError("설정 변경을 지원하지 않는 실행 모드입니다.")
@@ -838,7 +952,7 @@ class WebAppState:
                     raise ValueError(f"선택한 엔진/모델을 사용할 수 없습니다: {provider.name}")
             # OpenCode는 새 모델로 다시 만든다. 하네스는 provider_getter로 아래의 교체를 그대로 따른다.
             worker = self.core.opencode_worker
-            if isinstance(worker, OpenCodeWorker):
+            if isinstance(worker, OpenCodeWorker) and not worker.free:  # 무료 모델 일꾼은 이 PC 모델과 상관없어 그대로
                 if candidate.local_backend == "ollama":
                     candidate = replace(candidate, opencode_model=coder.model)
                 worker = OpenCodeWorker(worker.home, coder.model, context=coder.num_ctx,
@@ -1559,6 +1673,11 @@ def _handler_factory(state: WebAppState):
             if route.startswith("/api/code/"):
                 self._code_api("GET", route, query, {})
                 return
+            if route == "/api/coding":  # 설정의 '코딩 에이전트 · API' 칸(관리자)
+                viewer = self._require_viewer(admin=True)
+                if viewer is not None:
+                    self._json(HTTPStatus.OK, state.coding_status())
+                return
             viewer = self._require_viewer(admin=route == "/api/users")
             if viewer is None:
                 return
@@ -1787,10 +1906,11 @@ def _handler_factory(state: WebAppState):
                 if parts == ["event"] and method == "GET":
                     self._code_events(viewer, query)
                     return
-                if parts == ["path"] and method == "GET":  # 새 세션을 열 수 있는 곳(OpenCode GET /path 와 같은 뜻)
+                if parts == ["path"] and method == "GET":  # 새 세션을 열 수 있는 곳(OpenCode GET /path 와 같은 뜻)·고를 수 있는 모델
                     approved = getattr(state.core, "_approved_file_root", None)
                     self._json(HTTPStatus.OK, {"root": str(approved or ""),
-                                               "directory": str(state.core.current_project_root() or approved or "")})
+                                               "directory": str(state.core.current_project_root() or approved or ""),
+                                               "models": state.free_models()})
                     return
                 if not parts or parts[0] != "session":
                     raise LookupError("not found")
@@ -1800,7 +1920,7 @@ def _handler_factory(state: WebAppState):
                     else:
                         session = code.create(me, state.code_root(body.get("directory")),
                                               str(body.get("tier") or state.session_permission(viewer, state.current_session(viewer))),
-                                              str(body.get("title") or ""))
+                                              str(body.get("title") or ""), model=str(body.get("model") or ""))
                         self._json(HTTPStatus.OK, {"session": session.public()})
                     return
                 sid, action = parts[1], "/".join(parts[2:])
@@ -1994,7 +2114,7 @@ def _handler_factory(state: WebAppState):
                                  "/api/shutdown", "/api/pull", "/api/session/delete", "/api/login", "/api/logout",
                                  "/api/local-owner", "/api/password", "/api/users", "/api/memory", "/api/task",
                                  "/api/session/new", "/api/session/rename", "/api/session/permission",
-                                 "/api/document/discard", "/api/live/start"}:
+                                 "/api/document/discard", "/api/live/start", "/api/coding", "/api/restart"}:
                 self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
                 return
             if not self._authorized():
@@ -2023,6 +2143,9 @@ def _handler_factory(state: WebAppState):
                     return
                 if self.path == "/api/cancel":
                     self._cancel(viewer, body.get("request_id"))
+                    return
+                if self.path == "/api/coding":  # 교훈 붙이기·쉬는 중 자동 학습(관리자, 바로 적용)
+                    self._json(HTTPStatus.OK, state.save_coding_settings(body))
                     return
                 if self.path == "/api/project":
                     if body.get("action") == "delete" and state.ticket_for(viewer.id) is not None:
@@ -2150,14 +2273,20 @@ def _handler_factory(state: WebAppState):
                     if state.shutting_down:
                         self._json(HTTPStatus.CONFLICT, {"error": "앱을 종료하는 중입니다."})
                         return
-                    if self.path == "/api/shutdown":
+                    if self.path in ("/api/shutdown", "/api/restart"):
                         if state.queue:
                             self._json(HTTPStatus.CONFLICT, {"error": "다른 사용자의 요청이 처리 중입니다. 끝난 뒤 종료하세요."})
                             return
+                        if state.code is not None and any(s.status == "running" for s in state.code.sessions.values()):
+                            # 코딩 세션은 모델을 부를 때만 대기열에 있다 — 도구 실행 중에도 끊지 않게(2026-10-23)
+                            self._json(HTTPStatus.CONFLICT, {"error": "코딩 세션이 일하는 중입니다. 끝나거나 중단한 뒤 다시 하세요."})
+                            return
+                        if self.path == "/api/restart":  # '다시 켜기' — 실행기를 따로 띄워 두고 이 웹은 꺼진다(2026-10-23)
+                            state.spawn_restarter()
                         state.shutting_down = True
                         try:
                             cleanup = state.close_owned_services()
-                            self._json(HTTPStatus.OK, {"stopped": True, **cleanup})
+                            self._json(HTTPStatus.OK, {"stopped": True, "restarting": self.path == "/api/restart", **cleanup})
                         except ConnectionError:
                             pass  # Closing the browser must not cancel an accepted shutdown.
                         finally:

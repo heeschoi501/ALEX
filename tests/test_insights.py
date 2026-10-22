@@ -225,6 +225,40 @@ class CoreAndCommandTests(unittest.TestCase):
         self.assertIn("절차 교훈", self.seen)
         self.assertIn("테스트 코드를 먼저 읽는다", self.seen)
 
+    def test_the_same_insights_reach_the_coding_harness_only_when_enabled(self):
+        # 2026-10-23 claude: ALEX 하네스(ADR-112) 지시문에도 같은 절차 교훈 — 설정이 꺼져 있으면 비움
+        self.assertEqual(self.core.coding_insight_text(), "")
+        self.core.coding_insights = True
+        self.assertIn("테스트 코드를 먼저 읽는다", self.core.coding_insight_text())
+        from jarvis.harness.prompt import system_prompt
+        self.assertIn("테스트 코드를 먼저 읽는다", system_prompt(self.root, lessons=self.core.coding_insight_text()))
+
+    def test_code_session_records_are_learned_and_counted(self):
+        # 2026-10-23 claude: 코딩 세션 기록(type code)도 /dev-learn 재료 — 사후 확인은 '독립 관련 검사'
+        from jarvis.developer import DeveloperMode, record_outcome
+        record_outcome(self.storage, {"type": "code", "run_id": "ses_a@1", "goal": "add 고쳐", "result": "verified",
+                                      "rounds": [{"round": 1, "exit": 1, "failure": "AssertionError"},
+                                                 {"round": 2, "exit": 0, "diff": "-a - b\n+a + b"}]})
+        record_outcome(self.storage, {"type": "code", "run_id": "ses_b@2", "goal": "x", "result": "stopped", "rounds": []})
+        self.assertEqual(DeveloperMode(self.core).learning_pending(), 1)  # 검사 판정이 없는 기록은 재료가 아니다
+        self.reply = "ADD: 실패한 관련 검사 출력을 먼저 읽고 같은 원인을 고친다"
+        learned = self.say("/dev-learn")
+        self.assertIn("교훈 연산 1개", learned)
+        self.assertIn("독립 관련 검사 통과", self.seen)
+        self.assertIn("+a + b", self.seen)
+        self.assertEqual(DeveloperMode(self.core).learning_pending(), 0)
+
+    def test_a_reviewed_insight_becomes_a_harness_skill(self):
+        from jarvis.harness.tools import find_skills
+        self.core.current_project_root = lambda: self.root
+        reply = self.say("/dev-insights skill 1 read-tests-first")
+        self.assertIn("스킬로 올렸습니다", reply)
+        skills = find_skills(self.root / ".alex" / "skills")
+        self.assertEqual(skills["read-tests-first"].description, "테스트 코드를 먼저 읽는다")
+        self.assertIn("이미 있는 스킬", self.say("/dev-insights skill 1 read-tests-first"))
+        self.assertIn("그 번호의 교훈이 없습니다", self.say("/dev-insights skill 9"))
+        self.assertIn("영문 소문자", self.say("/dev-insights skill 1 Bad_Name"))
+
     def test_learn_reads_new_auto_records_once_and_the_list_can_be_shown_and_trimmed(self):
         outcomes = Path(self.storage.db_path).parent / "dev-outcomes.jsonl"
         outcomes.write_text(json.dumps({"type": "auto", "run_id": "r1", "at": "2026-09-30T00:00:00+00:00", "goal": "고쳐",

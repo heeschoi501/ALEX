@@ -20,7 +20,8 @@ import threading
 import time
 from typing import Callable
 
-from ..providers import ContextExhausted, GenerationCancelled, Message, ProviderError, ToolsUnsupported
+from ..providers import ContextExhausted, GenerationCancelled, GenerationTimeout, Message, ProviderError, ToolsUnsupported
+from ..http_control import RequestControl
 from . import opencode_text as oc
 from . import permission as perm
 from . import prompt as prompts
@@ -38,7 +39,7 @@ LABEL = {"read": "읽기", "write": "쓰기", "edit": "고치기", "apply_patch"
 @dataclass
 class AgentResult:
     text: str
-    stopped: str                    # done | max_steps | doom_loop | cancelled | error | question
+    stopped: str                    # done | max_steps | doom_loop | cancelled | timeout | error | question | unverified
     steps: int = 0
     seconds: float = 0.0
     tools: dict[str, int] = field(default_factory=dict)
@@ -47,6 +48,7 @@ class AgentResult:
     trace: list[dict] = field(default_factory=list)   # 차례마다 시간·도구·토큰(느린 원인 찾기용)
     questions: list[dict] = field(default_factory=list)   # stopped='question' 일 때 사람에게 물을 것
     todos: list[dict] = field(default_factory=list)
+    verification: list[dict] = field(default_factory=list)
 
 
 def _arguments(call: dict) -> tuple[str, dict | None, str]:
@@ -73,7 +75,7 @@ class CodingAgent:
         self.rules, self.lessons = rules, lessons
         self.say = progress or (lambda _text: None)
         self.cancel_event = cancel_event or workspace.cancel_event
-        self.deadline = deadline                     # time.monotonic() 기준 — 넘으면 정리 답을 받고 끝
+        self.deadline = deadline                     # time.monotonic() 기준 — 호출·압축·재시도에도 적용
         self.mode, self.depth, self.max_depth = mode, depth, max_depth
         self.sleep = sleep
         self.messages: list[Message] = []
@@ -145,26 +147,51 @@ class CodingAgent:
         conversation = messages if messages is not None else self.messages
         attempt = 0
         while True:
+            self._check_control()
             attempt += 1
             try:
                 try:
-                    return self.provider.chat_step(conversation, tools)
+                    return self._step(conversation, tools)
                 except ContextExhausted:
                     if not getattr(self.provider, "think", False):
                         raise
-                    self.provider.think = False  # 그 차례만 생각 없이(ALEX _coder_model 과 같은 방식)
-                    try:
-                        return self.provider.chat_step(conversation, tools)
-                    finally:
-                        self.provider.think = True
-            except (ContextExhausted, ToolsUnsupported, GenerationCancelled):
+                    return self._step(conversation, tools, think=False)
+            except (ContextExhausted, ToolsUnsupported, GenerationCancelled, GenerationTimeout):
                 raise
             except ProviderError as exc:
                 if attempt > RETRIES or self._cancelled():
                     raise
                 wait = min(2 * 2 ** (attempt - 1), 30)
                 self.say(f"[모델 연결 오류 — {wait}초 뒤 다시({attempt}/{RETRIES}): {str(exc)[:120]}]\n")
-                self.sleep(wait)
+                if self.sleep is time.sleep:
+                    RequestControl(self.cancel_event, deadline=self.deadline).wait(wait)
+                else:
+                    self.sleep(wait)
+                self._check_control()
+
+    def _check_control(self):
+        control = RequestControl(self.cancel_event, deadline=self.deadline)
+        if control.cancelled:
+            raise GenerationCancelled()
+        if control.expired:
+            raise GenerationTimeout("코딩 요청의 제한 시간이 끝났습니다.")
+
+    def _step(self, conversation, tools, think=None):
+        self._check_control()
+        controlled = getattr(self.provider, 'chat_step_controlled', None)
+        if callable(controlled):
+            value = controlled(conversation, tools, cancel_event=self.cancel_event, deadline=self.deadline, think=think)
+        else:  # 테스트·사용자 provider 호환. 실제 Ollama/Strata는 위의 소켓 제어 경로를 쓴다.
+            saved = getattr(self.provider, 'think', None)
+            if think is not None:
+                self.provider.think = think
+            try:
+                value = self.provider.chat_step(conversation, tools)
+            finally:
+                if think is not None:
+                    self.provider.think = saved
+        self._check_control()
+        return value
 
     def _cancelled(self) -> bool:
         return self.cancel_event is not None and self.cancel_event.is_set()
@@ -194,8 +221,10 @@ class CodingAgent:
             self.subagents[task_id] = child
             result = child.run(prompt)
         else:
+            child.deadline, child.provider = self.deadline, self.provider
+            child.workspace.cancel_event = self.workspace.cancel_event
             result = child.answer(prompt)
-        state = "error" if result.stopped in ("error", "cancelled") else "completed"
+        state = "error" if result.stopped in ("error", "cancelled", "timeout", "max_steps") else "completed"
         tag = "task_error" if state == "error" else "task_result"
         text = result.text or result.error or "(no output)"
         return "\n".join([f'<task id="{task_id}" state="{state}">', f"<summary>{args.get('description', '')}</summary>",
@@ -268,13 +297,12 @@ class CodingAgent:
                 self.step += 1
                 steps_here += 1
                 ws.begin_step(self.step)
-                if self._cancelled():
-                    raise GenerationCancelled("코딩 작업을 중단했습니다.")
+                self._check_control()
                 if self._size() > self.context_chars:
                     self._prune()
                     if self._size() > self.context_chars:
                         self._compact()
-                last = steps_here >= self.max_steps or (self.deadline is not None and time.monotonic() > self.deadline)
+                last = steps_here >= self.max_steps
                 if last:
                     self.messages.append(Message("user", prompts.MAX_STEPS_PROMPT))
                 began = time.monotonic()
@@ -293,6 +321,7 @@ class CodingAgent:
                 self.messages.append(Message("assistant", content, tool_calls=calls))
                 asked = None
                 for call in calls:
+                    self._check_control()
                     name, args, problem = _arguments(call)
                     signature = name + json.dumps(args, sort_keys=True, ensure_ascii=False)
                     recent = (recent + [signature])[-DOOM_LOOP:]
@@ -328,6 +357,8 @@ class CodingAgent:
                     warned = True
                     self.messages.append(Message("user", prompts.DOOM_LOOP_REMINDER))
                     recent = []
+        except GenerationTimeout as exc:
+            stopped, text, error = "timeout", "제한 시간이 끝나 코딩 작업을 중단했습니다.", str(exc)
         except GenerationCancelled:
             stopped, text = "cancelled", "코딩 작업을 중단했습니다."
         except ToolsUnsupported:

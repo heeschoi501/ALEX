@@ -154,7 +154,7 @@ HELP_TEXT = """사용 가능한 명령
   /dev-check [이름]        프로젝트의 alex-checks.json 에 사용자가 적은 검사 명령 목록/실행
   /dev-outcomes            최근 개발 작업의 결과 기록(시험·수정안·적용·전체 검사) 요약
   /dev-learn               결과 기록에서 코딩 절차 교훈을 뽑는다(로컬 모델, ADR-070)
-  /dev-insights [remove N] 코딩 절차 교훈 목록 / 하나 지우기 (수정안에 붙이는 것은 coding_insights_enabled)
+  /dev-insights [remove N|skill N [이름]] 코딩 절차 교훈 목록 / 지우기 / 골라서 스킬로 (붙이기: coding_insights_enabled)
   /dev-list                현재 프로젝트의 저장된 개발 작업 목록
   /dev-resume ID           저장된 작업 선택 (자동 실행 없음)
   /dev-status              저장된 개발 작업 상태·검증 이력
@@ -550,6 +550,38 @@ def build_memory_vectors(settings: Settings) -> MemoryVectors | None:
     return MemoryVectors(settings.data_dir / "embeddings.db", EmbeddingClient(settings.embedding_host))
 
 
+def apply_coding_worker(core, settings: Settings, notes: list[str] | None = None) -> None:
+    """설정대로 /dev-auto·/build 의 코딩 일꾼을 단다 — 시작할 때와 설정 화면에서 무료 모델을 바꿀 때 같이 쓴다(2026-10-23).
+    무료 모델(coding_free_model) > ALEX 하네스(coding_worker=harness) > 이 PC 모델의 오픈코드(coding_worker=opencode)."""
+    from .router import Destination as _Destination
+    home = Path(settings.opencode_dir) if settings.opencode_dir else Path(__file__).resolve().parents[2] / "tools" / "opencode"
+    notes = notes if notes is not None else []
+    if settings.coding_free_model and settings.coding_worker in ("opencode", "harness"):
+        # OpenCode 무료 모델 — 무료 단계는 OpenCode 안에서만 되므로 OpenCode 일꾼으로. 이 PC GPU 는 쓰지 않는다.
+        worker = OpenCodeWorker(home, settings.coding_free_model, timeout=settings.opencode_timeout)
+        worker.label = "오픈코드 무료 모델"
+        notes.append(f"Coding worker: OpenCode free model {settings.coding_free_model} (코드가 opencode.ai 로 전송)")
+    elif settings.coding_worker == "harness":  # ALEX 코딩 하네스(ADR-112) — OpenCode 방식을 ALEX 코드로, 모델은 지금 코딩 모델
+        from .harness.worker import HarnessWorker
+        worker = HarnessWorker(lambda: core.providers.get(_Destination.LOCAL_CODER), timeout=settings.opencode_timeout,
+                               lessons=core.coding_insight_text)  # 절차 교훈(ADR-070, 설정으로 켤 때만)
+        worker.progress = core._progress
+        worker.logger = core.logger
+        notes.append("Coding worker: ALEX harness (ADR-112)")
+    elif settings.coding_worker == "opencode":
+        strata = settings.local_backend == "strata"
+        worker = OpenCodeWorker(home, settings.strata_model if strata else settings.opencode_model,
+                                context=settings.strata_num_ctx if strata else settings.opencode_context,
+                                timeout=settings.opencode_timeout,
+                                host=settings.strata_host if strata else settings.ollama_host,
+                                backend=settings.local_backend)
+    else:
+        worker = None
+    core.opencode_worker = worker
+    if worker is not None and hasattr(core, "_release_media_for_worker"):
+        worker.before_run = core._release_media_for_worker
+
+
 def build_core(
     settings: Settings | None = None,
     approval_callback=None,
@@ -619,6 +651,7 @@ def build_core(
         lesson_context_limit=settings.lesson_context_limit,
         auto_lessons=settings.auto_lessons_enabled,
         coding_insights=settings.coding_insights_enabled,
+        coding_auto_learn=settings.coding_auto_learn_enabled,
         fact_reminder=settings.fact_reminder_enabled,
         coding_api_map=settings.coding_api_map_enabled,
         coding_num_ctx=settings.coding_num_ctx,
@@ -652,15 +685,7 @@ def build_core(
         summary_max_chars=settings.summary_max_chars,
         misroute_log_path=settings.log_dir / "misroute.jsonl",
     )
-    if settings.coding_worker == "harness":  # ALEX 코딩 하네스(ADR-112) — OpenCode 방식을 ALEX 코드로, 모델은 지금 코딩 모델
-        from .harness.worker import HarnessWorker
-        from .router import Destination as _Destination
-        harness = HarnessWorker(lambda: core.providers.get(_Destination.LOCAL_CODER), timeout=settings.opencode_timeout)
-        harness.before_run = core._release_media_for_worker
-        harness.progress = core._progress
-        harness.logger = core.logger
-        core.opencode_worker = harness
-        notes.append("Coding worker: ALEX harness (ADR-112)")
+    apply_coding_worker(core, settings, notes)
     # 영상 링크 읽기(ADR-098): C:\ALEX\tools\video 에 yt-dlp·Deno 가 있으면 켠다
     tools = Path(__file__).resolve().parents[2] / "tools"
     video_reader = VideoReader(tools / "video", transcriber=Transcriber(tools / "whisper"))  # 받아쓰기(ADR-108)는 있으면 켬

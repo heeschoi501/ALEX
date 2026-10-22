@@ -81,6 +81,11 @@ class OpenCodeWorker:
         self.backend = backend                      # 'ollama' 또는 'strata'(ADR-086: 같은 OpenAI 호환 /v1, 확인 방법만 다르다)
         self.before_run: Callable[[], None] | None = None
 
+    @property
+    def free(self) -> bool:
+        """'opencode/<모델>' 이면 OpenCode 무료 모델(2026-10-23, jarvis/freemodels.py) — 이 PC 모델이 아니라 opencode.ai 에서 돈다."""
+        return self.model.startswith("opencode/")
+
     def executable(self) -> Path:
         return self.home / ("opencode.exe" if os.name == "nt" else "opencode")
 
@@ -90,6 +95,8 @@ class OpenCodeWorker:
             return ""
         if not self.executable().is_file():
             return f"오픈코드 실행 파일이 없습니다: {self.executable()}"
+        if self.free:
+            return ""
         if self.backend == "strata":
             try:
                 with urllib.request.urlopen(f"{self.host}/health", timeout=5) as response:
@@ -108,7 +115,10 @@ class OpenCodeWorker:
             return f"Ollama 에 오픈코드용 모델 '{self.model}' 이(가) 없거나 Ollama 에 연결하지 못했습니다"
         return ""
 
-    def config(self) -> dict:
+    def config(self, permission: dict | None = None) -> dict:
+        if self.free:  # 공급자 설정 없이 OpenCode 가 아는 무료 모델을 그대로
+            return {"$schema": "https://opencode.ai/config.json", "share": "disabled", "autoupdate": False,
+                    "model": self.model, "small_model": self.model, "permission": permission or PERMISSION}
         return {
             "$schema": "https://opencode.ai/config.json", "share": "disabled", "autoupdate": False,
             "model": f"ollama/{self.model}", "small_model": f"ollama/{self.model}",
@@ -117,14 +127,33 @@ class OpenCodeWorker:
                                     "options": {"baseURL": f"{self.host}/v1"},
                                     "models": {self.model: {"name": f"{self.model} (ALEX)",
                                                             "limit": {"context": self.context, "output": 8192}}}}},
-            "permission": PERMISSION,
+            "permission": permission or PERMISSION,
         }
+
+    def environment(self, config: Path, data: Path) -> dict:
+        env = dict(os.environ, OPENCODE_CONFIG=str(config), OPENCODE_DISABLE_AUTOUPDATE="1",
+                   OPENCODE_DISABLE_LSP_DOWNLOAD="1", OPENCODE_DISABLE_SHARE="1",
+                   XDG_CONFIG_HOME=str(self.home / "xdg-config"), XDG_CACHE_HOME=str(self.home / "xdg-cache"),
+                   XDG_DATA_HOME=str(data), XDG_STATE_HOME=str(data),
+                   PATH=str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", ""))
+        if not self.free:  # 이 PC 모델만 쓸 때는 모델 목록을 받지 않는다(무료 모델은 OpenCode 가 목록을 알아야 한다)
+            env["OPENCODE_DISABLE_MODELS_FETCH"] = "1"
+        git_bash = Path(r"C:\Program Files\Git\bin\bash.exe")
+        if os.name == "nt" and git_bash.is_file():
+            env["OPENCODE_GIT_BASH_PATH"] = str(git_bash)
+        env.pop("SHELL", None)  # 비우지 않으면 WSL bash 를 고를 수 있다
+        return env
+
+    def command_line(self, prompt: str, *, session: str = "", agent: str = "") -> list[str]:
+        return (self.command or [str(self.executable())]) + [
+            "run", "--model", self.model if self.free else f"ollama/{self.model}", "--format", "json",
+            *(["--session", session] if session else []), *(["--agent", agent] if agent else []), prompt]
 
     def run(self, project: Path, prompt: str, cancel_event: threading.Event | None = None) -> WorkerRun:
         if cancel_event is not None and cancel_event.is_set():
             raise GenerationCancelled("오픈코드 작업을 중단했습니다.")
-        # 외부 일꾼은 OllamaProvider 를 거치지 않는다. 같은 GPU 반환 확인을 실행 전에 한다.
-        if self.before_run is not None:
+        # 외부 일꾼은 OllamaProvider 를 거치지 않는다. 같은 GPU 반환 확인을 실행 전에 한다(무료 모델은 이 PC GPU 를 안 쓴다).
+        if self.before_run is not None and not self.free:
             self.before_run()
         if cancel_event is not None and cancel_event.is_set():
             raise GenerationCancelled("오픈코드 작업을 중단했습니다.")
@@ -132,22 +161,18 @@ class OpenCodeWorker:
         with tempfile.TemporaryDirectory(prefix="alex-opencode-") as tmp:
             work = Path(tmp) / "project"
             _copy_project(project, work)
+            if self.free:  # opencode.ai 로 가는 복사본 — 개인 설정·비밀 파일은 빼고(비교 기준 전에 지워서 '삭제'로 잡히지 않게)
+                for path in list(work.rglob("*")):
+                    if path.is_file() and (path.name == "jarvis.local.json" or path.name.startswith(".env")
+                                           or path.suffix.lower() in (".pem", ".key")):
+                        path.unlink()
             before = _hashes(work)
             config = Path(tmp) / "opencode.json"
             config.write_text(json.dumps(self.config(), ensure_ascii=False, indent=2), encoding="utf-8")
             data = Path(tmp) / "data"
             data.mkdir()
-            env = dict(os.environ, OPENCODE_CONFIG=str(config), OPENCODE_DISABLE_AUTOUPDATE="1",
-                       OPENCODE_DISABLE_MODELS_FETCH="1", OPENCODE_DISABLE_LSP_DOWNLOAD="1", OPENCODE_DISABLE_SHARE="1",
-                       XDG_CONFIG_HOME=str(self.home / "xdg-config"), XDG_CACHE_HOME=str(self.home / "xdg-cache"),
-                       XDG_DATA_HOME=str(data), XDG_STATE_HOME=str(data),
-                       PATH=str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", ""))
-            git_bash = Path(r"C:\Program Files\Git\bin\bash.exe")
-            if os.name == "nt" and git_bash.is_file():
-                env["OPENCODE_GIT_BASH_PATH"] = str(git_bash)
-            env.pop("SHELL", None)  # 비우지 않으면 WSL bash 를 고를 수 있다
-            command = (self.command or [str(self.executable())]) + [
-                "run", "--model", f"ollama/{self.model}", "--format", "json", prompt + RULES]
+            env = self.environment(config, data)
+            command = self.command_line(prompt + RULES)
             log_path = Path(tmp) / "events.jsonl"
             started = time.monotonic()
             result = WorkerRun()

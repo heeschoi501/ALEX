@@ -1276,6 +1276,7 @@ async function openSettings() {
   $('settings-error').textContent = '';
   $('settings-save').disabled = true;
   try { await refresh(); } catch (e) { $('settings-error').textContent = e.message; return; }
+  loadCoding();
   if (ACCOUNTS_UI) loadUsers();
   const s = state.settings;
   $('model-backend').value = liveBackend(state) === 'strata' ? 'strata' : 'ollama';
@@ -1418,6 +1419,41 @@ $('permission-menu').querySelectorAll('[data-permission]').forEach(b => b.addEve
 function closeMenu() { $('account-menu').hidden = true; $('account-button').setAttribute('aria-expanded', 'false'); }
 $('live-open').addEventListener('click', () => { closeMenu(); window.open('/live', '_blank', 'noopener'); });  // ADR-111
 $('code-open').addEventListener('click', () => { closeMenu(); window.open('/code', '_blank', 'noopener'); });  // ADR-112
+$('code-session-open').addEventListener('click', () => window.open('/code', '_blank', 'noopener'));  // 입력창에서도(2026-10-23)
+// 설정의 '코딩 에이전트 · API' 칸 — 일꾼·배울 기록 수, 교훈 붙이기·쉬는 중 자동 학습(저장하면 바로 적용)
+function paintCoding(c) {
+  const worker = c.worker === 'harness' ? 'ALEX 하네스' : '오픈코드';
+  $('coding-status').textContent = `코딩 일꾼: ${worker} · 아직 안 배운 코딩 기록 ${c.pending}건(자동 학습은 ${c.auto_learn_min}건부터) · 코딩 세션 ${c.sessions}개`;
+  $('coding-insights').checked = c.insights;
+  $('coding-auto-learn').checked = c.auto_learn;
+  const select = $('coding-model');
+  select.replaceChildren(new Option('이 PC 모델(Strata 등)', ''));
+  for (const m of c.free_models || []) select.append(new Option(`OpenCode 무료 · ${m.name}`, m.id));
+  if (c.free_model && ![...select.options].some(o => o.value === c.free_model)) select.append(new Option(`OpenCode 무료 · ${c.free_model} (목록에 없음)`, c.free_model));
+  select.value = c.free_model || '';
+  $('coding-model-note').textContent = c.free_model
+    ? '무료 모델은 OpenCode 를 통해 opencode.ai 에서 돕니다 — 고친 코드·시험 출력이 그쪽으로 전송됩니다(이 PC 그래픽카드는 쓰지 않음).'
+    : (c.free_models?.length ? `OpenCode 와 같은 목록에서 무료 모델 ${c.free_models.length}개를 고를 수 있습니다(코드가 opencode.ai 로 전송됨).` : '무료 모델 목록을 받지 못했습니다(인터넷 확인).');
+}
+$('coding-model').addEventListener('change', async e => {
+  try { paintCoding(await api('/api/coding', {coding_free_model: e.target.value})); }
+  catch (err) { $('coding-status').textContent = err.message; loadCoding(); }
+});
+async function loadCoding() {
+  if (!state?.is_admin) return;
+  try { paintCoding(await api('/api/coding')); } catch (err) { $('coding-status').textContent = err.message; }
+}
+for (const [id, key] of [['coding-insights', 'coding_insights_enabled'], ['coding-auto-learn', 'coding_auto_learn_enabled']]) {
+  $(id).addEventListener('change', async e => {
+    try { paintCoding(await api('/api/coding', {[key]: e.target.checked})); }
+    catch (err) { e.target.checked = !e.target.checked; $('coding-status').textContent = err.message; }
+  });
+}
+$('coding-open').addEventListener('click', () => window.open('/code', '_blank', 'noopener'));
+$('coding-token').addEventListener('click', async () => {
+  try { await navigator.clipboard.writeText(token); $('coding-status').textContent = 'API 토큰을 복사했습니다(ALEX 를 다시 켜면 바뀝니다).'; }
+  catch { $('coding-status').textContent = '복사하지 못했습니다 — 브라우저가 클립보드를 막았습니다.'; }
+});
 $('account-button').addEventListener('click', e => {
   e.stopPropagation();
   const open = $('account-menu').hidden;
@@ -1483,6 +1519,28 @@ $('session-search').addEventListener('input', filterSessions);
 $('workspace-change').addEventListener('click', () => { if (anyWork()) { notice('모든 대화의 요청이 끝난 뒤 프로젝트 폴더를 바꾸세요.'); return; } $('workspace-path').value = state.project_root; $('workspace-error').textContent = ''; $('workspace-dialog').showModal(); });
 $('workspace-close').addEventListener('click', () => $('workspace-dialog').close());
 $('workspace-form').addEventListener('submit', async e => { e.preventDefault(); if (anyWork()) { $('workspace-error').textContent = '모든 대화의 요청이 끝난 뒤 바꾸세요.'; return; } try { await api('/api/workspace', {path: $('workspace-path').value, confirmed: true, session_id: state.session_id}); await refresh(); $('workspace-dialog').close(); notice('프로젝트 폴더를 변경했습니다. 기존의 미적용 수정안은 폐기됩니다.'); } catch (e) { $('workspace-error').textContent = e.message; } });
+// '다시 켜기'(2026-10-23) — 웹이 실행기를 따로 띄우고 꺼진다. 새 서버가 뜨면(화면 토큰이 바뀌면) 저절로 새로고침
+$('restart-app').addEventListener('click', async () => {
+  closeMenu();
+  if (anyWork()) { notice('모든 대화의 요청을 완료 또는 중단한 뒤 다시 켜세요.'); return; }
+  if (appStopped || !confirm('ALEX 를 다시 켤까요?\n웹만 다시 켜서 새 코드를 반영합니다(모델 서버는 그대로, 30초쯤). 대화와 기록은 그대로입니다.')) return;
+  lock(true);
+  notice('ALEX 를 다시 켜는 중입니다… 끝나면 이 화면이 저절로 새로고침됩니다.');
+  try {
+    await api('/api/restart', {});
+  } catch (err) { lock(false); notice(err.message); return; }
+  appStopped = true;
+  updateControls();
+  for (let attempt = 0; attempt < 240; attempt++) {  // 최대 2분
+    await new Promise(resolve => setTimeout(resolve, 500));
+    try {
+      const page = await (await fetch('/', {cache: 'no-store'})).text();
+      const fresh = page.match(/name="jarvis-token" content="([^"]+)"/);
+      if (fresh && fresh[1] !== token) { location.reload(); return; }
+    } catch { /* 옛 웹이 꺼졌고 새 웹이 아직 — 계속 기다림 */ }
+  }
+  notice('다시 켜진 것을 확인하지 못했습니다. start_alex.vbs 를 실행한 뒤 이 창을 새로고침하세요.');
+});
 $('shutdown').addEventListener('click', async () => {
   if (anyWork()) { notice('모든 대화의 요청을 완료 또는 중단한 뒤 종료하세요.'); return; }
   if (appStopped) return;

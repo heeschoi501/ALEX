@@ -75,15 +75,73 @@ class ExistingServerTests(unittest.TestCase):
         self.assertEqual(self.launch_against(self.health()), launcher.WEB)
 
     def test_server_running_older_code_is_not_silently_reused(self):
-        with self.assertRaises(RuntimeError) as ctx:
-            self.launch_against(self.health(code="0000000000000000"))
-        self.assertIn("앱 종료", str(ctx.exception))
+        # 2026-10-23: 옛 버전이면 웹만 끄고 새로 켠다(일하는 중이면 끄지 않고 알림) — 실제 8765 에는 절대 닿지 않게 가짜로
+        busy = RuntimeError("ALEX 가 지금 일하는 중이라 새 버전으로 다시 켜지 않았습니다.")
+        with patch.object(launcher, "stop_outdated_web", side_effect=busy) as stop:
+            with self.assertRaises(RuntimeError) as ctx:
+                self.launch_against(self.health(code="0000000000000000"))
+        stop.assert_called_once()
+        self.assertIn("일하는 중", str(ctx.exception))
+        with patch.object(launcher, "stop_outdated_web") as stop:
+            self.assertEqual(self.launch_against(self.health()), launcher.WEB)  # 같은 코드면 그대로 쓰고 끄지 않는다
+        stop.assert_not_called()
+
 
     def test_server_from_before_this_check_counts_as_old(self):
         health = self.health()
         del health["code"]
-        with self.assertRaises(RuntimeError):
+        with patch.object(launcher, "stop_outdated_web", side_effect=RuntimeError("busy")) as stop, \
+                self.assertRaises(RuntimeError):
             self.launch_against(health)
+        stop.assert_called_once()  # 지문 없는 옛 서버도 옛 코드로 보고 끄려 한다(가짜 — 실제 8765 에 닿지 않음)
+
+
+class StopOutdatedWebTests(unittest.TestCase):
+    """옛 웹 끄기 — 가짜 웹(임의 포트)으로만. 화면 토큰을 읽어 '앱 종료' 를 부르고, 꺼질 때까지 기다린다."""
+
+    def serve(self, shutdown_status):
+        import http.server
+        import threading
+        calls = []
+
+        class Fake(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+
+            def do_GET(self):
+                if self.path == "/":
+                    body = b'<meta name="jarvis-token" content="tok-1">'
+                    self.send_response(200)
+                else:
+                    body = b'{"app": "jarvis"}'
+                    self.send_response(200)
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self):
+                calls.append((self.path, self.headers.get("X-Jarvis-Token")))
+                self.send_response(shutdown_status)
+                self.end_headers()
+                self.wfile.write(b"{}")
+                if shutdown_status == 200:
+                    threading.Thread(target=server.shutdown, daemon=True).start()
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Fake)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        return f"http://127.0.0.1:{server.server_address[1]}", calls
+
+    def test_idle_server_is_stopped_with_its_page_token(self):
+        url, calls = self.serve(200)
+        with patch.object(launcher, "WEB", url):
+            launcher.stop_outdated_web(wait_seconds=5)
+        self.assertEqual(calls, [("/api/shutdown", "tok-1")])
+
+    def test_busy_server_is_left_running(self):
+        url, calls = self.serve(409)
+        with patch.object(launcher, "WEB", url), self.assertRaises(RuntimeError) as ctx:
+            launcher.stop_outdated_web(wait_seconds=1)
+        self.assertIn("일하는 중", str(ctx.exception))
 
 
 if __name__ == "__main__":

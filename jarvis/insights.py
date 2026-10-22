@@ -248,6 +248,9 @@ def after_evidence(run_events: list[dict], auto_event: dict) -> str:
     넘어오지 않게, 이 수정안의 적용 사건의 소스 지문(digest)과 같은 지문의 검사만 쓰고 다음 수정안 사건에서 멈춘다(Codex 2차 R2-01).
     연결을 증명할 수 없으면 '확인 안 됨' 으로 남긴다.
     """
+    if auto_event.get("type") == "code":  # 코딩 세션(2026-10-23): 작업 폴더에서 바로 고침 — 독립 관련 검사가 사후 확인
+        return ("사후 확인: 코딩 세션에서 바로 적용 · 독립 관련 검사 " + ("통과" if auto_event.get("result") == "verified" else "미통과")
+                + " · 전체 검사 확인 안 됨")
     if auto_event.get("result") != "copy_passed":
         return "사후 확인: 복사본에서 통과하지 못해 제안하지 않음"
     position = next((index for index, event in enumerate(run_events) if event is auto_event), None)

@@ -8,6 +8,8 @@ Study focus:
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
+import copy
 from dataclasses import dataclass
 import json
 import time
@@ -15,7 +17,7 @@ import threading
 from typing import Callable, Iterator, Sequence
 import urllib.error
 import urllib.request
-from .http_control import interrupt_on_cancel
+from .http_control import RequestControl, interrupt_on_cancel, open_interruptible
 
 
 class ProviderError(RuntimeError):
@@ -48,6 +50,10 @@ class GenerationCancelled(ProviderError):
     def __init__(self, partial: str = "") -> None:
         self.partial = partial
         super().__init__("응답 생성을 중단했습니다.")
+
+
+class GenerationTimeout(ProviderError):
+    """요청 전체의 시간 한도. 재시도하거나 정상 완료로 취급하지 않는다."""
 
 
 # 한 답에서 모델의 도구 호출을 실행해 주는 차례 수(ADR-056). 그다음 차례에도 도구를 부르면 끊는다.
@@ -283,7 +289,7 @@ class OllamaProvider(BaseLLMProvider):
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response, interrupt_on_cancel(response, self.cancel_event):
+            with self._chat_response(request) as response:
                 for raw_line in response:
                     self._check_cancelled()
                     if not raw_line.strip():
@@ -401,6 +407,44 @@ class OllamaProvider(BaseLLMProvider):
         if not content.strip() and not calls:
             self._raise_if_exhausted()
         return content, calls
+
+    def chat_step_controlled(self, messages, tools=None, on_chunk=None, *, cancel_event=None, deadline=None, think=None):
+        """코딩 요청의 설정은 사본에 묶는다. 공유 모델·다음 대화의 취소/timeout/think는 그대로."""
+        control = RequestControl(self.cancel_event, cancel_event, deadline=deadline)
+
+        def check():
+            if control.cancelled:
+                raise GenerationCancelled()
+            if control.expired:
+                raise GenerationTimeout("코딩 요청의 제한 시간이 끝났습니다.")
+
+        check()
+        request = copy.copy(self)
+        request.cancel_event = control
+        request._controlled_call = True
+        if deadline is not None:
+            request.timeout = max(0.001, min(self.timeout, deadline - time.monotonic()))
+        if think is not None:
+            request.think = think
+        try:
+            value = request.chat_step(messages, tools, on_chunk)
+            check()
+            return value
+        except Exception:
+            check()
+            raise
+        finally:
+            for name in ('last_metrics', 'last_tool_calls', '_tools_unsupported', '_thinking_unsupported'):
+                setattr(self, name, getattr(request, name))
+
+    @contextmanager
+    def _chat_response(self, request):
+        if getattr(self, '_controlled_call', False):
+            with open_interruptible(request, timeout=self.timeout, cancel_event=self.cancel_event) as response:
+                yield response
+        else:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response, interrupt_on_cancel(response, self.cancel_event):
+                yield response
 
     def _generate_with_tools(self, messages: Sequence[Message], tools: list, runner, callback: object) -> str:
         """모델이 도구를 부르면 앱(runner)이 실행하고, 결과를 tool 메시지로 돌려준 뒤 다시 묻는다(ADR-056).
@@ -687,7 +731,7 @@ class StrataProvider(OllamaProvider):
         calls: dict[int, dict] = {}
         request = self._request("/v1/chat/completions", payload, self.timeout)
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response, interrupt_on_cancel(response, self.cancel_event):
+            with self._chat_response(request) as response:
                 for raw_line in response:
                     self._check_cancelled()
                     line = raw_line.decode("utf-8", "replace").strip()

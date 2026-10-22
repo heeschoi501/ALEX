@@ -107,6 +107,8 @@ class Settings:
     auto_lessons_enabled: bool = True
     # 코딩 수정안 요청에 절차 교훈(jarvis/insights.py, ADR-070)을 붙인다. 기본 꺼짐 — 평가로 효과를 잰 뒤 사용자가 켠다.
     coding_insights_enabled: bool = False
+    # 배울 코딩 기록(자동 수정·코딩 세션)이 몇 건 쌓이면 쉬는 중에 /dev-learn 을 뒤 작업 차례로 자동 실행(2026-10-23). 기본 꺼짐.
+    coding_auto_learn_enabled: bool = False
     # 앞선 답이 있는 대화에서 마지막 질문 바로 앞에 핵심 사실을 한 번 더 준다(ADR-071, Lost in the Middle). 기본 꺼짐 — 실측 뒤 켠다.
     fact_reminder_enabled: bool = False
     # 코딩 수정안 요청에 '이 파일이 쓰는 객체의 API'(시그니처만)를 붙인다(ADR-072, Aider repo map 을 좁힌 것). 기본 꺼짐 — 실측 뒤 켠다.
@@ -141,6 +143,9 @@ class Settings:
     opencode_model: str = "qwen3.8-q3-32k"
     opencode_context: int = 32768
     opencode_timeout: int = 900
+    # OpenCode 무료 모델(2026-10-23, jarvis/freemodels.py) — 'opencode/<모델>' 이면 /dev-auto·/build 일꾼이 OpenCode + 그 모델(코드가
+    # opencode.ai 로 간다 — 사용자가 고를 때만). 비우면 이 PC 모델. 무료 단계는 OpenCode 안에서만 되므로 OpenCode 일꾼으로 돈다.
+    coding_free_model: str = ""
     # 로컬 모델 서버(2026-10-10, ADR-086): 'ollama'(기본) 또는 'strata'. strata 면 대화·코딩·요약·오픈코드 일꾼이 모두 이 PC 의
     # Strata 서버(Qwen3.8-Flash-Next 125B MoE, C:\ALEX\tools\strata)를 쓴다. 주소는 이 PC(loopback)만 허용한다.
     local_backend: str = "ollama"
@@ -279,6 +284,8 @@ def validate(settings: Settings) -> Settings:
         raise ConfigError("coding_context_char_budget(JARVIS_CODING_CONTEXT_CHAR_BUDGET) 는 0(자동) 또는 1000~500000 사이여야 합니다.")
     if not 1 <= settings.coding_auto_attempts <= 5:
         raise ConfigError("coding_auto_attempts(JARVIS_CODING_AUTO_ATTEMPTS) 는 1~5 사이여야 합니다.")
+    if settings.coding_free_model and not re.fullmatch(r"opencode/[A-Za-z0-9._-]{1,80}", settings.coding_free_model):
+        raise ConfigError("coding_free_model 은 비우거나 'opencode/<모델>' 이어야 합니다(OpenCode 무료 모델).")
     if settings.coding_worker not in ("alex", "opencode", "harness"):
         raise ConfigError("coding_worker(JARVIS_CODING_WORKER) 는 alex·opencode·harness(ALEX 코딩 하네스, ADR-112) 중 하나여야 합니다.")
     if not 4096 <= settings.opencode_context <= 262144:
@@ -422,8 +429,8 @@ LOCAL_FIELDS = {
     "context_char_budget": int, "force_profile": str, "web_enabled": bool,
     "remote_host": str, "remote_user": str, "remote_local_port": int, "remote_alex_port": int,
     "remote_web_host": str, "remote_web_users": str,
-    "lesson_context_limit": int, "web_tool_enabled": bool, "auto_lessons_enabled": bool, "coding_insights_enabled": bool, "fact_reminder_enabled": bool, "coding_api_map_enabled": bool,
-    "coding_num_ctx": int, "coding_num_gpu_layers": int, "coding_context_char_budget": int, "coding_auto_attempts": int, "coding_regression_check": bool, "coding_diagnostic_context": bool, "coding_build_loop_enabled": bool, "coding_code_check_enabled": bool, "coding_worker": str, "opencode_dir": str, "opencode_model": str, "opencode_context": int, "opencode_timeout": int,
+    "lesson_context_limit": int, "web_tool_enabled": bool, "auto_lessons_enabled": bool, "coding_insights_enabled": bool, "coding_auto_learn_enabled": bool, "fact_reminder_enabled": bool, "coding_api_map_enabled": bool,
+    "coding_num_ctx": int, "coding_num_gpu_layers": int, "coding_context_char_budget": int, "coding_auto_attempts": int, "coding_regression_check": bool, "coding_diagnostic_context": bool, "coding_build_loop_enabled": bool, "coding_code_check_enabled": bool, "coding_worker": str, "opencode_dir": str, "opencode_model": str, "opencode_context": int, "opencode_timeout": int, "coding_free_model": str,
     "local_backend": str, "strata_host": str, "strata_model": str, "strata_num_ctx": int, "strata_reasoning_effort": str,
     "strata_max_output_tokens": int, "strata_context_char_budget": int, "strata_history_limit": int,
     "rtl_root": str, "rtl_tools_dir": str, "cloud_agent": str, "cloud_agent_timeout": int,
@@ -477,6 +484,7 @@ def load_settings() -> Settings:
         lesson_context_limit=_env_int("JARVIS_LESSON_CONTEXT_LIMIT", 3),
         auto_lessons_enabled=_env_flag("JARVIS_AUTO_LESSONS", _env_flag("JARVIS_AUTO_LESSONS_ENABLED", True)),
         coding_insights_enabled=_env_flag("JARVIS_CODING_INSIGHTS_ENABLED", False),
+        coding_auto_learn_enabled=_env_flag("JARVIS_CODING_AUTO_LEARN_ENABLED", False),
         fact_reminder_enabled=_env_flag("JARVIS_FACT_REMINDER_ENABLED", False),
         coding_api_map_enabled=_env_flag("JARVIS_CODING_API_MAP_ENABLED", False),
         coding_num_ctx=_env_int("JARVIS_CODING_NUM_CTX", 0),
@@ -488,6 +496,7 @@ def load_settings() -> Settings:
         coding_build_loop_enabled=_env_flag("JARVIS_CODING_BUILD_LOOP", True),
         coding_code_check_enabled=_env_flag("JARVIS_CODING_CODE_CHECK", True),
         coding_worker=os.getenv("JARVIS_CODING_WORKER", "opencode").strip().lower(),
+        coding_free_model=os.getenv("JARVIS_CODING_FREE_MODEL", "").strip(),
         opencode_dir=os.getenv("JARVIS_OPENCODE_DIR", ""),
         opencode_model=os.getenv("JARVIS_OPENCODE_MODEL", "qwen3.8-q3-32k").strip(),
         opencode_context=_env_int("JARVIS_OPENCODE_CONTEXT", 32768),

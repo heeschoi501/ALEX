@@ -135,10 +135,14 @@ function questionCard(questions) {
 function finished(result) {
   endBubble();
   if (!result) return;
-  if (result.stopped === 'error') note(`오류: ${result.error || result.text || '알 수 없는 오류'}`, 'error');
+  if (['error', 'unverified', 'timeout'].includes(result.stopped)) note(`확인 필요: ${result.error || result.text || '알 수 없는 오류'}`, 'error');
   else if (result.stopped === 'max_steps') note('단계 상한에 닿아 여기까지 정리했습니다.');
   else if (!['done', 'question'].includes(result.stopped) && result.text) note(result.text);
   const tools = Object.entries(result.tools || {}).map(([k, v]) => `${k} ${v}`).join(' · ');
+  for (const report of result.verification || []) {
+    note(report.status === 'verified' ? `독립 검사 ${report.attempt}회차: ${(report.checks || []).length}개 파일 통과`
+      : `독립 검사 ${report.attempt}회차: ${report.reason || '미통과·미검증'}`, report.status === 'verified' ? 'meta' : 'error');
+  }
   note(`${result.steps}단계 · ${Math.round(result.seconds)}초${tools ? ` — ${tools}` : ''}`, 'meta');
 }
 function paintTodos(todos) {
@@ -303,7 +307,8 @@ async function open(sid) {
     commands = new Map(listed.commands.map(c => [c.name, c]));
     $('input').placeholder = `무엇을 할까요? (Enter 보내기 · Shift+Enter 줄바꿈 · 명령 ${[...commands.keys()].map(n => '/' + n).join(' ')})`;
     $('title').textContent = session.title || '새 세션';
-    $('dir').textContent = `${session.directory} · ${TIER[session.tier] || session.tier}`;
+    $('dir').textContent = `${session.directory} · ${TIER[session.tier] || session.tier}`
+      + (session.model ? ` · OpenCode 무료 ${session.model.slice(9)}(코드가 opencode.ai 로 감)` : '');
     $('mode').value = session.mode === 'plan' ? 'plan' : 'build';
     paintHistory(messages);
     endBubble();
@@ -337,10 +342,15 @@ async function send(text = $('input').value.trim()) {
   }
 }
 
+$('new-model').addEventListener('change', () => {
+  $('model-note').textContent = $('new-model').value
+    ? 'OpenCode 를 통해 opencode.ai 에서 돕니다 — 코드가 그쪽으로 전송됩니다. 바뀐 내용은 이 PC 권한대로 들입니다.' : '';
+});
 $('new-form').addEventListener('submit', async e => {
   e.preventDefault();
   try {
-    const {session} = await api('/api/code/session', {directory: $('new-dir').value.trim(), tier: $('new-tier').value});
+    const {session} = await api('/api/code/session', {directory: $('new-dir').value.trim(), tier: $('new-tier').value,
+      model: $('new-model').value});
     await open(session.id);
     $('input').focus();
   } catch (err) { note(err.message, 'error'); }
@@ -374,7 +384,8 @@ $('backdrop').addEventListener('click', () => { document.body.classList.remove('
 (async () => {
   setStatus('idle');
   try {
-    const {root, directory} = await api('/api/code/path');
+    const {root, directory, models} = await api('/api/code/path');
+    for (const m of models || []) $('new-model').append(new Option(`OpenCode 무료 · ${m.name}`, m.id));
     $('new-dir').placeholder = directory || root;
     $('root-note').textContent = root ? `비우면 지금 프로젝트. 상대 경로는 ${root} 기준.` : '승인된 파일 루트가 없어 세션을 열 수 없습니다.';
   } catch (err) { note(err.message, 'error'); }

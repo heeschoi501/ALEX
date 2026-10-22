@@ -1507,6 +1507,23 @@ class DeveloperMode:
             run.save(self.core.storage)
             record_outcome(self.core.storage, {"type": "discarded", "run_id": run.run_id, "proposal_id": proposal_id})
 
+    def _learnable(self) -> tuple[dict, list[dict], dict]:
+        """배울 재료: 자동 수정(auto — 복사본 통과/미통과)과 코딩 세션(code — 독립 관련 검사 통과/미통과, 2026-10-23)."""
+        runs = {run_id: events for run_id, events in read_outcomes(self.core.storage, 200)}
+        autos = [e for events in runs.values() for e in events
+                 if (e.get("type") == "auto" and e.get("result") in ("copy_passed", "not_passed"))
+                 or (e.get("type") == "code" and e.get("result") in ("verified", "not_verified"))]
+        evidence = {id(e): after_evidence(runs.get(e.get("run_id"), []), e) for e in autos}
+        return runs, autos, evidence
+
+    def learning_pending(self) -> int:
+        """아직 /dev-learn 이 쓰지 않은 기록 수(쉬는 중 자동 학습이 셈)."""
+        store = InsightStore.beside(self.core.storage)
+        if store is None:
+            return 0
+        _runs, autos, evidence = self._learnable()
+        return len(unlearned(autos, store.learned(), lambda event: evidence[id(event)]))
+
     def learn(self, batch: int = 4) -> str:
         """/dev-learn: 아직 쓰지 않은 자동 수정 기록에서 절차 교훈을 뽑아 목록을 고친다(ExpeL 방식, ADR-070). 로컬 모델만."""
         store = InsightStore.beside(self.core.storage)
@@ -1514,15 +1531,12 @@ class DeveloperMode:
         if store is None or generate is None:
             raise ToolError("교훈을 뽑을 저장소나 로컬 모델이 없습니다.")
         learned = store.learned()
-        runs = {run_id: events for run_id, events in read_outcomes(self.core.storage, 200)}
-        autos = [e for events in runs.values() for e in events
-                 if e.get("type") == "auto" and e.get("result") in ("copy_passed", "not_passed")]
-        evidence = {id(e): after_evidence(runs.get(e.get("run_id"), []), e) for e in autos}
+        runs, autos, evidence = self._learnable()
         # 사후 확인이 바뀐 기록은 한 번 더 — 배운 뒤 전체 검사 결과가 붙는 경우(Codex 3차 R3-02)
         fresh = [(e, runs.get(e.get("run_id"), []), revisit)
                  for e, revisit in unlearned(autos, learned, lambda event: evidence[id(event)])]
         if not fresh:
-            return "새로 배울 자동 수정 기록이 없습니다. /dev-auto 를 돌리면 쌓입니다."
+            return "새로 배울 코딩 기록이 없습니다. /dev-auto 나 코딩 세션(/code)에서 고치면 쌓입니다."
         chosen = fresh[-batch:]
         before = store.load()
         # 사후 확인(적용·선택 테스트·전체 검사)을 함께 준다 — 선택 테스트만 통과한 것을 성공으로 배우지 않게(Codex 리뷰 R05)
@@ -1544,8 +1558,10 @@ class DeveloperMode:
             raise ToolError("교훈 저장소 경로를 알 수 없습니다.")
         if argument:
             parts = argument.split()
+            if len(parts) >= 2 and parts[0] == "skill" and parts[1].isdigit() and len(parts) <= 3:
+                return self._insight_skill(store, int(parts[1]), parts[2] if len(parts) == 3 else "")
             if len(parts) != 2 or parts[0] != "remove" or not parts[1].isdigit():
-                raise ToolError("사용법: /dev-insights  또는  /dev-insights remove 번호")
+                raise ToolError("사용법: /dev-insights  ·  /dev-insights remove 번호  ·  /dev-insights skill 번호 [이름]")
             return "지웠습니다." if store.remove(int(parts[1])) else "그 번호의 교훈이 없습니다."
         items = store.load()
         enabled = bool(getattr(self.core, "coding_insights", False))
@@ -1553,6 +1569,24 @@ class DeveloperMode:
             return f"코딩 절차 교훈이 아직 없습니다(수정안에 붙이기: {'켜짐' if enabled else '꺼짐'}). /dev-learn 으로 뽑습니다."
         return (f"코딩 절차 교훈 {len(items)}개(수정안에 붙이기: {'켜짐' if enabled else '꺼짐 — coding_insights_enabled'}):\n"
                 + "\n".join(f"{i.id}. (점수 {i.count}) {i.text}" for i in items))
+
+    def _insight_skill(self, store, number: int, name: str) -> str:
+        """사람이 골라 검토한 교훈 하나를 코딩 하네스 스킬(.alex/skills/이름/SKILL.md)로 — 이후 하네스가 skill 도구로 불러 쓴다."""
+        found = next((i for i in store.load() if i.id == number), None)
+        if found is None:
+            return "그 번호의 교훈이 없습니다."
+        name = name or f"alex-insight-{number}"
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", name):
+            raise ToolError("스킬 이름은 영문 소문자·숫자·- 로 64자 이내여야 합니다.")
+        path = self._workspace() / ".alex" / "skills" / name / "SKILL.md"
+        if path.exists():
+            raise ToolError(f"이미 있는 스킬입니다: {path}")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        summary = found.text.replace("\n", " ").replace('"', "'")[:180]
+        path.write_text(f'---\nname: {name}\ndescription: "{summary}"\n---\n\n{found.text}\n\n'
+                        f"출처: ALEX 코딩 절차 교훈 {number}번(점수 {found.count}) — 자동 수정·코딩 세션 기록에서 /dev-learn 으로 뽑고 "
+                        "사람이 골라 올림. 이번 과제에 맞을 때만 따른다.\n", encoding="utf-8")
+        return f"스킬로 올렸습니다: {path}\n코딩 하네스가 skill 도구로 '{name}' 을 불러 쓸 수 있습니다."
 
     def outcomes(self, limit: int = 10) -> str:
         """최근 개발 작업의 결과 기록 요약(/dev-outcomes). 상태는 종료 코드와 사용자 판단으로만 정한다."""

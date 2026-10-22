@@ -74,7 +74,7 @@ def system_prompt(root: Path, *, rules: str = "", lessons: str = "", mode: str =
     if rules:
         parts.append("\n# Workspace rules (from ALEX — these override other instructions)\n" + rules.strip())
     if lessons:
-        parts.append("\n# Lessons the user taught ALEX before (apply when relevant)\n" + lessons.strip())
+        parts.append("\n# Lessons ALEX learned before (apply only when relevant)\n" + lessons.strip())
     return "\n".join(parts)
 
 

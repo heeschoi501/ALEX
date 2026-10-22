@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -228,13 +229,11 @@ def launch(allow_download: bool = False, report=print) -> str:
             raise RuntimeError("기존 서버가 로컬 전용 모드가 아닙니다. 종료 후 다시 실행하세요.")
         # 재사용은 의도다(두 개 띄우지 않는다). 다만 그 뒤에 코드가 바뀌었으면 조용히 옛 버전을
         # 쓰게 된다(ADR-049 와 같은 종류). 지문을 모르는 서버는 이 검사 이전 버전이므로 역시 옛 코드다.
-        if existing.get("code") != code_fingerprint():
-            raise RuntimeError(
-                "ALEX 가 이미 켜져 있는데, 그 뒤에 코드가 바뀌었습니다(업데이트).\n"
-                "열려 있는 ALEX 화면에서 '앱 종료' 를 누른 뒤 다시 실행하세요.\n"
-                "그대로 쓰면 새 기능이 빠진 옛 버전입니다."
-            )
-        return WEB
+        if existing.get("code") == code_fingerprint():
+            return WEB
+        # 2026-10-23: 예전엔 '앱 종료 후 다시' 오류만 냈다(사용자 "재시작이 잘 안되더라") — 쉬는 중이면 웹만 끄고 새로 켠다.
+        report("ALEX 코드가 바뀌어 웹만 다시 켭니다(모델 서버는 그대로)…")
+        stop_outdated_web()
     flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     log_dir = ROOT / "logs"
     log_dir.mkdir(exist_ok=True)
@@ -314,6 +313,55 @@ def launch(allow_download: bool = False, report=print) -> str:
     raise RuntimeError("채팅 서버 시작 시간이 초과되었습니다. logs/web-server.log를 확인하세요.")
 
 
+OUTDATED = ("ALEX 가 이미 켜져 있는데, 그 뒤에 코드가 바뀌었습니다(업데이트).\n"
+            "열려 있는 ALEX 화면에서 '다시 켜기'(또는 앱 종료 뒤 다시 실행)를 눌러 주세요.\n"
+            "그대로 쓰면 새 기능이 빠진 옛 버전입니다.")
+
+
+def wait_web_down(seconds: float) -> bool:
+    """8765 가 더 이상 답하지 않을 때까지(옛 웹이 꺼질 때까지) 기다린다."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        try:
+            get_json(WEB + "/health", timeout=1)
+        except (OSError, ValueError):
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def stop_outdated_web(wait_seconds: float = 60) -> None:
+    """켜져 있는 옛 버전 웹만 끈다(Strata·임베딩은 그대로). 웹의 '앱 종료' 와 같은 길 — 일하는 중이면 웹이 거절(409)하고
+    여기서도 끄지 않는다. 이 PC 의 실행기라 화면 토큰을 읽어 관리자(이 PC 주인)로 부른다."""
+    try:
+        page = urllib.request.urlopen(WEB + "/", timeout=5).read().decode("utf-8", "replace")
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(OUTDATED) from exc
+    match = re.search(r'name="jarvis-token" content="([^"]+)"', page)
+    if not match:
+        raise RuntimeError(OUTDATED)
+    request = urllib.request.Request(WEB + "/api/shutdown", data=b"{}", method="POST",
+                                     headers={"X-Jarvis-Token": match.group(1), "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            response.read()
+    except urllib.error.HTTPError as exc:
+        if exc.code == 409:
+            raise RuntimeError("ALEX 가 지금 일하는 중이라 새 버전으로 다시 켜지 않았습니다.\n"
+                               "하던 일이 끝난 뒤 다시 실행해 주세요(그동안은 옛 버전으로 계속 씁니다).") from exc
+        raise RuntimeError(OUTDATED) from exc
+    except (OSError, ValueError):
+        pass  # 종료 응답 전에 연결이 끊겨도 아래에서 꺼졌는지 본다
+    if not wait_web_down(wait_seconds):
+        raise RuntimeError("옛 버전 ALEX 가 꺼지지 않았습니다. 작업 관리자에서 pythonw(jarvis.web)를 끈 뒤 다시 실행해 주세요.")
+
+
+def run_restart(log_dir: Path | None = None, wait_seconds: float = 90) -> int:
+    """화면의 '다시 켜기' — 웹이 이 실행기를 따로 띄워 놓고 스스로 꺼진다. 옛 웹이 꺼지길 기다렸다가 창 없이 새로 켠다."""
+    wait_web_down(wait_seconds)
+    return run_background(log_dir)
+
+
 def run_background(log_dir: Path | None = None) -> int:
     """창도 브라우저도 없이 ALEX 를 띄운다 — 데스크톱이 켜질 때 원격 접속용으로(ADR-052).
 
@@ -334,6 +382,8 @@ def run_background(log_dir: Path | None = None) -> int:
 def main() -> None:
     if "--background" in sys.argv[1:]:
         raise SystemExit(run_background())
+    if "--restart" in sys.argv[1:]:
+        raise SystemExit(run_restart())
     import tkinter as tk
     from tkinter import ttk
 

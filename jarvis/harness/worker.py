@@ -101,9 +101,17 @@ class HarnessWorker:
                         new = (work / path).read_text(encoding="utf-8-sig", errors="replace") if (work / path).is_file() else ""
                         changed[path] = changed_names(old, new)
                     paths = index.select(changed) if changed else []
+                    # 마지막 수정 뒤 에이전트가 하네스 bash 로 직접 돌려 통과한 파일은 그 실행 기록(종료 코드·실행 수)을 근거로 인정
+                    passed = index.already_passed(workspace)
+                    rest = [p for p in paths if p not in passed]
                     if self.progress is not None and paths:
-                        self.progress("[관련 시험 확인] " + ", ".join(paths))
-                    checks = index.verify(workspace, paths, deadline) if paths else []
+                        self.progress("[관련 시험 확인] " + ", ".join(rest)
+                                      + (f" (마지막 수정 뒤 이미 통과 {len(paths) - len(rest)}개 제외)" if len(rest) < len(paths) else ""))
+                    checks = [{"path": p, "status": "verified", "command": passed[p], "exit": 0, "failures": [],
+                               "reason": "마지막 수정 뒤 하네스 bash 실행에서 통과(실행 기록 확인)", "output": ""}
+                              for p in paths if p in passed]
+                    from ..developer import SUITE_WORKERS  # ALEX 전체 검사와 같은 수로 나란히
+                    checks += index.verify(workspace, rest, deadline, workers=SUITE_WORKERS) if rest else []
                     self.last_verification.append({"attempt": attempt + 1, "paths": paths, "checks": checks})
                     verified = len(checks) == len(paths) and all(c["status"] == "verified" for c in checks)
                     if verified:
@@ -130,9 +138,9 @@ class HarnessWorker:
             if result.stopped == "cancelled" or (cancel_event is not None and cancel_event.is_set()):
                 raise GenerationCancelled("코딩 작업을 중단했습니다.")
             run = WorkerRun(exit_code=0 if result.stopped == "done" and verified else 1,
-                            timed_out=time.monotonic() >= deadline,
+                            timed_out=result.stopped == "timeout" or time.monotonic() >= deadline,
                             seconds=round(time.monotonic() - started, 1), tools=dict(workspace.counts),
-                            log_tail=(verification_error if not verified else result.error or result.text)[-1500:])
+                            log_tail=(verification_error or result.error or result.text)[-1500:])
             after = _hashes(work)
             for path in sorted(set(before) | set(after)):
                 if before.get(path) == after.get(path):

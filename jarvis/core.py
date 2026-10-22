@@ -413,6 +413,7 @@ class JarvisCore:
         lesson_context_limit: int = 3,
         auto_lessons: bool = True,
         coding_insights: bool = False,
+        coding_auto_learn: bool = False,
         fact_reminder: bool = False,
         coding_api_map: bool = False,
         coding_num_ctx: int = 0,
@@ -517,6 +518,7 @@ class JarvisCore:
         # ADR-057. 사용자가 바로잡은 것·웹에서 찾은 사실을 자동으로 승인해 교훈으로 쓴다.
         self.auto_lessons = auto_lessons
         self.coding_insights = bool(coding_insights)  # ADR-070
+        self.coding_auto_learn = bool(coding_auto_learn)  # 쉬는 중 /dev-learn 자동(2026-10-23, web 이 뒤 작업 차례로)
         self.fact_reminder = bool(fact_reminder)  # ADR-071
         self.coding_api_map = bool(coding_api_map)  # ADR-072
         # ADR-076: 코딩 수정안만 쓰는 문맥(토큰)·GPU 층 수(0 = 자동)·글자 예산. coding_num_ctx 가 0 이면 대화와 같다.
@@ -2610,9 +2612,7 @@ class JarvisCore:
             "- 줄 번호 diff·명령어는 쓰지 않는다. 보여 주지 않은 파일은 추측해서 고치지 않는다.\n"
         )
         files_text = "".join(f"\nFILE: {path}\n---\n{text}\n---\n" for path, text in originals.items())
-        if self.coding_insights:  # ADR-070: 결과 기록에서 뽑은 절차 교훈(기본 꺼짐)
-            store = InsightStore.beside(self.storage)
-            header += prompt_block(store.load()) if store else ""
+        header += self.coding_insight_text()  # ADR-070: 결과 기록에서 뽑은 절차 교훈(기본 꺼짐)
         if self.coding_api_map:  # ADR-072: 고칠 파일이 쓰는 객체의 공개 메서드 시그니처(기본 꺼짐)
             # 문맥이 넓으면(ADR-076, 48K 에 13만 5천 자) API 도 더 담는다 — 기본 1,200자, 글자 예산의 1/20, 최대 8,000자
             api_budget = max(API_BUDGET, min(8000, self.context_char_budget // 20))
@@ -3396,6 +3396,13 @@ class JarvisCore:
                 lines.append(f"— 찾은 내용을 배웠습니다({short}, {FOUND_MAX_AGE_DAYS}일 동안 참고). "
                              "틀렸으면 '방금 배운 거 취소' 라고 해 주세요.")
         return ("\n\n" + "\n".join(lines)) if lines else ""
+
+    def coding_insight_text(self) -> str:
+        """ADR-070 절차 교훈 — 설정 coding_insights_enabled 일 때만. 수정안 요청과 코딩 하네스(ADR-112) 지시문이 같이 쓴다."""
+        if not self.coding_insights:
+            return ""
+        store = InsightStore.beside(self.storage)
+        return prompt_block(store.load()) if store else ""
 
     def _select_lessons(self, query: str) -> list[Experience]:
         """승인된 학습 분할 경험 중 이번 요청과 관련된 것 (ADR-055)."""

@@ -84,8 +84,18 @@ class WebStateTests(unittest.TestCase):
         self.assertTrue(core.require_cloud_approval)
 
 
+CATALOG = {"opencode": {"models": {
+    "big-pickle": {"name": "Big Pickle", "cost": {"input": 0, "output": 0}, "tool_call": True, "limit": {"context": 200000}},
+    "old-free": {"name": "Old", "cost": {"input": 0}, "tool_call": True, "status": "deprecated"},
+    "paid": {"name": "Paid", "cost": {"input": 1.5}, "tool_call": True}}}}
+
+
 class WebHTTPTests(unittest.TestCase):
     def setUp(self):
+        from unittest import mock
+        patcher = mock.patch("jarvis.freemodels._download", return_value=CATALOG)  # 시험은 models.dev 에 나가지 않는다
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.state = make_state(Path(self.temp.name))
         self.server = make_server(self.state, 0)
@@ -275,6 +285,83 @@ class WebHTTPTests(unittest.TestCase):
         self.assertIn('src="/code.js"', page)
         self.assertEqual(self._get("/code.js", {})[0], 200)
         self.assertEqual(call("GET", "/api/code/path")[1]["root"], str(root))
+        self.assertEqual([m["id"] for m in call("GET", "/api/code/path")[1]["models"]], ["opencode/big-pickle"])
+        self.assertEqual(call("POST", "/api/code/session", {"directory": "proj", "model": "openai/gpt"})[0], 400)
+
+    def test_coding_settings_and_idle_auto_learn(self):
+        """설정의 '코딩 에이전트 · API' 칸과 쉬는 중 자동 학습(2026-10-23)."""
+        from unittest import mock
+        from jarvis.config import Settings
+        from jarvis.developer import record_outcome
+        headers = {"X-Jarvis-Token": "test-token", "Content-Type": "application/json"}
+
+        def call(method, path, body=None):
+            data = json.dumps(body).encode("utf-8") if body is not None else None
+            request = urllib.request.Request(self.base + path, data=data, headers=headers, method=method)
+            try:
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    return response.status, json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                return exc.code, json.loads(exc.read().decode("utf-8"))
+
+        status, info = call("GET", "/api/coding")
+        self.assertEqual((status, info["insights"], info["auto_learn"], info["pending"]), (200, False, False, 0))
+        self.assertEqual(call("POST", "/api/coding", {"coding_insights_enabled": True})[0], 400)  # 설정 없는 실행 모드
+        config = Path(self.temp.name) / "local.json"
+        self.state.settings = Settings(data_dir=Path(self.temp.name))  # 실제 data 폴더에 쓰지 않게
+        with mock.patch("jarvis.web.local_config_path", return_value=config):
+            self.assertEqual(call("POST", "/api/coding", {"coding_insights_enabled": "yes"})[0], 400)
+            status, info = call("POST", "/api/coding", {"coding_insights_enabled": True, "coding_auto_learn_enabled": True})
+        self.assertEqual((status, info["insights"], info["auto_learn"]), (200, True, True))
+        self.assertEqual([m["id"] for m in info["free_models"]], ["opencode/big-pickle"])
+        with mock.patch("jarvis.web.local_config_path", return_value=config):
+            self.assertEqual(call("POST", "/api/coding", {"coding_free_model": "not-a-model"})[0], 400)
+            status, info = call("POST", "/api/coding", {"coding_free_model": "opencode/big-pickle"})
+        self.assertEqual((status, info["free_model"]), (200, "opencode/big-pickle"))
+        worker = self.state.core.opencode_worker
+        self.assertTrue(worker.free and worker.model == "opencode/big-pickle")  # 자동 수정·만들기 일꾼이 바로 바뀐다
+        with mock.patch("jarvis.web.local_config_path", return_value=config):
+            call("POST", "/api/coding", {"coding_free_model": ""})
+        self.assertFalse(getattr(self.state.core.opencode_worker, "free", False))
+        self.assertTrue(json.loads(config.read_text(encoding="utf-8"))["coding_auto_learn_enabled"])
+        self.assertTrue((Path(self.temp.name) / "free-models.json").exists())  # 목록 저장도 시험 폴더에
+        self.assertTrue(self.state.core.coding_insights and self.state.core.coding_auto_learn)  # 바로 적용
+        self.assertEqual(self.state.maybe_auto_learn(), "")  # 배울 기록이 아직 없다
+        for n in range(3):
+            record_outcome(self.state.core.storage, {"type": "code", "run_id": f"ses_{n}@1", "goal": "g", "result": "verified",
+                                                     "rounds": [{"round": 1, "exit": 0, "diff": "+x"}]})
+        self.assertEqual(call("GET", "/api/coding")[1]["pending"], 3)
+        self.state.core.coding_auto_learn = False
+        self.assertEqual(self.state.maybe_auto_learn(), "")  # 꺼져 있으면 안 함
+        self.state.core.coding_auto_learn = True
+        self.assertIn("교훈 연산", self.state.maybe_auto_learn())  # 가짜 모델 답엔 연산이 없다 — 그래도 차례를 얻어 /dev-learn 을 돌렸다
+        self.assertEqual(self.state.queue, [])
+
+    def test_restart_spawns_the_launcher_and_waits_for_busy_coding_sessions(self):
+        """'다시 켜기'(2026-10-23) — 코딩 세션이 일하는 중이면 거절, 아니면 실행기를 띄우고 이 웹은 꺼진다(실행기는 가짜)."""
+        from types import SimpleNamespace
+        from unittest import mock
+        headers = {"X-Jarvis-Token": "test-token", "Content-Type": "application/json"}
+
+        def post(path):
+            request = urllib.request.Request(self.base + path, data=b"{}", headers=headers, method="POST")
+            try:
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    return response.status, json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                return exc.code, json.loads(exc.read().decode("utf-8"))
+
+        self.state.code.sessions["ses_busy"] = SimpleNamespace(status="running")
+        with mock.patch.object(self.state, "spawn_restarter") as spawn:
+            status, body = post("/api/restart")
+            self.assertEqual(status, 409)
+            self.assertIn("코딩 세션", body["error"])
+            spawn.assert_not_called()
+            del self.state.code.sessions["ses_busy"]
+            status, body = post("/api/restart")
+        self.assertEqual((status, body["stopped"], body["restarting"]), (200, True, True))
+        spawn.assert_called_once()
+        self.assertTrue(self.state.shutting_down)
 
 if __name__ == "__main__":
     unittest.main()

@@ -321,5 +321,38 @@ class BuildWithOpenCodeTests(FakeOpenCode, unittest.TestCase):
         process.assert_not_called()
 
 
+
+class FreeModelWorkerTests(unittest.TestCase):
+    """OpenCode 무료 모델 일꾼(2026-10-23) — 공급자 설정 없이 모델 그대로, 개인 파일은 보내지 않는다(가짜 오픈코드)."""
+
+    def test_free_model_command_config_and_private_files(self):
+        import tempfile as _tempfile
+        with _tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            project = root / "project"
+            (project / "jarvis").mkdir(parents=True)
+            (project / "jarvis" / "a.py").write_text("a = 0\n", encoding="utf-8")
+            (project / "jarvis.local.json").write_text('{"secret": 1}', encoding="utf-8")
+            (project / ".env").write_text("TOKEN=x", encoding="utf-8")
+            script = root / "fake.py"
+            script.write_text("import json, sys\nfrom pathlib import Path\n"
+                              "Path('seen.json').write_text(json.dumps({'args': sys.argv[1:], "
+                              "'files': sorted(str(p) for p in Path('.').rglob('*') if p.is_file())}), encoding='utf-8')\n",
+                              encoding="utf-8")
+            worker = OpenCodeWorker(root, "opencode/big-pickle", command=[sys.executable, str(script)])
+            self.assertTrue(worker.free)
+            self.assertEqual(worker.unavailable_reason(), "")
+            config = worker.config()
+            self.assertEqual((config["model"], "provider" in config), ("opencode/big-pickle", False))
+            env = worker.environment(root / "c.json", root / "d")
+            self.assertNotIn("OPENCODE_DISABLE_MODELS_FETCH", env)  # 무료 모델은 OpenCode 가 목록을 알아야 한다
+            run = worker.run(project, "고쳐")
+            seen = json.loads(run.created["seen.json"])
+            self.assertEqual(seen["args"][:3], ["run", "--model", "opencode/big-pickle"])
+            self.assertNotIn("jarvis.local.json", " ".join(seen["files"]))
+            self.assertNotIn(".env", " ".join(seen["files"]))
+            self.assertEqual(run.deleted, [])  # 빼고 보낸 개인 파일이 '삭제'로 돌아오지 않는다
+            self.assertTrue((project / "jarvis.local.json").exists())
+
 if __name__ == "__main__":
     unittest.main()

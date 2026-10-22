@@ -90,6 +90,8 @@ class Workspace:
     _outputs: int = 0
     _step: int = 1   # 반복 밖에서 바로 쓸 때도 차례 1 — revert(0) 이 처음으로 돌린다
     read_max_lines: int = MAX_LINES  # 일꾼은 짧게 읽고 offset으로 이어 읽어 문맥 낭비를 줄인다.
+    edits: int = 0                   # 파일을 바꾼 횟수(쓰기·고치기·패치·되돌리기) — 시험 실행이 마지막 수정 뒤인지 가린다
+    test_runs: list[dict] = field(default_factory=list)   # bash 로 실제 실행한 명령·종료 코드·그때의 edits(일꾼 독립 검사가 씀)
 
     def __post_init__(self) -> None:
         self.root = Path(self.root).resolve()
@@ -151,6 +153,7 @@ class Workspace:
         self._step = step
 
     def _remember(self, path: Path) -> None:
+        self.edits += 1
         if not self.history or self.history[-1][0] != self._step:
             self.history.append((self._step, {}))
         saved = self.history[-1][1]
@@ -172,6 +175,7 @@ class Workspace:
                     path.write_bytes(before)
                 restored.append(self.relative(path))
                 self.read_times.pop(key, None)
+        self.edits += 1 if restored else 0
         return restored
 
     def diff(self) -> str:
@@ -197,7 +201,8 @@ class Workspace:
             return text
         self._outputs += 1
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
-        saved = Path(self.output_dir) / f"tool_{int(time.time())}_{self._outputs}.txt"
+        # 독립 검사가 나란히 돌 때도 이름이 겹치지 않게 끝에 무작위 4자리
+        saved = Path(self.output_dir) / f"tool_{int(time.time())}_{self._outputs}_{os.urandom(2).hex()}.txt"
         saved.write_text(text, encoding="utf-8")
         kept, size = [], 0
         source = lines if direction == "head" else list(reversed(lines))
@@ -281,6 +286,22 @@ class Workspace:
         text = "".join(difflib.unified_diff(before.splitlines(keepends=True), after.splitlines(keepends=True),
                                             f"a/{name}" if before else "/dev/null", f"b/{name}"))
         return text[:8000] + ("\n… (생략)" if len(text) > 8000 else "")
+
+    def apply_external(self, rel: str, text: str | None, tool: str = "opencode") -> str:
+        """다른 일꾼(OpenCode 무료 모델 세션)이 복사본에서 만든 변경을 작업 폴더에 들인다 — 권한(diff 미리보기)·되돌리기 기록은
+        write 와 같은 길. text 가 None 이면 지우기. '' 이면 들임, 아니면 거절 글."""
+        path = self.resolve(rel)
+        before = path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
+        if problem := self.permit("edit", self.relative(path), {"tool": tool, "filePath": str(path),
+                                                                 "diff": self._preview(path, before, text or "")}):
+            return problem
+        self.counts["edit"] = self.counts.get("edit", 0) + 1
+        if text is None:
+            self._remember(path)
+            path.unlink(missing_ok=True)
+        else:
+            self._write(path, text)
+        return ""
 
     def write(self, args: dict) -> str:
         path = self.resolve(args.get("filePath"))
@@ -484,7 +505,8 @@ class Workspace:
             timeout = self.shell.timeout
         run = [sys.executable if words[0] == "python" else words[0], *words[1:]]
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-        env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", PYTHONIOENCODING="utf-8")
+        # ALEX 의 시험 실행(developer.py)과 같은 UTF-8 모드 — 아니면 기본 인코딩으로 읽는 시험이 한글에서 가짜로 깨진다(2026-10-23)
+        env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
         try:
             process = subprocess.Popen(run, cwd=self.root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                        stdin=subprocess.DEVNULL, env=env, creationflags=flags)
@@ -510,6 +532,8 @@ class Workspace:
             if process.stdout is not None:
                 process.stdout.close()
         output = b"".join(chunks).decode("utf-8", errors="replace").replace("\r\n", "\n").rstrip()
+        self.test_runs.append({"words": words, "exit": None if timed_out else process.returncode, "edits": self.edits,
+                               "tail": output[-2000:]})
         output += (f"\n\n(Command timed out after {timeout:.0f} seconds and was terminated.)" if timed_out
                    else f"\n\n(exit code {process.returncode})")
         return self.truncate(output.strip(), direction="tail")
