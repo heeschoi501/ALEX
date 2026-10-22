@@ -36,3 +36,10 @@ REVIEW_PACKET.md
 
 # 에이전트 첨부 사본(작업 도구가 만든 것)
 .codex-remote-attachments/
+
+# Private operational handoffs and unrelated personal source
+/GPT_NEXT.md
+/CLAUDE_NEXT.md
+/CLAUDE_START_PROMPT.md
+/GPT_CLAUDE_IMPLEMENTATION_HANDOFF.md
+/jarvis/2dsoul.py

@@ -1,6 +1,7 @@
 'use strict';
 const $ = id => document.getElementById(id);
 const token = document.querySelector('meta[name="jarvis-token"]').content;
+let reasoningSaving = false;
 let state = null, busy = false, requestId = null, pullRequestId = null, oldest = null;
 // 열린 화면과 작업 중인 방은 별개다. 스트림은 방을 이동해도 같은 요청에 붙어 있다.
 const roomRequests = new Map(), roomDrafts = new Map(), unreadRooms = new Set();
@@ -117,6 +118,7 @@ function icon(...paths) {
   for (const d of paths) { const p = document.createElementNS('http://www.w3.org/2000/svg', 'path'); p.setAttribute('d', d); svg.append(p); }
   return svg;
 }
+const fileIcon = () => icon('M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zM14 2v6h6M8 13h8M8 17h5');
 const folderIcon = () => icon('M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.7-.9l-.8-1.2A2 2 0 0 0 7.9 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z');
 function backendLabel(backend) {
   return {strata: 'Strata', ollama: 'Ollama', mock: '데모'}[backend] || '추론 엔진 확인 필요';
@@ -130,6 +132,39 @@ function liveBackend(snapshot, kind = 'general') {
   if (name.startsWith('ollama:')) return 'ollama';
   return snapshot?.mock ? 'mock' : 'unknown';
 }
+// Existing administrator settings: shared by this PC, never changed while a request is active.
+function syncReasoningControl() {
+  const select = $('reasoning-level'), backend = liveBackend(state);
+  const settings = state?.settings || {}, strata = backend === 'strata';
+  const available = Boolean(state?.is_admin && !state?.mock && ['ollama', 'strata'].includes(backend)
+    && typeof settings.ollama_think === 'boolean');
+  for (const option of select.options) {
+    if (['low', 'high'].includes(option.value)) option.disabled = !strata;
+    if (option.value === 'medium') option.textContent = strata ? '보통' : '켜기';
+  }
+  if (!reasoningSaving) {
+    const thinking = state?.effective_settings?.general?.think ?? settings.ollama_think;
+    select.value = thinking ? (strata ? settings.strata_reasoning_effort || 'medium' : 'medium') : 'off';
+  }
+  select.disabled = !available || reasoningSaving || anyWork() || tokenExpired || appStopped;
+}
+$('reasoning-level').addEventListener('change', async () => {
+  const choice = $('reasoning-level').value, backend = liveBackend(state);
+  if (!state?.is_admin || anyWork() || tokenExpired || appStopped
+      || !['ollama', 'strata'].includes(backend) || !['off', 'low', 'medium', 'high'].includes(choice)
+      || (backend !== 'strata' && ['low', 'high'].includes(choice))) {
+    syncReasoningControl(); return;
+  }
+  const changes = {ollama_think: choice !== 'off'};
+  if (backend === 'strata' && choice !== 'off') changes.strata_reasoning_effort = choice;
+  reasoningSaving = true; lock(true);
+  try {
+    await api('/api/settings', {session_id: state.session_id, settings: changes});
+    await refreshVisible(false);
+    notice('추론 설정을 저장했습니다. 이 PC의 모든 대화에 다음 요청부터 적용됩니다. 모델에 따라 수준 지원이 다릅니다.');
+  } catch (error) { notice(error.message); }
+  finally { reasoningSaving = false; lock(false); }
+});
 function scrollBottom() { const el = $('chat-scroll'); el.scrollTop = el.scrollHeight; }
 // 주소를 링크로 (2026-09-25: 검색 답의 출처가 글자로만 나와서 누를 수 없었다).
 // HTML 을 해석하지 않고 DOM 으로만 만든다. http/https 만 링크가 되고, 새 탭으로 열며,
@@ -222,12 +257,32 @@ function documentDownload(name) {
   });
   return button;
 }
+// 말로 내려받은 파일(ADR-104) — 누르면 이 기기에 저장(브라우저에서 열지 않음)
+const DOWNLOAD_LINE = /^\[받은 파일: ([^\]\n]{1,300})\]\(alex-download:([A-Za-z0-9._%-]{1,600})\)$/;
+function downloadedFile(label, name) {
+  const button = node('button', 'secondary', '받은 파일 저장 · ' + label);
+  button.type = 'button';
+  button.addEventListener('click', async () => {
+    button.disabled = true;
+    try {
+      const r = await fetch('/api/downloaded?name=' + encodeURIComponent(name), {headers});
+      if (r.status === 403) { showTokenExpired(); throw new Error('연결이 만료되었습니다.'); }
+      if (!r.ok) throw new Error('파일을 찾을 수 없습니다(지웠거나 2GB 보다 큼 — data\\downloads 폴더에서 직접 여세요).');
+      const url = URL.createObjectURL(await r.blob());
+      const a = document.createElement('a'); a.href = url; a.download = label;
+      document.body.append(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (e) { notice(e.message); }
+    finally { button.disabled = false; }
+  });
+  return button;
+}
 function appendWithImages(el, text, sessionId = state?.session_id) {
   let buffer = [];
   const flush = () => { if (buffer.length) { appendLinked(el, buffer.join('\n')); buffer = []; } };
   for (const line of text.split('\n')) {
-    const m = line.match(IMAGE_LINE), a = line.match(ATTACHMENT_LINE), v = line.match(VIDEO_LINE), d = line.match(DOCUMENT_LINE);
-    if (m) { flush(); el.append(imageFigure(m[1], m[2])); } else if (a) { flush(); el.append(imageFigure(a[1], a[2], true, sessionId)); } else if (v) { flush(); el.append(videoFigure(v[1], v[2])); } else if (d) { flush(); el.append(documentDownload(d[1])); } else buffer.push(line);
+    const m = line.match(IMAGE_LINE), a = line.match(ATTACHMENT_LINE), v = line.match(VIDEO_LINE), d = line.match(DOCUMENT_LINE), g = line.match(DOWNLOAD_LINE);
+    if (m) { flush(); el.append(imageFigure(m[1], m[2])); } else if (a) { flush(); el.append(imageFigure(a[1], a[2], true, sessionId)); } else if (v) { flush(); el.append(videoFigure(v[1], v[2])); } else if (d) { flush(); el.append(documentDownload(d[1])); } else if (g) { flush(); el.append(downloadedFile(g[1], g[2])); } else buffer.push(line);
   }
   flush();
 }
@@ -237,6 +292,8 @@ function mediaLine(line, sessionId = state?.session_id) {
   if (a) return imageFigure(a[1], a[2], true, sessionId);
   if (v) return videoFigure(v[1], v[2]);
   if (d) return documentDownload(d[1]);
+  const g = line.match(DOWNLOAD_LINE);
+  if (g) return downloadedFile(g[1], g[2]);
   return null;
 }
 function renderContent(el, text, markdown = false, sessionId = state?.session_id) {
@@ -301,8 +358,46 @@ function message(role, text, parent = $('messages')) {
   actions.append(copy); el.append(content, actions); parent.append(el);
   const result = {el, content, actions, update(t, formatted = false) {
     value = t;
-    if (formatted) renderContent(content, t, role === 'assistant', sessionId); else content.textContent = t;
+    // 보낸 질문의 '[첨부 문서: …]' 줄은 글 대신 칩으로(ADR-096). 복사하면 원래 글 그대로.
+    const docs = role === 'user' ? [...t.matchAll(/^\[첨부 문서: (.+)\]$/gm)].map(match => match[1]) : [];
+    const shown = docs.length ? t.replace(/^\[첨부 문서: .+\]$/gm, '').trim() : t;
+    if (formatted) renderContent(content, shown, role === 'assistant', sessionId); else content.textContent = shown;
+    if (docs.length) {
+      const chips = node('div', 'doc-chips');
+      for (const doc of docs) { const chip = node('span', 'doc-chip'); chip.title = doc; chip.append(fileIcon(), node('span', '', doc)); chips.append(chip); }
+      content.append(chips);
+    }
     el.querySelector('.learned-actions')?.remove();
+    el.querySelector('.cloud-actions')?.remove();
+    el.querySelector('.download-actions')?.remove();
+    // 실행 파일·큰 파일 내려받기는 승인 버튼으로(ADR-104). 받은 뒤에도 ALEX 는 실행하지 않는다.
+    const approve = formatted && role === 'assistant' ? t.match(/^- 받기: (\/download https?:\/\/\S+ --yes)$/m) : null;
+    if (approve) {
+      const row = node('div', 'row download-actions'), go = node('button', 'primary', '승인하고 받기');
+      go.type = 'button';
+      if (permission === 'read') { go.disabled = true; go.title = '읽기 전용 권한에서는 내려받지 않습니다'; }
+      go.addEventListener('click', () => {
+        if (!busy && confirm(`이 파일을 내려받을까요? 받은 뒤에도 ALEX 는 실행하지 않습니다.\n\n${approve[1].slice(10, -6)}`)) { submit(approve[1]); go.disabled = true; }
+      });
+      row.append(go); el.insertBefore(row, actions);
+    }
+    // 클라우드 작업 결과(ADR-102)는 뒤 작업으로 와서 기록에서 그려진다 — 거기에 적용·폐기 버튼을 붙인다.
+    if (formatted && role === 'assistant' && t.startsWith('클라우드 작업 결과')) {
+      const ids = [...t.matchAll(/^(?:- )?적용: \/apply-edit ([a-f0-9]{12}) --yes$/gm)].map(match => match[1]);
+      if (ids.length) {
+        const row = node('div', 'row cloud-actions');
+        for (const id of ids) {
+          const apply = node('button', 'primary', ids.length > 1 ? `수정안 적용 (${id.slice(0, 6)})` : '이 수정안 적용');
+          const discard = node('button', 'secondary', '폐기');
+          apply.type = 'button'; discard.type = 'button';
+          if (permission === 'read') { apply.disabled = true; apply.title = '읽기 전용 권한에서는 적용하지 않습니다 — 입력창 아래 권한을 바꾸세요'; }
+          apply.addEventListener('click', () => { if (!busy && confirm('위 diff와 ALEX 확인 결과를 봤나요? 원본을 백업하고 이 수정안을 적용합니다.')) { submit(`/apply-edit ${id} --yes`); apply.disabled = true; discard.disabled = true; } });
+          discard.addEventListener('click', () => { if (!busy) { submit(`/discard-edit ${id}`); apply.disabled = true; discard.disabled = true; } });
+          row.append(apply, discard);
+        }
+        el.insertBefore(row, actions);
+      }
+    }
     if (formatted && role === 'assistant') {
       const ids = [...t.matchAll(/^— (?:바로잡아 주신 내용을|찾은 내용을) 배웠습니다\(([0-9a-f]{8})/gm)]
         .map(match => match[1]);
@@ -341,6 +436,8 @@ function updateControls() {
   $('knowledge-form').querySelectorAll('input,button').forEach(b => { b.disabled = busy || tokenExpired || appStopped; });
   $('attachments').querySelectorAll('button').forEach(button => { button.disabled = busy || tokenExpired || appStopped; });
   $('media-prompt-open').disabled = busy || tokenExpired || appStopped;
+  $('send-background').disabled = busy || tokenExpired || appStopped;
+  $('send-background').hidden = Boolean(job);
   $('stop').hidden = !job;
   $('stop').disabled = !requestId || Boolean(job?.cancelRequested);
   $('stop').title = job?.cancelRequested ? '중단 요청 중…' : '이 대화의 생성 중단';
@@ -348,6 +445,7 @@ function updateControls() {
   document.querySelectorAll('#sessions .session-delete').forEach(b => { b.disabled = auxiliaryBusy || Boolean(roomRequest(b.dataset.sessionId)); });
   document.querySelectorAll('#file-form button, [data-command]').forEach(b => { b.disabled = busy || tokenExpired; });
   paintRequestBadges();
+  syncReasoningControl();
 }
 // 대화 목록은 날짜별로 묶는다(Claude·ChatGPT 처럼).
 function dayGroup(iso) {
@@ -422,8 +520,10 @@ function paintState(s, history = false) {
     $('hardware').textContent = `${s.profile} · ${s.gpu || 'GPU 미확인'}`;
     $('project-root').textContent = s.project_root;
   }
+  paintPermission(s.permission);
   paintMemories(s.memories || {});
   paintTasks(s.tasks || []);
+  paintJobs(s.jobs || []);
   if (history) {
     $('messages').replaceChildren();
     const job = roomRequests.get(s.session_id);
@@ -532,6 +632,7 @@ async function models() {
 }
 async function submit(text = $('input').value.trim()) {
   if (busy || !state) return;
+  if (/^\/bg(\s|$)/.test(text.trim())) return submitJob(text.trim().replace(/^\/bg\s*/, ''));
   if (roomRequests.size >= 4) { notice('동시에 최대 4개 대화의 요청을 받을 수 있습니다. 하나가 끝난 뒤 보내 주세요.'); return; }
   // 프로젝트 화면에서 쓰면 그 프로젝트 안에 새 대화를 만들고 보낸다(Claude 프로젝트처럼).
   if (openProject && !text.trim().startsWith('/') && text.trim()) {
@@ -539,14 +640,18 @@ async function submit(text = $('input').value.trim()) {
     try { if (!await newChat(openProject)) return; } catch (e) { notice(e.message); return; }
   }
   const selected = text.trim().startsWith('/') ? [] : pendingAttachments.slice();
-  if (!text.trim() && selected.length) text = '첨부한 이미지의 내용을 설명해 주세요.';
+  const images = selected.filter(item => item.kind !== 'document'), documents = selected.filter(item => item.kind === 'document');
+  if (!text.trim() && documents.length) text = '첨부한 문서의 핵심을 정리해 주세요.';
+  else if (!text.trim() && images.length) text = '첨부한 이미지의 내용을 설명해 주세요.';
   if (!text.trim()) return;
-  const body = {message: text, session_id: state.session_id, attachments: selected.map(image => image.name)};
+  const body = {message: text, session_id: state.session_id, attachments: images.map(image => image.name),
+    documents: documents.map(doc => doc.id), permission};
   if (new TextEncoder().encode(JSON.stringify(body)).length > 64000) { notice('요청이 너무 큽니다. 64KB 이하로 줄여 주세요.'); return; }
   const oldSession = state.session_id;
   notice(''); $('input').value = ''; fitInput(); $('welcome').hidden = true;
   if (openProject) closeProject();
-  const displayed = text + (selected.length ? '\n' + selected.map(image => `![첨부 이미지 ${image.width}×${image.height}](alex-attachment:${image.name})`).join('\n') : '');
+  const displayed = text + (images.length ? '\n' + images.map(image => `![첨부 이미지 ${image.width}×${image.height}](alex-attachment:${image.name})`).join('\n') : '')
+    + (documents.length ? '\n\n' + documents.map(doc => `[첨부 문서: ${documentLabel(doc)}]`).join('\n') : '');
   const user = message('user', displayed);
   clearAttachments(new Set(selected.map(image => image.name)));
   const answer = message('assistant', '');
@@ -619,8 +724,16 @@ async function submit(text = $('input').value.trim()) {
           // Only show apply buttons for commands that return real edit proposals.
           if (text.startsWith('/edit-file ') || text.startsWith('/edit-files ') || text === '/dev-next' || text === '/dev-propose' || text === '/dev-auto') {
             const id = event.response.match(/^편집 제안 ID: ([a-f0-9]{12})/m)?.[1];
-            if (id) {
+            // 자동 실행 권한으로 이미 적용했으면 '되돌리기' 버튼만(ADR-095)
+            for (const [, undo] of event.response.matchAll(/^되돌리기: (\/undo-(?:bundle|file) .+ --yes)$/gm)) {
+              const row = node('div', 'row'), button = node('button', 'secondary', '되돌리기');
+              button.title = undo;
+              button.addEventListener('click', () => { if (!busy && confirm('자동으로 적용한 수정을 백업에서 되돌릴까요?')) { submit(undo); button.disabled = true; } });
+              row.append(button); answer.el.append(row);
+            }
+            if (id && event.response.includes(`/apply-edit ${id} --yes`)) {
               const row = node('div', 'row'), apply = node('button', 'primary', '이 수정안 적용'), discard = node('button', 'secondary', '폐기');
+              if (permission === 'read') { apply.disabled = true; apply.title = '읽기 전용 권한에서는 적용하지 않습니다 — 입력창 아래 권한을 바꾸세요'; }
               apply.addEventListener('click', () => { if (!busy && confirm('위 diff를 확인했나요? 원본을 백업하고 이 수정안을 적용합니다.')) { submit(`/apply-edit ${id} --yes`); apply.disabled = true; discard.disabled = true; } });
               discard.addEventListener('click', () => { if (!busy) { submit(`/discard-edit ${id}`); apply.disabled = true; discard.disabled = true; } });
               row.append(apply, discard); answer.el.append(row);
@@ -654,6 +767,7 @@ async function submit(text = $('input').value.trim()) {
 function fitInput() { const el = $('input'); el.style.height = 'auto'; el.style.height = Math.min(el.scrollHeight, 240) + 'px'; }
 $('input').addEventListener('input', () => { fitInput(); saveComposer(); });
 $('chat-form').addEventListener('submit', e => { e.preventDefault(); submit(); });
+$('send-background').addEventListener('click', () => { if (!busy) submitJob($('input').value.trim()); });
 // Direct mode sends the prompt exactly as entered to ComfyUI; the chat model does not rewrite it.
 const mediaPromptDialog = $('media-prompt-dialog');
 $('media-prompt-open').addEventListener('click', () => {
@@ -682,6 +796,7 @@ function renderAttachments() {
   list.replaceChildren();
   list.hidden = !pendingAttachments.length;
   for (const image of pendingAttachments) {
+    if (image.kind === 'document') { list.append(documentCard(image)); continue; }
     const card = node('div', 'attachment-preview');
     const preview = document.createElement('img');
     preview.src = image.url; preview.alt = image.filename || '첨부 스크린샷';
@@ -693,10 +808,67 @@ function renderAttachments() {
     list.append(card);
   }
 }
+// ── 대화에 문서 올리기(ADR-096, 2026-10-18 사용자 "파일 올리는 게 안 되더라, 그림만 되고"). 올리면 그 대화의 보내기 전
+// 첨부(draft)가 되고, 보내면 그 대화의 자료가 된다. 칩의 ✕ 는 서버에서도 지운다.
+const DOCUMENT_EXTENSIONS = new Set($('screenshot-file').accept.split(',').filter(item => item.startsWith('.')));
+const isImageFile = file => ['image/png', 'image/jpeg', 'image/webp'].includes(file.type) || /\.(png|jpe?g|webp)$/i.test(file.name);
+const documentLabel = doc => `${doc.title} · ${doc.pages}쪽 · ${Number(doc.chars).toLocaleString()}자`;
+function documentCard(doc) {
+  const card = node('div', 'attachment-file'), text = node('span');
+  text.append(node('strong', '', doc.title), node('small', '', `${doc.pages}쪽 · ${Number(doc.chars).toLocaleString()}자`
+    + (doc.empty_pages?.length ? ` · 그림·스캔 ${doc.empty_pages.length}쪽은 못 읽음` : '')));
+  const remove = node('button', 'text-button', '✕');
+  remove.type = 'button'; remove.title = '첨부 빼기'; remove.setAttribute('aria-label', `${doc.title} 첨부 빼기`);
+  remove.disabled = busy || tokenExpired || appStopped;
+  remove.addEventListener('click', () => { if (!busy) removeDocument(doc); });
+  card.title = doc.title;
+  card.append(fileIcon(), text, remove);
+  return card;
+}
+async function removeDocument(doc) {
+  pendingAttachments = pendingAttachments.filter(item => item !== doc);
+  renderAttachments(); saveComposer();
+  try { await api('/api/document/discard', {session_id: doc.session_id, document_id: doc.id}); } catch { /* 다음 정리 때 */ }
+}
+async function attachDocuments(files) {
+  if (busy || tokenExpired || appStopped || !state) return;
+  const selected = Array.from(files);
+  if (!selected.length) return;
+  const unsupported = selected.find(file => !DOCUMENT_EXTENSIONS.has('.' + file.name.split('.').pop().toLowerCase()));
+  if (unsupported) { notice(`“${unsupported.name}” 은(는) 올릴 수 없는 형식입니다. 그림·PDF·워드·엑셀·파워포인트·한글(hwp·hwpx)·텍스트·코드 파일을 올려 주세요. 구 오피스(doc·xls·ppt) 파일은 PDF 로 저장해서 올려 주세요.`); return; }
+  if (pendingAttachments.filter(item => item.kind === 'document').length + selected.length > 5) { notice('문서는 한 번에 최대 5개까지 첨부할 수 있습니다.'); return; }
+  if (selected.some(file => file.size > 20000000 || !file.size)) { notice('문서는 빈 파일이 아니어야 하고 파일당 20MB 이하여야 합니다.'); return; }
+  if (openProject) {  // 첨부는 대화에 붙는다 — 프로젝트 화면이면 그 안에 대화를 먼저 연다
+    try { await newChat(openProject); } catch (e) { notice(e.message); return; }
+  }
+  const sessionId = state.session_id;
+  lock(true);
+  try {
+    for (const file of selected) {
+      notice(`문서를 읽고 있습니다… ${file.name}`);
+      const response = await fetch('/api/document/upload', {method: 'POST', body: file,
+        headers: {'X-Jarvis-Token': token, 'X-Jarvis-Session': sessionId, 'X-File-Name': encodeURIComponent(file.name),
+          'Content-Type': 'application/octet-stream'}});
+      if (response.status === 403) { showTokenExpired(); throw new Error('연결이 만료되었습니다.'); }
+      const result = await response.json();
+      if (!response.ok) throw new Error(`${file.name}: ${result.error || 'HTTP ' + response.status}`);
+      if (state.session_id !== sessionId) throw new Error('대화가 바뀌었습니다. 다시 첨부해 주세요.');
+      pendingAttachments.push({kind: 'document', ...result.document, name: 'doc:' + result.document.id, session_id: sessionId});
+    }
+    notice('');
+  } catch (error) { notice('문서 첨부: ' + error.message); }
+  finally { lock(false); renderAttachments(); saveComposer(); $('input').focus(); }
+}
+async function attachFiles(files) {
+  const all = Array.from(files);
+  const images = all.filter(isImageFile), documents = all.filter(file => !isImageFile(file));
+  if (images.length) await attachScreenshots(images);
+  if (documents.length) await attachDocuments(documents);
+}
 function clearAttachments(names = null) {
   pendingAttachments = pendingAttachments.filter(image => {
     if (names && !names.has(image.name)) return true;
-    URL.revokeObjectURL(image.url);
+    if (image.url) URL.revokeObjectURL(image.url);
     return false;
   });
   renderAttachments();
@@ -706,7 +878,7 @@ async function attachScreenshots(files) {
   if (busy || tokenExpired || appStopped || !state) return;
   const selected = Array.from(files);
   if (!selected.length) return;
-  if (pendingAttachments.length + selected.length > 3) { notice('이미지는 한 번에 최대 3개까지 첨부할 수 있습니다.'); return; }
+  if (pendingAttachments.filter(item => item.kind !== 'document').length + selected.length > 3) { notice('이미지는 한 번에 최대 3개까지 첨부할 수 있습니다.'); return; }
   if (selected.some(file => file.size > 10000000)) { notice('이미지는 파일당 10MB 이하로 보내 주세요.'); return; }
   if (openProject) {  // 첨부는 대화에 붙는다 — 프로젝트 화면이면 그 안에 대화를 먼저 연다
     try { await newChat(openProject); } catch (e) { notice(e.message); return; }
@@ -733,11 +905,11 @@ async function attachScreenshots(files) {
 $('screenshot').addEventListener('click', () => { if (!busy) $('screenshot-file').click(); });
 $('screenshot-file').addEventListener('change', event => {
   const files = Array.from(event.target.files); event.target.value = '';
-  attachScreenshots(files);
+  attachFiles(files);
 });
 $('input').addEventListener('paste', event => {
-  const files = Array.from(event.clipboardData?.items || []).filter(item => item.kind === 'file' && item.type.startsWith('image/')).map(item => item.getAsFile()).filter(Boolean);
-  if (files.length) { event.preventDefault(); attachScreenshots(files); }
+  const files = Array.from(event.clipboardData?.items || []).filter(item => item.kind === 'file').map(item => item.getAsFile()).filter(Boolean);
+  if (files.length) { event.preventDefault(); attachFiles(files); }
 });
 const composer = document.querySelector('.composer');
 composer.addEventListener('dragover', event => {
@@ -746,7 +918,7 @@ composer.addEventListener('dragover', event => {
 composer.addEventListener('dragleave', () => composer.classList.remove('drag-over'));
 composer.addEventListener('drop', event => {
   composer.classList.remove('drag-over');
-  if (event.dataTransfer?.files.length) { event.preventDefault(); attachScreenshots(event.dataTransfer.files); }
+  if (event.dataTransfer?.files.length) { event.preventDefault(); attachFiles(event.dataTransfer.files); }
 });
 // 참고 그림 올리기(ADR-074 보충): 그림 바이트를 토큰과 함께 보내고, 받은 답이 들어간 대화를 다시 그린다.
 $('attach').addEventListener('click', () => { if (!busy) $('attach-file').click(); });
@@ -837,6 +1009,74 @@ function paintMemories(memories) {
     row.append(text, remove); $('memories').append(row);
   }
   if (!Object.keys(memories).length) $('memories').append(node('small', '', '저장한 기억이 없습니다. 예: 선호언어 = 한국어'));
+}
+// ── 뒤 작업(ADR-101): 창을 닫아도 서버가 끝까지 하고, 끝나면 그 대화에 답을 남긴다. 화면은 끝난 것을 한 번 알린다.
+const JOB_STATUS = {queued: '기다리는 중', running: '하는 중', paused: '잠시 멈춤(대화 먼저)', done: '끝남', failed: '실패', cancelled: '취소함', interrupted: '끊김(ALEX 재시작)'};
+const JOB_RETRY = new Set(['failed', 'cancelled', 'interrupted']);
+const JOB_ENDED = new Set(['done', 'failed', 'cancelled', 'interrupted']);
+async function submitJob(text) {
+  if (busy || !state || tokenExpired || appStopped) return;
+  if (!text) { notice('뒤에서 할 일을 입력창에 쓰고 시계 버튼을 누르세요. 예: /build 테트리스 만들어 줘'); return; }
+  if (openProject) { notice('뒤 작업은 대화 안에서 맡길 수 있습니다. 대화를 하나 연 뒤 보내 주세요.'); return; }
+  if (pendingAttachments.length) { notice('뒤 작업에는 첨부를 붙일 수 없습니다. 첨부는 보통 전송으로 보내 주세요.'); return; }
+  // 끝났을 때 창이 뒤에 있어도 알 수 있게 — 처음 한 번만 묻는다(버튼을 누른 순간이어야 브라우저가 허락을 묻는다).
+  try { if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission().catch(() => {}); } catch { /* 알림 없이도 화면 안내는 된다 */ }
+  try {
+    await api('/api/job', {message: text, session_id: state.session_id, permission});
+    $('input').value = ''; fitInput(); saveComposer();
+    notice('뒤에서 시작했습니다. 창을 닫아도 계속하고, 끝나면 이 대화에 답을 남기고 알려 드립니다. (계정 메뉴 → 뒤 작업)');
+    await refreshVisible(false);
+  } catch (e) { notice(e.message); }
+}
+function seenJobs() { try { return new Set(JSON.parse(localStorage.getItem('alex-seen-jobs') || '[]')); } catch { return new Set(); } }
+function announceJobs(jobs) {
+  const seen = seenJobs(), dayAgo = Date.now() - 86400000;
+  const fresh = jobs.filter(job => JOB_ENDED.has(job.status) && !seen.has(job.id) && Date.parse(job.finished || job.created) > dayAgo);
+  if (!fresh.length) return;
+  for (const job of fresh) { seen.add(job.id); if (job.session_id !== state?.session_id || openProject) unreadRooms.add(job.session_id); }
+  try { localStorage.setItem('alex-seen-jobs', JSON.stringify(Array.from(seen).slice(-200))); } catch { /* 이 브라우저에 못 남기면 다음에 한 번 더 알린다 */ }
+  const text = fresh.map(job => `뒤 작업 ${JOB_STATUS[job.status] || job.status}: ${job.title || job.request}`).join('\n');
+  notice(text + '\n(계정 메뉴 → 뒤 작업에서 대화로 갈 수 있습니다)');
+  try { if ('Notification' in window && Notification.permission === 'granted' && document.hidden) new Notification('ALEX', {body: text}); } catch { /* 화면 안내로 충분 */ }
+  paintRequestBadges();
+}
+function paintJobs(jobs) {
+  $('job-count').textContent = jobs.filter(job => !JOB_ENDED.has(job.status)).length || '';
+  $('jobs').replaceChildren();
+  for (const job of jobs) {
+    const row = node('div', 'job'), head = node('div', 'job-head');
+    const when = new Date(job.finished || job.started || job.created);
+    head.append(node('strong', '', job.request || '(내용 없음)'),
+      node('span', 'job-status ' + job.status, `${JOB_STATUS[job.status] || job.status} · ${when.toLocaleString('ko-KR', {month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit'})}`));
+    row.append(head);
+    if (job.title) row.append(node('small', 'muted', '대화: ' + job.title));
+    const detail = job.status === 'running' || job.status === 'paused' ? job.progress.slice(-600) : JOB_ENDED.has(job.status) ? job.result : '';
+    if (detail) row.append(node('pre', '', detail));
+    const actions = node('div', 'row'), open = node('button', 'secondary', '대화 열기'); open.type = 'button';
+    open.addEventListener('click', () => { $('jobs-dialog').close(); openSession(job.session_id).catch(e => notice(e.message)); });
+    actions.append(open);
+    if (JOB_RETRY.has(job.status)) {  // ADR-110: 끊기거나 실패한 일을 같은 대화·같은 요청으로 다시
+      const again = node('button', 'secondary', '다시 맡기기'); again.type = 'button';
+      again.addEventListener('click', async () => {
+        again.disabled = true;
+        try { await api('/api/job', {retry: job.id, session_id: job.session_id}); notice('같은 요청으로 다시 맡겼습니다.'); await refreshVisible(false); }
+        catch (e) { notice(e.message); again.disabled = false; }
+      });
+      actions.append(again);
+    }
+    if (!JOB_ENDED.has(job.status)) {
+      const stop = node('button', 'text-button danger-text', '중단'); stop.type = 'button';
+      stop.addEventListener('click', async () => {
+        if (!confirm('이 뒤 작업을 중단할까요? 파일 변경은 적용되지 않습니다.')) return;
+        stop.disabled = true;
+        try { await api('/api/cancel', {request_id: job.id}); await refreshVisible(false); } catch (e) { notice(e.message); stop.disabled = false; }
+      });
+      actions.append(stop);
+    }
+    row.append(actions); $('jobs').append(row);
+  }
+  if (!jobs.length) $('jobs').append(node('small', '', '맡긴 뒤 작업이 없습니다. 입력창에 쓰고 시계 버튼을 누르거나 /bg 요청 으로 맡깁니다.'));
+  announceJobs(jobs);
 }
 function paintTasks(tasks) {
   $('task-count').textContent = tasks.filter(t => t.status === 'open').length || '';
@@ -1144,8 +1384,40 @@ $('user-form').addEventListener('submit', async e => {
   } catch (err) { $('user-error').textContent = err.message; }
 });
 
+// ── 권한(ADR-095, 2026-10-18 사용자 "클라우드 LLM 처럼 선택해서"): 대화마다 읽기 전용 / 확인 후 실행 / 자동 실행.
+// 고르면 서버에 저장하고, 보낼 때도 함께 보낸다(기다리는 동안 바꿔도 그 요청은 보낼 때 권한). 새 대화는 언제나 '확인 후 실행'.
+const PERMISSIONS = {read: '읽기 전용', ask: '확인 후 실행', auto: '자동 실행'};
+let permission = 'ask';
+function paintPermission(mode) {
+  permission = PERMISSIONS[mode] ? mode : 'ask';
+  $('permission-label').textContent = PERMISSIONS[permission];
+  $('permission').dataset.mode = permission;
+  $('permission').title = `이 대화에서 ALEX 의 권한: ${PERMISSIONS[permission]}`;
+  $('permission-menu').querySelectorAll('[data-permission]').forEach(b => {
+    b.setAttribute('aria-checked', String(b.dataset.permission === permission));
+    if (b.dataset.permission === 'auto') b.disabled = !state?.is_admin;
+  });
+}
+function closePermissionMenu() { $('permission-menu').hidden = true; $('permission').setAttribute('aria-expanded', 'false'); }
+$('permission').addEventListener('click', e => {
+  e.stopPropagation();
+  const open = $('permission-menu').hidden;
+  $('permission-menu').hidden = !open; $('permission').setAttribute('aria-expanded', String(open));
+});
+document.addEventListener('click', e => { if (!$('permission-menu').hidden && !e.target.closest('.perm')) closePermissionMenu(); });
+$('permission-menu').querySelectorAll('[data-permission]').forEach(b => b.addEventListener('click', async () => {
+  const mode = b.dataset.permission, sid = state?.session_id, previous = permission;
+  closePermissionMenu();
+  if (!sid || mode === previous) return;
+  paintPermission(mode);
+  try { await api('/api/session/permission', {session_id: sid, permission: mode}); }
+  catch (e) { if (state?.session_id === sid) paintPermission(previous); notice(e.message); }
+}));
+
 // ── 계정 메뉴·로그인
 function closeMenu() { $('account-menu').hidden = true; $('account-button').setAttribute('aria-expanded', 'false'); }
+$('live-open').addEventListener('click', () => { closeMenu(); window.open('/live', '_blank', 'noopener'); });  // ADR-111
+$('code-open').addEventListener('click', () => { closeMenu(); window.open('/code', '_blank', 'noopener'); });  // ADR-112
 $('account-button').addEventListener('click', e => {
   e.stopPropagation();
   const open = $('account-menu').hidden;
@@ -1199,7 +1471,7 @@ $('context-close').addEventListener('click', () => setContextPanel(false));
 document.addEventListener('keydown', e => {
   if (e.key !== 'Escape' || document.querySelector('dialog[open]')) return;
   if (document.querySelector('.context-panel.open')) setContextPanel(false);
-  closeMenu(); setSidebar(false);
+  closeMenu(); closePermissionMenu(); setSidebar(false);
 });
 function filterSessions() {
   const query = $('session-search').value.trim().toLowerCase();

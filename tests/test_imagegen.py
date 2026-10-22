@@ -26,7 +26,8 @@ MP4 = b"\x00\x00\x00\x18ftypmp42" + b"fake-mp4-body"
 
 
 class OwnedEngineCloseTests(unittest.TestCase):
-    def test_start_keeps_engine_default_vram_reservation(self):
+    def test_start_reserves_1_5gb_of_vram(self):
+        # 10-04 사용자 요청으로 뺐다가(GPU_STABILITY_FIX_20261004), 10-19 23:53 GPU lost 뒤 사용자 "1.5gb만 지키면 될 듯"(10-20)으로 다시.
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             for relative in ("python_embeded/python.exe", "ComfyUI/main.py"):
@@ -38,7 +39,7 @@ class OwnedEngineCloseTests(unittest.TestCase):
                     patch("jarvis.imagegen.subprocess.Popen") as popen:
                 generator.ensure_running()
             args = popen.call_args.args[0]
-            self.assertNotIn("--reserve-vram", args)
+            self.assertEqual(args[args.index("--reserve-vram") + 1], "1.5")
 
     def test_termination_timeout_kills_and_waits_for_owned_child(self):
         generator = ComfyImageGenerator(Path("unused"))
@@ -308,6 +309,15 @@ class CoreImageTests(unittest.TestCase):
         self.core = make_core(self.root, self.gen, self.writer)
         self.sid = self.core.get_or_create_session(False)
 
+    def test_the_answer_names_the_model_and_how_to_switch(self):
+        # 2026-10-18 사용자: 어떤 모델로 그렸는지 보이고 'Qwen으로 다시' 처럼 쉽게 바꾸게(그 문구만 고침)
+        reply, _ = self.core.handle(self.sid, "창가에서 자는 고양이 그려줘")
+        self.assertIn("그렸습니다 — 모델 Z-Image Turbo", reply)
+        switch = next(line for line in reply.splitlines() if line.startswith("다른 모델로: "))
+        self.assertIn("'Qwen으로 다시 그려줘'", switch)
+        self.assertIn("'애니로 다시 그려줘'", switch)
+        self.assertNotIn("Z-Image로", switch)  # 방금 쓴 모델은 빼고 안내한다
+
     def test_a_natural_request_draws_and_shows_the_picture(self):
         reply, decision = self.core.handle(self.sid, "창가에서 자는 고양이 그려줘")
         self.assertEqual(decision.destination, Destination.TOOL_IMAGE_GEN)
@@ -547,7 +557,7 @@ class ModelRouterTests(unittest.TestCase):
         graph = self.fake.prompts[-1]
         self.assertEqual(graph["1"]["inputs"]["unet_name"], QWEN_UNET)
         self.assertIn("TextEncodeQwenImage21", self.kinds(graph))
-        self.assertIn("Qwen-Image 2.1", self.writer.seen[0])
+        self.assertIn("Qwen-Image 2.1", self.writer.seen[-1])  # seen[0] 은 대화 모델에게 그림 모델을 묻는 것(ADR-107)
 
     def test_tags_with_a_minor_word_fall_back_to_z_image(self):
         self.writer.reply = "1girl, school uniform, classroom"

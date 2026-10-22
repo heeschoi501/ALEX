@@ -393,6 +393,15 @@ class OllamaProvider(BaseLLMProvider):
             raise ProviderError("Ollama streaming 응답에 content 가 없습니다.")
         return content
 
+    def chat_step(self, messages: Sequence[Message], tools: list | None = None, on_chunk: object = None) -> tuple[str, list]:
+        """코딩 하네스(ADR-112)의 한 차례 — (답 글, 모델이 부른 도구들). 둘 다 비었으면 한도 때문인지 알려 준다.
+        도구를 모르는 모델이면 ToolsUnsupported."""
+        content = self._collect_stream(messages, on_chunk, tools=tools)
+        calls = list(self.last_tool_calls)
+        if not content.strip() and not calls:
+            self._raise_if_exhausted()
+        return content, calls
+
     def _generate_with_tools(self, messages: Sequence[Message], tools: list, runner, callback: object) -> str:
         """모델이 도구를 부르면 앱(runner)이 실행하고, 결과를 tool 메시지로 돌려준 뒤 다시 묻는다(ADR-056).
 

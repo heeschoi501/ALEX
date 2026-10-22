@@ -25,15 +25,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import re
 import secrets
+import shutil
 import os
 from pathlib import Path
 import time
 from urllib.parse import urlparse, parse_qs, unquote
 import webbrowser
 import threading
-from typing import Any
+from typing import Any, Callable
 
-from .app import (build_core, build_providers, build_summary_provider, engine_context_limits, handle_command,
+from .app import (auto_apply_proposals, build_core, build_providers, build_summary_provider, engine_context_limits, handle_command,
                   provider_runtime_settings, CONTEXT_CHAR_BUDGET_BY_PROFILE)
 from .config import ConfigError, Settings, load_settings, validate, LOCAL_FIELDS, local_config_path
 from .core import JarvisCore
@@ -48,6 +49,12 @@ from .vision import ImageAttachmentStore, MAX_ATTACHMENTS
 from .knowledge import KnowledgeError, MAX_DOCUMENT_BYTES, import_notice
 from . import accounts
 from .storage import OWNER, StorageError, UserAccount
+from .cloudagent import parse_request as parse_cloud_request
+from .fetcher import downloaded_path
+from .live import (LANG_LABEL, TRANSLATE, LiveError, SpeechRecognizer, check_wav, clean_translation, meaningful, tidy,
+                   translate_messages)
+from .permissions import (DEFAULT_PERMISSION, PERMISSION_MODES, READ_ONLY_BLOCKED, READ_ONLY_BLOCKED_COMMANDS,
+                          clean_permission)
 
 # 이 서버가 **불러온** 코드의 지문. 모듈을 읽는 순간에 잰다 — /health 를 받을 때 재면
 # 그 사이 디스크에서 바뀐 코드를 자기 것처럼 보고하게 된다. 런처가 이 값으로 옛 서버를 알아본다.
@@ -61,12 +68,18 @@ MAX_BODY_BYTES = 64_000
 
 STATIC = Path(__file__).with_name("static")
 PAGE = (STATIC / "index.html").read_text(encoding="utf-8")
+LIVE_PAGE = (STATIC / "live.html").read_text(encoding="utf-8")  # 실시간 통역(ADR-111)
+CODE_PAGE = (STATIC / "code.html").read_text(encoding="utf-8")  # 코딩 세션 화면(ADR-112)
+CODE_FILES = {"/code.js": "text/javascript; charset=utf-8", "/code.css": "text/css; charset=utf-8"}
+LIVE_FILES = {"/live.js": "text/javascript; charset=utf-8", "/live-worklet.js": "text/javascript; charset=utf-8",
+              "/live.css": "text/css; charset=utf-8"}
 
 # 여러 사람이 쓰기(2026-10-11). 이 PC 에서 열면 주인(관리자)으로 바로 들어오고, 밖(Tailscale)에서는 로그인한다.
 SESSION_COOKIE = "alex_session"
 MANUAL_COOKIE = "alex_manual"  # 이 PC 에서 '사용자 전환'을 누른 브라우저 — 주인으로 자동 로그인하지 않는다
 LOGIN_LOCK_AFTER, LOGIN_LOCK_SECONDS = 5, 60
-ARTIFACT_RE = re.compile(r"\]\(alex-(?:image|video|document):([A-Za-z0-9._-]{1,120})\)")
+ARTIFACT_RE = re.compile(r"\]\(alex-(?:image|video|document|download):([A-Za-z0-9._%-]{1,600})\)")
+MAX_CHAT_DOCUMENTS = 5  # 한 번에 첨부하는 문서 수(ADR-096)
 # 관리자가 아닌 사용자가 쓸 수 있는 명령. 이 PC 의 파일·설정·학습·개발 도구에 손대는 명령은 뺀다.
 MEMBER_COMMANDS = frozenset({
     "/help", "/new", "/use", "/rename", "/delete-session", "/sessions", "/summary", "/export", "/document",
@@ -75,8 +88,10 @@ MEMBER_COMMANDS = frozenset({
     "/ask-knowledge", "/search", "/web", "/good", "/bad",
 })
 def provisional_title(text: str) -> str:
-    """첫 답이 오기 전까지 쓸 임시 제목 — 첫 메시지를 한 줄로 줄이고 40자 넘으면 낱말 경계에서 자른다."""
-    clean = " ".join(text.split())
+    """첫 답이 오기 전까지 쓸 임시 제목 — 첫 메시지를 한 줄로 줄이고 40자 넘으면 낱말 경계에서 자른다.
+    문서를 붙였으면 '[첨부 문서: …]' 표시 줄은 빼고, 질문이 없으면 첫 문서 이름으로."""
+    documents = re.findall(r"(?m)^\[첨부 문서: (.+?) · \d+쪽 · [\d,]+자\]$", text)
+    clean = " ".join(re.sub(r"(?m)^\[첨부 문서: .+\]$", "", text).split()) or (documents[0] if documents else "")
     if len(clean) <= 40:
         return clean
     cut = clean[:40]
@@ -113,6 +128,19 @@ class Ticket:
     request_id: str = field(default_factory=lambda: secrets.token_hex(12))
     cancel: threading.Event = field(default_factory=threading.Event)
     session_id: str = ""
+    background: bool = False  # 뒤 작업(ADR-101): 브라우저 연결과 상관없이 끝까지, 기다리는 대화 요청보다 뒤에
+    external: bool = False    # 클라우드가 일하는 중(ADR-102) — 모델 잠금 없이 '하는 중'
+
+
+MAX_SERVED_DOWNLOAD = 2_000_000_000  # 화면으로 내주는 받은 파일 상한(그보다 크면 폴더에서 직접)
+JOB_KEEP = 20                # 사람마다 남겨 두는 뒤 작업 기록 수
+JOB_PROGRESS_CHARS = 1500    # 진행 중 화면에 보이는 마지막 글자 수
+JOB_RESULT_CHARS = 600       # 끝난 작업 목록에 보이는 답 앞부분
+JOB_MESSAGE_CHARS = 4000     # '다시 맡기기'(ADR-110)용으로 남기는 요청 원문
+JOB_STATE_CHARS = 9500       # app_state 한 칸(1만 자) 안에 — 넘으면 끝난 것의 진행 글부터 줄이고, 그래도 넘으면 오래된 것부터 뺀다
+# 뒤 작업이 대화에 비켜 준 뒤 되돌리지 않는 코어 값 — 끼어든 대화가 바꾼 작업 폴더는 그대로 둔다(ADR-110)
+YIELD_KEEP = ("project_root", "workspace_editor", "vscode_launcher", "project_tree_tool", "project_context_tool",
+              "file_search_tool", "file_read_tool", "_knowledge_store")
 
 
 def _provider_backend(provider: object) -> str:
@@ -151,6 +179,13 @@ class WebAppState:
     exchanges: dict[tuple[str, str], tuple[Any, Any]] = field(default_factory=dict)
     login_failures: dict[str, tuple[int, float]] = field(default_factory=dict)
     login_lock: threading.Lock = field(default_factory=threading.Lock)
+    year_report: threading.Thread | None = None
+    jobs: dict[str, dict] = field(default_factory=dict)       # 뒤 작업 기록(id → 상태). 사람마다 app_state 'jobs:<id>' 에도
+    jobs_loaded: set[str] = field(default_factory=set)
+    # 실시간 통역(ADR-111): 받아쓰기 일꾼(처음 쓸 때 띄움), 방마다 앞 발화 두 개
+    speech: SpeechRecognizer = field(default_factory=lambda: SpeechRecognizer(Path(__file__).resolve().parents[2] / "tools" / "stt"))
+    live_history: dict[str, list[str]] = field(default_factory=dict)
+    code: Any = None   # 코딩 세션(ADR-112 — OpenCode 서버 API 와 같은 일, harness.sessions.CodeSessions)
 
     def owner_viewer(self) -> Viewer:
         return Viewer(self.core.storage.get_user(OWNER))  # type: ignore[arg-type]
@@ -187,10 +222,313 @@ class WebAppState:
             return {"running": self.running is not None or self.active_id is not None,
                     "waiting": max(0, len(self.queue) - (1 if self.running is not None else 0)),
                     "position": mine,
-                    "requests": [{"request_id": t.request_id, "session_id": t.session_id,
-                                  "status": "running" if t is self.running else "queued",
+                    "requests": [{"request_id": t.request_id, "session_id": t.session_id, "background": t.background,
+                                  "status": "running" if t is self.running or t.external else "queued",
                                   "position": 0 if t is self.running else max(i, 1)}
                                  for i, t in enumerate(self.queue) if t.user_id == viewer.id]}
+
+    # ---------------------------------------------------------------- 차례(대기열)
+    def may_run(self, ticket: Ticket) -> bool:
+        """queue_cv 를 잡은 채 부른다. 대화 요청이 먼저 — 기다리는 뒤 작업은 대화 요청이 하나도 없을 때 들어간다
+        (이미 도는 뒤 작업은 끝까지 간다. 모델은 한 번에 한 요청만)."""
+        ahead = self.queue[:self.queue.index(ticket)]
+        if ticket.background:
+            return not any(not t.background for t in self.queue) and not any(t.background for t in ahead)
+        return not any(not t.background for t in ahead)
+
+    def position(self, ticket: Ticket) -> int:
+        """queue_cv 를 잡은 채 부른다. 이 요청보다 먼저 처리될 요청 수(최소 1 — 부를 때는 이미 못 들어간 것)."""
+        ahead = self.queue[:self.queue.index(ticket)]
+        if ticket.background:
+            count = sum(1 for t in self.queue if t is not ticket and (not t.background or t in ahead or t is self.running))
+        else:
+            count = sum(1 for t in ahead if not t.background or t is self.running)
+        return max(count, 1)
+
+    def wait_turn(self, ticket: Ticket, on_position=None) -> bool:
+        """차례가 오면 모델 잠금(lock)을 잡고 True. 기다리는 동안 순번이 바뀌거나 10초마다 on_position(순번)."""
+        last, sent_at = None, 0.0
+        while True:
+            with self.queue_cv:
+                if ticket.cancel.is_set() or self.shutting_down:
+                    return False
+                if self.may_run(ticket) and self.lock.acquire(blocking=False):
+                    return True
+                position = self.position(ticket)
+            now = time.monotonic()
+            if on_position is not None and (position != last or now - sent_at > 10):
+                on_position(position)
+                last, sent_at = position, now
+            with self.queue_cv:
+                self.queue_cv.wait(timeout=1.0)
+
+    @contextmanager
+    def ticket_running(self, ticket: Ticket, kind: str, on_chunk):
+        """차례가 온 요청(lock 을 잡은 상태)을 처리하는 동안 공유 콜백·취소 신호를 이 요청 것으로 바꾼다.
+        끝나면 되돌리고 잠금을 푼다. 기다리는 동안 엔진이 바뀌었을 수 있으니 지금의 모델들을 여기서 잡는다."""
+        core = self.core
+        previous = core.response_chunk_callback
+        previous_command_cancel = getattr(core, "command_cancel_event", None)
+        local = {p for p in core.providers.values() if isinstance(p, OllamaProvider)}
+        if isinstance(core.local_summarizer, OllamaProvider):
+            local.add(core.local_summarizer)
+        previous_cancel = {p: p.cancel_event for p in local}
+        self.running = ticket
+        self.active_id, self.active_kind = ticket.request_id, kind
+        self.cancel_event = ticket.cancel
+        core.response_chunk_callback = on_chunk
+        core.command_cancel_event = ticket.cancel
+        for p in local:
+            p.cancel_event = ticket.cancel
+            p.last_metrics = {}
+        try:
+            yield local
+        finally:
+            core.response_chunk_callback = previous
+            core.command_cancel_event = previous_command_cancel
+            for p, event in previous_cancel.items():
+                p.cancel_event = event
+            self.running = None
+            self.active_id = self.active_kind = None
+            self.lock.release()
+
+    # ---------------------------------------------------------------- 뒤 작업(ADR-101)
+    def start_job(self, viewer: Viewer, session_id: str, message: str, permission: str | None) -> dict:
+        """대기열에 넣고 바로 돌아온다. 브라우저를 닫아도 계속하고, 끝나면 그 대화에 답이 남고 화면이 알린다."""
+        self.job_list(viewer)  # 예전 기록을 먼저 읽어 둔다(저장할 때 덮지 않게)
+        ticket = Ticket(viewer.id, session_id=session_id, background=True)
+        now = datetime.now(timezone.utc).isoformat()
+        job = {"id": ticket.request_id, "owner": viewer.id, "session_id": session_id,
+               "title": self.core.storage.session_title(session_id) or "", "request": message.strip()[:200],
+               "status": "queued", "created": now, "started": "", "finished": "", "progress": "", "result": "",
+               "message": message.strip()[:JOB_MESSAGE_CHARS], "permission": permission}
+        with self.queue_cv:
+            self.queue.append(ticket)
+            self.jobs[ticket.request_id] = job
+            self.queue_cv.notify_all()
+        self._save_jobs(viewer.id)
+        accepted = self._public_job(job)
+        threading.Thread(target=self._run_job, args=(ticket, viewer, message, permission), daemon=True,
+                         name=f"alex-job-{ticket.request_id[:6]}").start()
+        return accepted
+
+    def _run_job(self, ticket: Ticket, viewer: Viewer, message: str, permission: str | None) -> None:
+        job = self.jobs[ticket.request_id]
+
+        def chunk(text: str) -> None:
+            job["progress"] = (job["progress"] + text)[-JOB_PROGRESS_CHARS:]
+        if parse_cloud_request(message) is not None:
+            self._run_cloud_job(ticket, viewer, message, permission, job, chunk)
+            return
+        try:
+            if not self.wait_turn(ticket):
+                job["status"] = "cancelled"
+                return
+            job.update(status="running", started=datetime.now(timezone.utc).isoformat())
+            self._save_jobs(viewer.id)
+            with self.ticket_running(ticket, "background", chunk) as local:
+                self.core.turn_yield = self._turn_yield(ticket, job, chunk, local)
+                try:
+                    result = self.process(message, None, viewer=viewer, session_id=ticket.session_id, permission=permission)
+                finally:
+                    self.core.turn_yield = None
+            job.update(status="done", result=str(result.get("response", ""))[:JOB_RESULT_CHARS],
+                       title=self.core.storage.session_title(ticket.session_id) or job["title"])
+        except GenerationCancelled:
+            job["status"] = "cancelled"
+        except Exception as exc:  # noqa: BLE001 — 뒤 작업의 실패는 기록하고 그 대화에 알린다
+            self.core.logger.exception("background job failed")
+            job.update(status="failed", result=str(exc)[:JOB_RESULT_CHARS])
+            try:
+                self.core.storage.add_message(ticket.session_id, "assistant",
+                                              f"뒤 작업이 실패했습니다: {job['request']}\n\n{exc}")
+            except StorageError:
+                pass
+        finally:
+            job["finished"] = datetime.now(timezone.utc).isoformat()
+            with self.queue_cv:
+                if ticket in self.queue:
+                    self.queue.remove(ticket)
+                self.queue_cv.notify_all()
+            self._save_jobs(viewer.id)
+            self.archive_sync()
+
+    def _run_cloud_job(self, ticket: Ticket, viewer: Viewer, message: str, permission: str | None, job: dict,
+                       chunk) -> None:
+        """클라우드로 넘기기(ADR-102)를 세 단계로: 준비(잠금) → 클라우드가 일함(잠금 없음 — 그동안 ALEX 와 대화 가능)
+        → ALEX 확인·수정안(잠금). 실패·중단해도 복사본을 지우고 그 대화에 이유를 남긴다."""
+        sid, task, run, error = ticket.session_id, None, None, ""
+        try:
+            if not self.wait_turn(ticket):
+                job["status"] = "cancelled"
+                return
+            job.update(status="running", started=datetime.now(timezone.utc).isoformat())
+            self._save_jobs(viewer.id)
+            with self.ticket_running(ticket, "background", chunk), self.acting_as(viewer, sid):
+                self.core.permission_mode = (self.set_permission(viewer, sid, permission) if permission is not None
+                                             else self.session_permission(viewer, sid))
+                try:
+                    task = self.core.cloud_prepare(sid, message)
+                finally:
+                    self.core.permission_mode = DEFAULT_PERMISSION
+            if isinstance(task, str):
+                job.update(status="done", result=task[:JOB_RESULT_CHARS])
+                task = None
+                return
+            ticket.external = True
+            try:
+                run = self.core.cloud_run(task, ticket.cancel, chunk)
+            except GenerationCancelled:
+                error = "사용자가 중단했습니다."
+            except Exception as exc:  # noqa: BLE001 — 이유를 남기고 복사본은 아래에서 지운다
+                self.core.logger.exception("cloud agent failed")
+                error = str(exc)
+            finally:
+                ticket.external = False
+            # 마무리는 중단됐어도 해야 한다(복사본 지우기·답 남기기) — 취소 신호 없는 새 차례로
+            ticket.cancel = threading.Event()
+            if not self.wait_turn(ticket):  # 앱을 끄는 중 — 복사본만 지우고(아래 finally) 끝낸다
+                job["status"] = "interrupted"
+                return
+            with self.ticket_running(ticket, "background", chunk):
+                answer = self.core.cloud_finish(sid, task, run, error)
+            task = None
+            job.update(status="cancelled" if error == "사용자가 중단했습니다." else "done",
+                       result=answer[:JOB_RESULT_CHARS])
+        except Exception as exc:  # noqa: BLE001
+            self.core.logger.exception("cloud job failed")
+            job.update(status="failed", result=str(exc)[:JOB_RESULT_CHARS])
+        finally:
+            if task is not None:  # 준비 뒤 예기치 않게 끝났으면 복사본만이라도 지운다
+                shutil.rmtree(task.temp, ignore_errors=True)
+            job["finished"] = datetime.now(timezone.utc).isoformat()
+            with self.queue_cv:
+                if ticket in self.queue:
+                    self.queue.remove(ticket)
+                self.queue_cv.notify_all()
+            self._save_jobs(viewer.id)
+            self.archive_sync()
+
+    def _turn_yield(self, ticket: Ticket, job: dict, chunk, local) -> Callable[[], None]:
+        """뒤 작업이 단계 사이(긴 문서 요약 조각·RTL 회차·EDA 흐름)에서 부른다(ADR-110). 기다리는 대화 요청이 있으면 모델 잠금을
+        잠시 내주고, 대화가 다 끝나면 다시 잡는다. 코어는 하나라서 끼어든 대화가 바꾼 요청별 값(권한·직전 문답·이번 차례 안내·
+        콜백·취소 신호 …)을 되돌려 뒤 작업이 제 상태로 이어 가게 한다. 끼어든 대화의 직전 문답은 그 방 몫으로 남긴다."""
+        core = self.core
+
+        def yield_turn() -> None:
+            with self.queue_cv:
+                if self.shutting_down or ticket.cancel.is_set() or not any(not t.background for t in self.queue):
+                    return
+            saved_core = dict(vars(core))
+            saved_web = (self.running, self.active_id, self.active_kind, self.cancel_event)
+            saved_exchange = (self.exchange_owner, self.exchange_session)
+            saved_cancel = {p: p.cancel_event for p in local}
+            chunk("\n[대화 요청이 와서 잠시 비켜 줍니다 — 끝나면 이어서 합니다]\n")
+            job["status"] = "paused"
+            self.running, self.active_id, self.active_kind = None, None, None
+            # 처리 안에서 'with self.lock' 으로 한 번 더 잡혀 있다(RLock) — 겹친 만큼 모두 놓았다가 그대로 되잡는다
+            # (threading.Condition 이 쓰는 것과 같은 _release_save/_acquire_restore).
+            held = self.lock._release_save()
+            with self.queue_cv:
+                self.queue_cv.notify_all()
+            while True:
+                with self.queue_cv:
+                    if not any(not t.background for t in self.queue) and self.lock.acquire(blocking=False):
+                        self.lock.release()
+                        break
+                    self.queue_cv.wait(timeout=1.0)
+            self.lock._acquire_restore(held)
+            if (self.exchange_owner, self.exchange_session) != saved_exchange and self.exchange_session:
+                self.exchanges[(self.exchange_owner, self.exchange_session)] = (core.last_exchange, core.last_route_event_id)
+            self.exchanges.pop(saved_exchange, None)
+            kept = {name: getattr(core, name) for name in YIELD_KEEP if hasattr(core, name)}
+            core.__dict__.update(saved_core)
+            core.__dict__.update(kept)
+            self.exchange_owner, self.exchange_session = saved_exchange
+            self.running, self.active_id, self.active_kind, self.cancel_event = saved_web
+            for provider, event in saved_cancel.items():
+                provider.cancel_event = event
+            job["status"] = "running"
+            chunk("[이어서 합니다]\n")
+        return yield_turn
+
+    # ---------------------------------------------------------------- 실시간 통역(ADR-111)
+    def live_start(self, viewer: Viewer) -> dict:
+        """통역 한 번 = 새 대화 하나('실시간 통역 10-22 15:30'). 받아쓰기 일꾼을 미리 띄운다."""
+        if not self.speech.available():
+            raise ValueError("받아쓰기 도구가 설치되어 있지 않습니다(C:\\ALEX\\tools\\stt — ADR-111).")
+        sid = self.core.storage.create_session(viewer.id)
+        self.core.storage.rename_session(sid, f"실시간 통역 {datetime.now():%m-%d %H:%M}")
+        try:
+            self.speech.warm()
+        except LiveError as exc:
+            raise ValueError(str(exc)) from exc
+        return {"session_id": sid, "languages": "중국어·영어·일본어 → 한국어"}
+
+    def live_translate(self, viewer: Viewer, session_id: str, text: str, lang: str) -> str:
+        """모델 잠금을 잡은 상태에서 부른다. 생각 끈 대화 모델로 자막 한두 줄."""
+        history = self.live_history.setdefault(session_id, [])
+        try:
+            glossary = self.core.storage.list_memories(owner=viewer.id)
+        except StorageError:
+            glossary = {}
+        reply = self.core.local_summarizer.generate(translate_messages(text, lang, history, glossary))
+        history.append(text)
+        del history[:-2]
+        return clean_translation(reply)
+
+    def job_message(self, viewer: Viewer, job_id: str) -> tuple[str, str, str | None]:
+        """'다시 맡기기'(ADR-110) — 끝나지 못한 이 사람의 뒤 작업의 (대화, 요청 원문, 권한)."""
+        self.job_list(viewer)
+        job = self.jobs.get(str(job_id))
+        if job is None or job.get("owner") != viewer.id:
+            raise ValueError("그 뒤 작업을 찾지 못했습니다.")
+        if job.get("status") not in ("failed", "cancelled", "interrupted"):
+            raise ValueError("끝나지 못한 뒤 작업(실패·취소·끊김)만 다시 맡길 수 있습니다.")
+        message = job.get("message") or (job.get("request", "") if len(job.get("request", "")) < 200 else "")
+        if not message:
+            raise ValueError("이 뒤 작업은 요청 원문이 남아 있지 않아 다시 맡길 수 없습니다. 입력창에 다시 써 주세요.")
+        if not self.owns(viewer, job.get("session_id", "")):
+            raise ValueError("그 대화가 지워져 다시 맡길 수 없습니다.")
+        permission = job.get("permission")
+        return job["session_id"], message, permission if permission in (None, "read", "ask", "auto") else None
+
+    def job_list(self, viewer: Viewer) -> list[dict]:
+        """이 사람의 뒤 작업(최근 순, 최대 JOB_KEEP). ALEX 가 다시 시작되기 전에 끝나지 못한 것은 '끊김'."""
+        if viewer.id not in self.jobs_loaded:
+            self.jobs_loaded.add(viewer.id)
+            try:
+                saved = json.loads(self.core.storage.get_state(f"jobs:{viewer.id}") or "[]")
+            except (ValueError, StorageError):
+                saved = []
+            for job in saved if isinstance(saved, list) else []:
+                if isinstance(job, dict) and job.get("id") and job["id"] not in self.jobs:
+                    if job.get("status") in ("queued", "running", "paused"):
+                        job["status"] = "interrupted"
+                    self.jobs[job["id"]] = job
+        mine = [job for job in self.jobs.values() if job.get("owner") == viewer.id]
+        mine.sort(key=lambda job: job.get("created", ""), reverse=True)
+        return [self._public_job(job) for job in mine[:JOB_KEEP]]
+
+    def _public_job(self, job: dict) -> dict:
+        return {key: job.get(key, "") for key in ("id", "session_id", "title", "request", "status", "created", "started",
+                                                  "finished", "progress", "result")}
+
+    def _save_jobs(self, owner: str) -> None:
+        mine = sorted((job for job in self.jobs.values() if job.get("owner") == owner),
+                      key=lambda job: job.get("created", ""), reverse=True)[:JOB_KEEP]
+        # 한 칸 1만 자 제한(ADR-110 에서 발견 — 진행 글 1,500자짜리 작업이 몇 개만 쌓여도 저장이 실패했다):
+        # 끝난 작업은 진행 글을 빼고, 끝난 것(done)은 원문도 빼고, 그래도 넘으면 오래된 것부터 뺀다.
+        mine = [{**job, "progress": "" if job.get("status") in ("done", "failed", "cancelled", "interrupted") else job.get("progress", ""),
+                 "message": "" if job.get("status") == "done" else job.get("message", "")} for job in mine]
+        text = json.dumps(mine, ensure_ascii=False)
+        while len(text) > JOB_STATE_CHARS and mine:
+            mine.pop()
+            text = json.dumps(mine, ensure_ascii=False)
+        try:
+            self.core.storage.set_state(f"jobs:{owner}", text)
+        except StorageError as exc:
+            self.core.logger.warning("뒤 작업 기록 저장 실패: %s", exc)
 
     @contextmanager
     def acting_as(self, viewer: Viewer, session_id: str = ""):
@@ -228,11 +566,81 @@ class WebAppState:
                 provider = OllamaProvider(self.settings.general_model, host=self.settings.ollama_host) if other == "ollama" else StrataProvider(self.settings.strata_model, host=self.settings.strata_host)
                 self.inactive_providers.append(provider)
                 self.core.local_engine_guard = self._check_inactive_engines
+        from .harness.mcp import MCPHub
+        from .harness.sessions import CodeSessions
+        logger = getattr(self.core, "logger", None)
+        hub = None
+        try:
+            hub = MCPHub.from_config(data_dir / "mcp.json")
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            if logger is not None:
+                logger.warning("MCP 설정을 읽지 못했습니다: %s", exc)
+        if hub is not None:
+            threading.Thread(target=hub.start, daemon=True, name="alex-mcp-start").start()
+        self.code = CodeSessions(lambda: self.core.providers.get(Destination.LOCAL_CODER), model_turn=self.code_turn,
+                                 store=data_dir / "code_sessions", fetch=self._code_fetch, search=self._code_search,
+                                 mcp=hub, logger=logger)
+
+    # ---------------------------------------------------------------- 코딩 세션(ADR-112)
+    @contextmanager
+    def code_turn(self, session):
+        """코딩 세션이 모델을 한 번 부르는 동안만 차례를 잡는다(대화 요청과 같은 대기열). 도구 실행·허락 기다리는 동안엔 내준다."""
+        ticket = Ticket(session.owner, session_id=session.id, cancel=session.cancel)
+        with self.queue_cv:
+            self.queue.append(ticket)
+            self.queue_cv.notify_all()
+        try:
+            if not self.wait_turn(ticket):
+                raise GenerationCancelled("코딩 작업을 중단했습니다.")
+            with self.ticket_running(ticket, "code", lambda _chunk: None):
+                yield
+        finally:
+            with self.queue_cv:
+                if ticket in self.queue:
+                    self.queue.remove(ticket)
+                self.queue_cv.notify_all()
+
+    def code_root(self, raw: Any) -> Path:
+        """코딩 세션 폴더 — 시작할 때 승인한 파일 루트 안만. 비우면 지금 프로젝트 폴더."""
+        approved = getattr(self.core, "_approved_file_root", None)
+        if approved is None:
+            raise ValueError("승인된 파일 루트가 없어 코딩 세션을 열 수 없습니다.")
+        if not raw:
+            return self.core.current_project_root() or approved
+        path = Path(str(raw))
+        path = (path if path.is_absolute() else approved / path).resolve()
+        if path != approved and approved not in path.parents:
+            raise ValueError("승인된 파일 루트 밖의 폴더는 열 수 없습니다.")
+        return path
+
+    def _code_fetch(self, url: str, _format: str = "markdown") -> str:
+        from .webread import WebError
+        if self.core.web_reader is None:
+            return "Error: web access is turned off in ALEX settings"
+        try:
+            page = self.core.web_reader.fetch(url)
+        except WebError as exc:
+            return f"Error: {exc}"
+        return (f"# {page.title}\n" if page.title else "") + f"{page.url}\n\n{page.text}" + (
+            "\n\n(page truncated)" if page.truncated else "")
+
+    def _code_search(self, query: str) -> str:
+        from .webread import WebError
+        if self.core.web_reader is None:
+            return "Error: web access is turned off in ALEX settings"
+        try:
+            results = self.core.web_reader.search(query)
+        except WebError as exc:
+            return f"Error: {exc}"
+        return "\n\n".join(f"{i}. {r.title}\n{r.url}\n{r.snippet}" for i, r in enumerate(results, 1)) or "No results found."
 
     def close_owned_services(self) -> dict[str, Any]:
         """Shared Ollama and pre-existing ComfyUI services remain independent."""
         services = {"ollama": "preserved", "comfyui": "not_owned"}
         warnings = []
+        self.speech.close()  # 실시간 통역 받아쓰기 일꾼(ADR-111)
+        if self.code is not None and self.code.mcp is not None:
+            self.code.mcp.close()
         if self.core.image_generator is not None:
             try:
                 if self.core.image_generator.close():
@@ -255,6 +663,7 @@ class WebAppState:
         mine = self.ticket_for(viewer.id, sid)
         data = {
             "session_id": sid, "title": storage.session_title(sid), "cloud_web_approval": False, "local_only": True,
+            "permission": self.session_permission(viewer, sid),
             "user": viewer.public(), "is_admin": viewer.is_admin,
             # 왼쪽 목록은 프로젝트 밖 대화만. 프로젝트 대화는 그 프로젝트 화면에 모인다(Claude·ChatGPT 프로젝트처럼).
             "sessions": [asdict(s) for s in storage.list_sessions(100, owner=viewer.id, project_id="")],
@@ -276,6 +685,7 @@ class WebAppState:
             # 다른 사람의 요청 번호는 내주지 않는다 — 중단은 자기 요청만
             "request_id": mine.request_id if mine else None,
             "queue": self.queue_info(viewer, sid),
+            "jobs": self.job_list(viewer),
             "active_kind": self.active_kind, "shutting_down": self.shutting_down,
         }
         if not viewer.is_admin:
@@ -387,14 +797,15 @@ class WebAppState:
             raise ValueError("설정 변경을 지원하지 않는 실행 모드입니다.")
         allowed = {"general_model", "coder_model", "desktop_general_model", "desktop_coder_model",
                    "auto_profile_models", "single_model_on_laptop", "local_max_output_tokens",
-                   "desktop_max_output_tokens", "ollama_think", "num_ctx", "local_backend", "strata_max_output_tokens"}
+                   "desktop_max_output_tokens", "ollama_think", "num_ctx", "local_backend", "strata_max_output_tokens",
+                   "strata_reasoning_effort"}
         if not isinstance(changes, dict) or not changes or any(k not in allowed or type(v) is not LOCAL_FIELDS[k] for k, v in changes.items()):
             raise ValueError("지원하지 않는 설정 또는 잘못된 형식입니다.")
         if changes.get("local_backend", self.settings.local_backend) == "strata" and any(k not in {
                 "local_max_output_tokens", "desktop_max_output_tokens", "ollama_think", "local_backend",
-                "strata_max_output_tokens"} for k in changes):
+                "strata_max_output_tokens", "strata_reasoning_effort"} for k in changes):
             raise ValueError("Strata는 서버에 설정된 모델 하나를 대화·코딩에 공유합니다. "
-                             "여기서는 출력 길이와 Thinking만 변경할 수 있습니다. "
+                             "여기서는 출력 길이와 Thinking·추론 수준만 변경할 수 있습니다. "
                              "다른 모델 선택은 Ollama 모드에서 지원합니다.")
         for k in changes:
             if "JARVIS_" + k.upper() in os.environ:
@@ -425,9 +836,9 @@ class WebAppState:
             for provider in {general, coder}:
                 if not provider.health_check():
                     raise ValueError(f"선택한 엔진/모델을 사용할 수 없습니다: {provider.name}")
-            # OpenCode must follow the selected coding engine/model as well.
+            # OpenCode는 새 모델로 다시 만든다. 하네스는 provider_getter로 아래의 교체를 그대로 따른다.
             worker = self.core.opencode_worker
-            if worker is not None:
+            if isinstance(worker, OpenCodeWorker):
                 if candidate.local_backend == "ollama":
                     candidate = replace(candidate, opencode_model=coder.model)
                 worker = OpenCodeWorker(worker.home, coder.model, context=coder.num_ctx,
@@ -499,6 +910,7 @@ class WebAppState:
                 raise ValueError("이 대화에 처리 중인 요청이 있습니다. 완료 또는 중단 후 삭제하세요.")
             if not self.owns(viewer, target) or not self.core.storage.delete_session(target):
                 raise ValueError("대화를 찾을 수 없습니다. 새로고침해 주세요.")
+        self.core.forget_session_documents(target)  # 그 대화에만 올린 문서도 지운다(ADR-096)
         for exchange in (self.core.last_exchange, *(e[0] for e in self.exchanges.copy().values())):
             if (exchange or {}).get("session_id") == target:
                 exchange.clear()  # 지운 대화의 질문·답을 메모리에도 남기지 않는다
@@ -513,8 +925,76 @@ class WebAppState:
             self.set_current(viewer, current)
         return {"deleted": target, "session_id": current}
 
+    def archive_sync(self) -> None:
+        """월별 대화 기록에 새 메시지를 덧붙인다(ADR-100). 기록이 실패해도 대화는 계속한다.
+        새해가 되어 지난해 보고서가 없으면 뒤에서 만든다 — 요약 한 번마다 lock 을 잡으므로 그사이 대화가 끼어들 수 있다."""
+        try:
+            self.core.archive.sync()
+            year = self.core.archive.needs_year_report()
+        except Exception as exc:  # noqa: BLE001 — 기록 실패가 답을 막지 않게
+            self.core.logger.warning("월별 대화 기록 실패: %s", exc)
+            return
+        if year and not (self.year_report and self.year_report.is_alive()):
+            self.year_report = threading.Thread(target=self._write_year_report, args=(year,), daemon=True,
+                                                name="alex-year-report")
+            self.year_report.start()
+
+    def _write_year_report(self, year: int) -> None:
+        summarizer = self.core.local_summarizer
+
+        def generate(messages):
+            with self.lock:
+                return summarizer.generate(messages)
+        try:
+            path = self.core.archive.year_report(year, generate)
+            self.core.logger.info("연간 보고서: %s", path)
+        except Exception as exc:  # noqa: BLE001 — 다음 대화 뒤에 다시 시도
+            self.core.logger.warning("연간 보고서 실패: %s", exc)
+
+    # ---------------------------------------------------------------- 대화에 올린 문서(ADR-096)
+    def attach_documents(self, sid: str, message: str, documents: list[str]) -> str:
+        """보내기 전 첨부(draft)를 이 대화의 자료로 옮기고, 질문 끝에 '[첨부 문서: …]' 줄을 붙인다(대화 기록에 남는다)."""
+        if message.strip().startswith("/"):
+            raise ValueError("문서 첨부와 명령어는 따로 보내 주세요.")
+        lines = []
+        for document_id in documents:
+            record = self.core.knowledge.move_scope(document_id, f"draft:{sid}", f"session:{sid}")
+            title = re.sub(r"[\[\]\r\n]", " ", record["title"])[:120]
+            lines.append(f"[첨부 문서: {title} · {record['pages']}쪽 · {record['chars']:,}자]")
+        return message.rstrip() + "\n\n" + "\n".join(lines)
+
+    def discard_document(self, viewer: Viewer, sid: Any, document_id: Any) -> dict[str, Any]:
+        """보내기 전에 첨부를 빼면 지운다(다른 곳에서도 쓰는 자료면 이 첨부에서만 뺀다)."""
+        if not isinstance(sid, str) or not self.owns(viewer, sid):
+            raise ValueError("대화를 찾을 수 없습니다. 새로고침해 주세요.")
+        self.core.knowledge.forget(str(document_id or ""), scope=f"draft:{sid}")
+        return {"discarded": document_id}
+
+    # ---------------------------------------------------------------- 권한(ADR-095)
+    def session_permission(self, viewer: Viewer, sid: str) -> str:
+        """이 대화의 권한. 저장된 값이 없거나 이 사람이 고를 수 없는 값이면 기본(확인 후 실행)."""
+        mode = self.core.storage.get_state(f"permission:{sid}") or DEFAULT_PERMISSION
+        if mode not in PERMISSION_MODES or (mode == "auto" and not viewer.is_admin):
+            return DEFAULT_PERMISSION
+        return mode
+
+    def set_permission(self, viewer: Viewer, sid: str, value: Any) -> str:
+        mode = clean_permission(value)
+        if mode == "auto" and not viewer.is_admin:
+            raise ValueError("자동 실행은 관리자만 고를 수 있습니다.")
+        if not self.owns(viewer, sid):
+            raise ValueError("대화를 찾을 수 없습니다. 새로고침해 주세요.")
+        self.core.storage.set_state(f"permission:{sid}", mode)
+        return mode
+
+    def reset_permission(self, sid: str) -> None:
+        """새 대화는 언제나 기본 권한으로 시작한다(빈 대화를 다시 쓸 때 예전 '자동 실행' 이 남지 않게)."""
+        if self.core.storage.get_state(f"permission:{sid}") not in (None, DEFAULT_PERMISSION):
+            self.core.storage.set_state(f"permission:{sid}", DEFAULT_PERMISSION)
+
     def process(self, message: str, attachments: list[str] | None = None, viewer: Viewer | None = None,
-                session_id: str | None = None) -> dict[str, Any]:
+                session_id: str | None = None, permission: str | None = None,
+                documents: list[str] | None = None) -> dict[str, Any]:
         viewer = viewer or self.owner_viewer()
         text = message.strip()
         if not text:
@@ -530,7 +1010,16 @@ class WebAppState:
             sid = session_id or self.current_session(viewer)
             if not self.owns(viewer, sid):
                 raise ValueError("대화를 찾을 수 없습니다. 새로고침해 주세요.")
-            return self._process_in_session(message, attachments, viewer, sid)
+            # 보낼 때 고른 권한으로 처리한다(기다리는 동안 바꿔도 이 요청에는 보낼 때 값). 끝나면 기본으로.
+            self.core.permission_mode = (self.set_permission(viewer, sid, permission) if permission is not None
+                                         else self.session_permission(viewer, sid))
+            try:
+                if documents:
+                    message = self.attach_documents(sid, message, documents)
+                return self._process_in_session(message, attachments, viewer, sid)
+            finally:
+                self.core.permission_mode = DEFAULT_PERMISSION
+                self.archive_sync()
 
     def _process_in_session(self, message: str, attachments: list[str] | None, viewer: Viewer,
                             sid: str) -> dict[str, Any]:
@@ -555,12 +1044,19 @@ class WebAppState:
                                for t in self.queue):
                             return {"response": "이 대화에 처리 중인 요청이 있습니다. 완료 또는 중단 후 삭제하세요.",
                                     "route": "command", "session_id": sid}
-                if not viewer.is_admin and text.split(None, 1)[0] not in MEMBER_COMMANDS:
+                command = text.split(None, 1)[0]
+                if not viewer.is_admin and command not in MEMBER_COMMANDS:
                     output, keep_running, new_session = "이 명령은 관리자만 쓸 수 있습니다.", True, sid
+                elif self.core.permission_mode == "read" and command in READ_ONLY_BLOCKED_COMMANDS:
+                    output, keep_running, new_session = READ_ONLY_BLOCKED, True, sid
                 else:
                     output, keep_running, new_session = handle_command(self.core, sid, text)
+                    if self.core.permission_mode == "auto":
+                        output = auto_apply_proposals(self.core, output)
                 if not self.owns(viewer, new_session):
                     new_session = sid
+                elif new_session != sid:
+                    self.reset_permission(new_session)  # /new·/use 로 옮긴 대화는 기본 권한에서
                 # 다른 방을 보는 동안 끝난 요청이 현재 대화 선택을 되돌리지 않는다.
                 if new_session != sid and self.current_session(viewer) == sid:
                     self.set_current(viewer, new_session)
@@ -941,6 +1437,39 @@ def _handler_factory(state: WebAppState):
             except (KnowledgeError, OSError) as exc:
                 self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
 
+        def _upload_document(self) -> None:
+            """채팅창 클립으로 문서 올리기(ADR-096) — 그 대화에서만 참고한다. 보내기 전에는 draft 로 두었다가 보낼 때 대화로 옮긴다.
+            누구나 자기 대화에. 모델 차례를 기다리지 않는다(PDF 는 별도 일꾼이 읽는다)."""
+            if not self._authorized():
+                self._json(HTTPStatus.FORBIDDEN, {"error": "invalid local token"})
+                return
+            viewer = self._require_viewer()
+            if viewer is None:
+                return
+            sid = self._session_header(viewer)
+            if sid is None:
+                self._json(HTTPStatus.CONFLICT, {"error": "대화가 바뀌었습니다. 새로고침 후 다시 올려 주세요."})
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid content length"})
+                return
+            if length <= 0 or length > MAX_DOCUMENT_BYTES:
+                self._json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "문서는 파일당 20MB 이하여야 합니다."})
+                return
+            try:
+                name = unquote(self.headers.get("X-File-Name", ""))
+                state.core.knowledge._validate_name(name)
+                data = self.rfile.read(length)
+                if len(data) != length:
+                    raise KnowledgeError("파일 전송이 완료되지 않았습니다.")
+                record = state.core.knowledge.import_bytes(data, name, source_path="대화 첨부", scope=f"draft:{sid}")
+                self._json(HTTPStatus.OK, {"document": {key: record[key] for key in ("id", "title", "pages", "chars")}
+                                           | {"empty_pages": json.loads(record["empty_pages"])}})
+            except (KnowledgeError, OSError) as exc:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+
         def _upload_knowledge(self) -> None:
             if not self._authorized():
                 self._json(HTTPStatus.FORBIDDEN, {"error": "invalid local token"})
@@ -993,6 +1522,20 @@ def _handler_factory(state: WebAppState):
                 body = PAGE.replace("__TOKEN__", html.escape(state.token, quote=True)).encode("utf-8")
                 self._send_bytes("text/html; charset=utf-8", body)
                 return
+            if self.path == "/live":  # 실시간 통역 화면(ADR-111) — 폰·AI 안경 브라우저용
+                self._send_bytes("text/html; charset=utf-8",
+                                 LIVE_PAGE.replace("__TOKEN__", html.escape(state.token, quote=True)).encode("utf-8"))
+                return
+            if self.path == "/code":  # 코딩 세션 화면(ADR-112) — 관리자만 쓰는 API 를 부른다
+                self._send_bytes("text/html; charset=utf-8",
+                                 CODE_PAGE.replace("__TOKEN__", html.escape(state.token, quote=True)).encode("utf-8"))
+                return
+            if self.path in CODE_FILES:
+                self._send_bytes(CODE_FILES[self.path], (STATIC / self.path[1:]).read_bytes())
+                return
+            if self.path in LIVE_FILES:
+                self._send_bytes(LIVE_FILES[self.path], (STATIC / self.path[1:]).read_bytes())
+                return
             if self.path in APP_FILES:  # 홈 화면에 설치하는 앱(PWA) 파일: 매니페스트·서비스 워커·아이콘
                 self._send_bytes(APP_FILES[self.path], (STATIC / self.path[1:]).read_bytes())
                 return
@@ -1012,6 +1555,9 @@ def _handler_factory(state: WebAppState):
                 remote = self._is_remote()
                 self._json(HTTPStatus.OK, {"user": viewer.public() if viewer else None, "remote": remote,
                                            "can_use_owner": not remote})
+                return
+            if route.startswith("/api/code/"):
+                self._code_api("GET", route, query, {})
                 return
             viewer = self._require_viewer(admin=route == "/api/users")
             if viewer is None:
@@ -1037,7 +1583,7 @@ def _handler_factory(state: WebAppState):
                     self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return
             name = query.get("name", [""])[0]
-            if route in ("/api/document", "/api/video", "/api/image") and (
+            if route in ("/api/document", "/api/video", "/api/image", "/api/downloaded") and (
                     not name or state.core.storage.artifact_owner(name) != viewer.id):
                 self._json(HTTPStatus.NOT_FOUND, {"error": route.rsplit("/", 1)[1] + " not found"})
                 return
@@ -1056,6 +1602,15 @@ def _handler_factory(state: WebAppState):
                     self._json(HTTPStatus.NOT_FOUND, {"error": "document not found"})
                     return
                 self._send_bytes(FORMATS[path.suffix[1:]], body, f'attachment; filename="{name}"')
+                return
+            if route == "/api/downloaded":
+                # ADR-104: 말로 내려받은 파일 — data/downloads 바로 아래의 실제 파일만, 언제나 '저장' 으로(브라우저에서 열지 않음)
+                path = downloaded_path(state.core.storage.db_path.parent / "downloads", unquote(name))
+                if path is None or path.stat().st_size > MAX_SERVED_DOWNLOAD:
+                    self._json(HTTPStatus.NOT_FOUND, {"error": "file not found"})
+                    return
+                self._send_bytes("application/octet-stream", path.read_bytes(),
+                                 "attachment; filename*=UTF-8''" + name)
                 return
             if route == "/api/video":
                 # ADR-075: 앱이 만든 MP4 만 — 이름 모양을 확인하고 data/videos 바로 아래에서만 찾는다.
@@ -1101,26 +1656,223 @@ def _handler_factory(state: WebAppState):
             self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
         # ------------------------------------------------------------ 대화(대기열)
+        def _live_utterance(self) -> None:
+            """실시간 통역의 말 한 토막(ADR-111): WAV → 받아쓰기(모델 잠금 없이, CPU) → heard → (한국어가 아니면) 차례를 기다려
+            번역 → translation. 줄마다 JSON(NDJSON). 기록을 켜면 그 통역 대화에 원문·번역을 남긴다."""
+            if not self._authorized():
+                self._json(HTTPStatus.FORBIDDEN, {"error": "invalid local token"})
+                return
+            viewer = self._require_viewer()
+            if viewer is None:
+                return
+            if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "audio/wav":
+                self._json(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, {"error": "audio/wav 만 받습니다."})
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = -1
+            if not 0 < length <= 2_000_000:
+                self._json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "소리 토막이 비었거나 너무 큽니다."})
+                return
+            data = self.rfile.read(length)
+            sid = self.headers.get("X-Live-Session", "")
+            if not state.owns(viewer, sid):
+                self._json(HTTPStatus.CONFLICT, {"error": "통역 대화를 찾지 못했습니다. 다시 시작해 주세요."})
+                return
+            try:
+                check_wav(data)
+            except ValueError as exc:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            if state.shutting_down:
+                self._json(HTTPStatus.CONFLICT, {"error": "앱을 종료하는 중입니다."})
+                return
+            record = self.headers.get("X-Live-Record", "1") == "1"
+            ticket, disconnected = None, False
+
+            def emit(payload: dict) -> None:
+                nonlocal disconnected
+                if disconnected:
+                    return
+                try:
+                    self.wfile.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    disconnected = True
+                    if ticket is not None:
+                        ticket.cancel.set()
+            self.send_response(HTTPStatus.OK)
+            self._security_headers("application/x-ndjson; charset=utf-8")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            try:
+                text, lang, took = state.speech.recognize(data)
+                text = tidy(text, lang)
+                if not meaningful(text):
+                    emit({"type": "done", "empty": True, "stt": took})
+                    return
+                emit({"type": "heard", "text": text, "lang": lang, "label": LANG_LABEL.get(lang, lang), "stt": took})
+                if lang not in TRANSLATE:  # 한국어(또는 모르는 말)는 받아 적은 그대로
+                    if record:
+                        state.core.storage.add_message(sid, "user", f"[{LANG_LABEL.get(lang, lang)}] {text}")
+                    emit({"type": "done", "stt": took})
+                    return
+                ticket = Ticket(viewer.id, session_id=sid)
+                with state.queue_cv:
+                    state.queue.append(ticket)
+                waited_from = time.monotonic()
+                if not self._wait_turn(ticket, emit):
+                    emit({"type": "done", "cancelled": True})
+                    return
+                with state.ticket_running(ticket, "live", lambda _chunk: None):
+                    started = time.monotonic()
+                    korean = state.live_translate(viewer, sid, text, lang)
+                    finished = time.monotonic()
+                    if record:
+                        state.core.storage.add_message(sid, "user", f"[{LANG_LABEL[lang]}] {text}")
+                        state.core.storage.add_message(sid, "assistant", korean)
+                emit({"type": "translation", "text": korean, "stt": took, "wait": round(started - waited_from, 2),
+                      "translate": round(finished - started, 2)})
+                emit({"type": "done"})
+                state.core.logger.info("live: %s %.2fs stt, %.2fs wait, %.2fs translate", lang, took,
+                                       started - waited_from, finished - started)
+            except GenerationCancelled:
+                emit({"type": "done", "cancelled": True})
+            except LiveError as exc:
+                emit({"type": "error", "error": str(exc)})
+            except Exception:  # noqa: BLE001
+                state.core.logger.exception("live utterance failed")
+                emit({"type": "error", "error": "이 토막을 처리하지 못했습니다."})
+            finally:
+                if ticket is not None:
+                    with state.queue_cv:
+                        if ticket in state.queue:
+                            state.queue.remove(ticket)
+                        state.queue_cv.notify_all()
+
+        # ------------------------------------------------------------ 코딩 세션 API(ADR-112, OpenCode 서버와 같은 일)
+        def _code_post(self) -> None:
+            if not self._authorized():
+                self._json(HTTPStatus.FORBIDDEN, {"error": "invalid local token"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid content length"})
+                return
+            if length < 0 or length > MAX_BODY_BYTES:
+                self._json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "request body too large"})
+                return
+            try:
+                body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self._json(HTTPStatus.BAD_REQUEST, {"error": "JSON object가 필요합니다."})
+                return
+            if not isinstance(body, dict):
+                self._json(HTTPStatus.BAD_REQUEST, {"error": "JSON object가 필요합니다."})
+                return
+            self._code_api("POST", urlparse(self.path).path, {}, body)
+
+        def _code_api(self, method: str, route: str, query: dict, body: dict) -> None:
+            """/api/code/session[/{id}[/message|diff|todo|command|prompt_async|abort|revert|delete|permissions/{pid}]] · /api/code/event.
+            이 PC 의 파일을 바꾸고 명령을 실행하므로 관리자만."""
+            viewer = self._require_viewer(admin=True)
+            if viewer is None:
+                return
+            code, me = state.code, viewer.id
+            parts = [unquote(p) for p in route[len("/api/code/"):].split("/") if p]
+            try:
+                if parts == ["event"] and method == "GET":
+                    self._code_events(viewer, query)
+                    return
+                if parts == ["path"] and method == "GET":  # 새 세션을 열 수 있는 곳(OpenCode GET /path 와 같은 뜻)
+                    approved = getattr(state.core, "_approved_file_root", None)
+                    self._json(HTTPStatus.OK, {"root": str(approved or ""),
+                                               "directory": str(state.core.current_project_root() or approved or "")})
+                    return
+                if not parts or parts[0] != "session":
+                    raise LookupError("not found")
+                if len(parts) == 1:
+                    if method == "GET":
+                        self._json(HTTPStatus.OK, {"sessions": code.list(me)})
+                    else:
+                        session = code.create(me, state.code_root(body.get("directory")),
+                                              str(body.get("tier") or state.session_permission(viewer, state.current_session(viewer))),
+                                              str(body.get("title") or ""))
+                        self._json(HTTPStatus.OK, {"session": session.public()})
+                    return
+                sid, action = parts[1], "/".join(parts[2:])
+                if method == "GET" and action == "":
+                    self._json(HTTPStatus.OK, {"session": code.get(sid, me).public()})
+                elif method == "GET" and action == "message":
+                    self._json(HTTPStatus.OK, {"messages": code.messages(sid, me)})
+                elif method == "GET" and action == "diff":
+                    self._json(HTTPStatus.OK, {"diff": code.diff(sid, me)})
+                elif method == "GET" and action == "todo":
+                    self._json(HTTPStatus.OK, {"todos": code.todo(sid, me)})
+                elif method == "GET" and action == "command":
+                    self._json(HTTPStatus.OK, {"commands": code.commands(sid, me)})
+                elif method == "POST" and action == "command":  # OpenCode 와 같은 모양: {"command": "init", "arguments": ""}
+                    code.command(sid, str(body.get("command") or ""), str(body.get("arguments") or ""), owner=me,
+                                 mode=str(body.get("mode") or body.get("agent") or ""))
+                    self._json(HTTPStatus.OK, {"accepted": True, "session": code.get(sid, me).public()})
+                elif method == "POST" and action in ("prompt_async", "message"):
+                    text = body.get("text")
+                    if text is None:  # OpenCode 모양: {"parts": [{"type": "text", "text": "…"}]}
+                        text = "\n".join(str(p.get("text", "")) for p in body.get("parts") or []
+                                         if isinstance(p, dict) and p.get("type", "text") == "text")
+                    code.prompt(sid, str(text or ""), owner=me, mode=str(body.get("mode") or body.get("agent") or ""))
+                    self._json(HTTPStatus.OK, {"accepted": True, "session": code.get(sid, me).public()})
+                elif method == "POST" and action == "abort":
+                    code.abort(sid, me)
+                    self._json(HTTPStatus.OK, {"aborted": True})
+                elif method == "POST" and action == "revert":
+                    self._json(HTTPStatus.OK, {"files": code.revert(sid, int(body.get("step") or 0), me)})
+                elif method == "POST" and action == "delete":
+                    code.delete(sid, me)
+                    self._json(HTTPStatus.OK, {"deleted": sid})
+                elif method == "POST" and len(parts) == 4 and parts[2] == "permissions":
+                    code.reply_permission(sid, parts[3], str(body.get("response") or ""), me)
+                    self._json(HTTPStatus.OK, {"replied": True})
+                else:
+                    raise LookupError("not found")
+            except LookupError as exc:  # KeyError 도 여기(없는 세션·권한 요청)
+                self._json(HTTPStatus.NOT_FOUND, {"error": exc.args[0] if exc.args else "not found"})
+            except ValueError as exc:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+
+        def _code_events(self, viewer: Viewer, query: dict) -> None:
+            """사건 흐름(SSE, OpenCode /event 와 같은 뜻) — 'data: {사건}' 줄. 15초마다 빈 줄로 끊긴 연결을 알아챈다.
+            ?session=…&since=N(이 번호부터). 토큰 머리글이 필요해 브라우저는 EventSource 대신 fetch 로 읽는다."""
+            sid = query.get("session", [""])[0]
+            since = int(query.get("since", ["0"])[0] or 0)
+            state.code.get(sid, viewer.id)
+            self.send_response(HTTPStatus.OK)
+            self._security_headers("text/event-stream; charset=utf-8")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            try:
+                while not state.shutting_down:
+                    batch = state.code.events(sid, since, wait=15.0, owner=viewer.id)
+                    out = [f"id: {e['n']}\ndata: {json.dumps(e, ensure_ascii=False)}\n\n" for e in batch] or [": ping\n\n"]
+                    if batch:
+                        since = batch[-1]["n"] + 1
+                    self.wfile.write("".join(out).encode("utf-8"))
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError, KeyError):
+                return
+
         def _wait_turn(self, ticket: Ticket, emit) -> bool:
-            """차례가 오면 모델 잠금(state.lock)을 잡고 True. 기다리는 동안 앞에 몇 명이 있는지 알린다."""
-            last, sent_at = None, 0.0
-            while True:
-                with state.queue_cv:
-                    if ticket.cancel.is_set() or state.shutting_down:
-                        return False
-                    ahead = state.queue.index(ticket)
-                    if ahead == 0 and state.lock.acquire(blocking=False):
-                        return True
-                    position = max(ahead, 1)
-                now = time.monotonic()
-                if position != last or now - sent_at > 10:  # 10초마다 한 번은 보내서 끊긴 연결을 알아챈다
-                    emit({"type": "queue", "position": position})
-                    last, sent_at = position, now
-                with state.queue_cv:
-                    state.queue_cv.wait(timeout=1.0)
+            """차례가 오면 모델 잠금(state.lock)을 잡고 True. 기다리는 동안 앞에 몇 명이 있는지 알린다
+            (10초마다 한 번은 보내서 끊긴 연결을 알아챈다)."""
+            return state.wait_turn(ticket, lambda position: emit({"type": "queue", "position": position}))
 
         def _stream(self, message: str, attachments: list[str] | None = None, viewer: Viewer | None = None,
-                    session_id: str | None = None, ticket: Ticket | None = None) -> None:
+                    session_id: str | None = None, ticket: Ticket | None = None, permission: str | None = None,
+                    documents: list[str] | None = None) -> None:
             viewer = viewer or state.owner_viewer()
             session_id = session_id or state.current_session(viewer)
             if ticket is None:
@@ -1140,11 +1892,6 @@ def _handler_factory(state: WebAppState):
                     disconnected = True
                     ticket.cancel.set()
 
-            previous = None
-            previous_command_cancel_event = None
-            previous_provider_cancel_events: dict[OllamaProvider, Any] = {}
-            local: set[OllamaProvider] = set()
-            acquired = False
             waited_from = time.monotonic()
             try:
                 self.send_response(HTTPStatus.OK)
@@ -1160,51 +1907,46 @@ def _handler_factory(state: WebAppState):
                           else "기다리던 요청을 취소했습니다."})
                     return
                 # A queued request does not own these shared fields until it gets
-                # the model lock. Snapshot the current providers here too: an
-                # engine/settings operation may have replaced them while waiting.
+                # the model lock (ticket_running 이 그때의 모델들을 잡고, 끝나면 되돌리고 잠금을 푼다).
                 # (대기 중인 요청의 취소/끊김은 실행 중인 다른 방의 콜백과 취소 신호를 건드리지 않는다.)
-                previous = state.core.response_chunk_callback
-                previous_command_cancel_event = getattr(state.core, "command_cancel_event", None)
-                local = {p for p in state.core.providers.values() if isinstance(p, OllamaProvider)}
-                if isinstance(state.core.local_summarizer, OllamaProvider):
-                    local.add(state.core.local_summarizer)
-                previous_provider_cancel_events = {p: p.cancel_event for p in local}
-                state.running = ticket
-                state.active_id, state.active_kind = ticket.request_id, "chat"
-                state.cancel_event = ticket.cancel
-                started = time.monotonic()
-                emit({"type": "running", "request_id": ticket.request_id, "session_id": session_id})
-                state.core.response_chunk_callback = lambda chunk: emit({"type": "chunk", "text": chunk})
-                state.core.command_cancel_event = state.cancel_event
-                for p in local:
-                    p.cancel_event = state.cancel_event
-                    p.last_metrics = {}
-                result = state.process(message, attachments, viewer=viewer, session_id=session_id)
-                saved = state.core.storage.message_page(result["session_id"], limit=1)["messages"]
-                metrics = next((p.last_metrics for p in local if p.last_metrics), {})
-                emit({"type": "done", **result, "metrics": metrics, "elapsed": round(time.monotonic() - started, 2),
-                      "waited": round(started - waited_from, 1), "last_message_id": saved[-1]["id"] if saved else 0})
-                if not disconnected and (title := state.auto_title(result, message)):
-                    emit({"type": "title", "session_id": result["session_id"], "title": title})
+                with state.ticket_running(ticket, "chat", lambda chunk: emit({"type": "chunk", "text": chunk})) as local:
+                    started = time.monotonic()
+                    emit({"type": "running", "request_id": ticket.request_id, "session_id": session_id})
+                    result = state.process(message, attachments, viewer=viewer, session_id=session_id,
+                                           permission=permission, documents=documents)
+                    saved = state.core.storage.message_page(result["session_id"], limit=1)["messages"]
+                    metrics = next((p.last_metrics for p in local if p.last_metrics), {})
+                    emit({"type": "done", **result, "metrics": metrics, "elapsed": round(time.monotonic() - started, 2),
+                          "waited": round(started - waited_from, 1), "last_message_id": saved[-1]["id"] if saved else 0})
+                    if not disconnected and (title := state.auto_title(result, message)):
+                        emit({"type": "title", "session_id": result["session_id"], "title": title})
             except GenerationCancelled:
                 emit({"type": "done", "response": "응답 생성을 중단했습니다. 파일 변경은 적용되지 않았습니다.",
                       "session_id": session_id or state.current_session(viewer)})
             except Exception:
                 emit({"type": "error", "error": "요청을 완료하지 못했습니다. 새로고침해 저장된 대화를 확인하세요."})
             finally:
-                if acquired:
-                    state.core.response_chunk_callback = previous
-                    state.core.command_cancel_event = previous_command_cancel_event
-                    for p, previous_cancel_event in previous_provider_cancel_events.items():
-                        p.cancel_event = previous_cancel_event
-                    state.running = None
-                    state.active_id = None
-                    state.active_kind = None
-                    state.lock.release()
                 with state.queue_cv:
                     if ticket in state.queue:
                         state.queue.remove(ticket)
                     state.queue_cv.notify_all()
+
+        def _job_stream(self, job: dict, session_id: str) -> None:
+            """보통 전송으로 온 요청을 뒤 작업으로 돌렸다고 알리는 짧은 스트림(화면은 보통 답처럼 받는다)."""
+            self.send_response(HTTPStatus.OK)
+            self._security_headers("application/x-ndjson; charset=utf-8")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            text = ("클라우드에 넘기는 일을 뒤 작업으로 시작했습니다. 클라우드가 일하는 동안에도 ALEX 와 계속 대화할 수 있고, "
+                    "창을 닫아도 됩니다. 끝나면 이 대화에 결과(ALEX 확인·수정안)를 남기고 알려 드립니다. (계정 메뉴 → 뒤 작업)")
+            for payload in ({"type": "start", "request_id": job["id"], "session_id": session_id},
+                            {"type": "done", "response": text, "session_id": session_id, "background_job": job["id"]}):
+                try:
+                    self.wfile.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    return
 
         def _cancel(self, viewer: Viewer, request_id: Any) -> None:
             if state.active_id and request_id == state.active_id and (
@@ -1239,10 +1981,20 @@ def _handler_factory(state: WebAppState):
             if self.path == "/api/project/upload":
                 self._upload_project_file()
                 return
-            if self.path not in {"/api/project", "/api/chat", "/api/chat/stream", "/api/cancel", "/api/settings", "/api/workspace",
+            if self.path == "/api/document/upload":
+                self._upload_document()
+                return
+            if self.path == "/api/live/utterance":
+                self._live_utterance()
+                return
+            if self.path.startswith("/api/code/"):
+                self._code_post()
+                return
+            if self.path not in {"/api/project", "/api/chat", "/api/chat/stream", "/api/job", "/api/cancel", "/api/settings", "/api/workspace",
                                  "/api/shutdown", "/api/pull", "/api/session/delete", "/api/login", "/api/logout",
                                  "/api/local-owner", "/api/password", "/api/users", "/api/memory", "/api/task",
-                                 "/api/session/new", "/api/session/rename"}:
+                                 "/api/session/new", "/api/session/rename", "/api/session/permission",
+                                 "/api/document/discard", "/api/live/start"}:
                 self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
                 return
             if not self._authorized():
@@ -1285,6 +2037,17 @@ def _handler_factory(state: WebAppState):
                     state.core.storage.rename_session(target, str(body.get("title") or ""))
                     self._json(HTTPStatus.OK, {"session_id": target, "title": state.core.storage.session_title(target)})
                     return
+                if self.path == "/api/document/discard":  # 보내기 전 첨부 빼기(ADR-096)
+                    self._json(HTTPStatus.OK, state.discard_document(viewer, body.get("session_id"), body.get("document_id")))
+                    return
+                if self.path == "/api/session/permission":  # 입력창의 권한 고르기(ADR-095)
+                    target = body.get("session_id")
+                    self._json(HTTPStatus.OK, {"session_id": target,
+                                               "permission": state.set_permission(viewer, target, body.get("permission"))})
+                    return
+                if self.path == "/api/live/start":  # 실시간 통역 시작(ADR-111) — 새 통역 대화, 받아쓰기 일꾼 미리 띄움
+                    self._json(HTTPStatus.OK, state.live_start(viewer))
+                    return
                 if self.path == "/api/session/new":  # 새 대화는 모델을 쓰지 않으니 차례를 기다리지 않는다
                     project_id = str(body.get("project_id") or "")
                     if project_id and state.core.storage.get_project(project_id, owner=viewer.id) is None:
@@ -1294,6 +2057,7 @@ def _handler_factory(state: WebAppState):
                         if sid and any(t.session_id == sid for t in state.queue):
                             sid = None  # 아직 메시지를 쓰기 전인 대기 중 방을 '새 대화'로 재사용하지 않는다
                         sid = sid or state.core.storage.create_session(viewer.id, project_id=project_id)
+                    state.reset_permission(sid)
                     state.set_current(viewer, sid)
                     self._json(HTTPStatus.OK, {"session_id": sid})
                     return
@@ -1330,12 +2094,21 @@ def _handler_factory(state: WebAppState):
                 if session_id is not None and not state.owns(viewer, session_id):
                     self._json(HTTPStatus.CONFLICT, {"error": "다른 탭에서 대화가 바뀌었습니다. 새로고침 후 전송하세요."})
                     return
-                if self.path == "/api/chat/stream":
+                if self.path in ("/api/chat/stream", "/api/job"):
                     # 접수할 때 방을 고정한다. 기다리는 동안 사용자가 다른 방을 골라도 바뀌지 않는다.
                     session_id = session_id or state.current_session(viewer)
-                    message, attachments = self._chat_body(body, viewer, session_id)
+                    if self.path == "/api/job" and body.get("retry"):  # '다시 맡기기'(ADR-110) — 남겨 둔 원문·권한으로
+                        session_id, message, permission = state.job_message(viewer, body["retry"])
+                        attachments, documents = [], []
+                    else:
+                        message, attachments, documents = self._chat_body(body, viewer, session_id)
+                        permission = self._permission(body, viewer)  # 차례를 기다리기 전에 형식·자격을 확인
                     if state.shutting_down:
                         self._json(HTTPStatus.CONFLICT, {"error": "앱을 종료하는 중입니다."})
+                        return
+                    cloud = self.path == "/api/chat/stream" and parse_cloud_request(message) is not None
+                    if cloud and not viewer.is_admin:
+                        self._json(HTTPStatus.CONFLICT, {"error": "클라우드로 넘기기는 관리자만 쓸 수 있습니다."})
                         return
                     with state.queue_cv:
                         if not state.owns(viewer, session_id):
@@ -1349,13 +2122,25 @@ def _handler_factory(state: WebAppState):
                             ticket = None
                             # HTTP/1.1 브라우저 연결을 전부 긴 스트림으로 채우면 방 이동·중단도 막힌다.
                             rejection = "동시에 최대 4개 대화의 요청을 받을 수 있습니다. 하나가 끝난 뒤 다시 보내 주세요."
+                        elif (self.path == "/api/job" or cloud) and (attachments or documents):
+                            ticket = None
+                            rejection = "뒤 작업에는 첨부를 붙일 수 없습니다. 첨부는 보통 전송으로 보내 주세요."
+                        elif self.path == "/api/job" or cloud:
+                            ticket = Ticket(viewer.id, session_id=session_id, background=True)  # 자리만 확인 — start_job 이 만든다
                         else:
                             ticket = Ticket(viewer.id, session_id=session_id)
                             state.queue.append(ticket)
                     if ticket is None:
                         self._json(HTTPStatus.CONFLICT, {"error": rejection})
                         return
-                    self._stream(message, attachments, viewer, session_id, ticket)
+                    if self.path == "/api/job":
+                        self._json(HTTPStatus.OK, {"job": state.start_job(viewer, session_id, message, permission)})
+                        return
+                    if cloud:  # 클라우드로 넘기기는 언제나 뒤 작업 — 클라우드가 일하는 동안 ALEX 와 계속 대화할 수 있다
+                        job = state.start_job(viewer, session_id, message, permission)
+                        self._job_stream(job, session_id)
+                        return
+                    self._stream(message, attachments, viewer, session_id, ticket, permission, documents)
                     return
                 if not state.lock.acquire(blocking=False):
                     self._json(HTTPStatus.CONFLICT, {"error": "응답 생성 중입니다. 완료 또는 중단 후 다시 시도하세요."})
@@ -1387,8 +2172,9 @@ def _handler_factory(state: WebAppState):
                     if self.path == "/api/pull":
                         self._pull(body)
                         return
-                    message, attachments = self._chat_body(body, viewer, session_id)
-                    result = state.process(message, attachments, viewer=viewer, session_id=session_id)
+                    message, attachments, documents = self._chat_body(body, viewer, session_id)
+                    result = state.process(message, attachments, viewer=viewer, session_id=session_id,
+                                           permission=self._permission(body, viewer), documents=documents)
                     if title := state.auto_title(result, message):
                         result["title"] = title
                 finally:
@@ -1405,7 +2191,18 @@ def _handler_factory(state: WebAppState):
                 return
             self._json(HTTPStatus.OK, result)
 
-        def _chat_body(self, body: dict, viewer: Viewer, session_id: str | None) -> tuple[str, list[str]]:
+        @staticmethod
+        def _permission(body: dict, viewer: Viewer) -> str | None:
+            """보낼 때 고른 권한(없으면 대화에 저장된 값). 자동 실행은 관리자만."""
+            value = body.get("permission")
+            if value is None:
+                return None
+            mode = clean_permission(value)
+            if mode == "auto" and not viewer.is_admin:
+                raise ValueError("자동 실행은 관리자만 고를 수 있습니다.")
+            return mode
+
+        def _chat_body(self, body: dict, viewer: Viewer, session_id: str | None) -> tuple[str, list[str], list[str]]:
             message = body.get("message")
             if not isinstance(message, str) or not message.strip() or len(message) > 32000:
                 raise ValueError("메시지는 1~32000자 문자열이어야 합니다.")
@@ -1419,7 +2216,16 @@ def _handler_factory(state: WebAppState):
             sid = session_id or state.current_session(viewer)
             for name in attachments:
                 state.attachments.load(sid, name)  # Validate ownership before opening a stream.
-            return message, attachments
+            documents = body.get("documents", [])
+            if (not isinstance(documents, list) or len(documents) > MAX_CHAT_DOCUMENTS
+                    or any(not isinstance(d, str) or not re.fullmatch(r"[a-f0-9]{8,24}", d) for d in documents)
+                    or len(set(documents)) != len(documents)):
+                raise ValueError(f"문서는 한 번에 최대 {MAX_CHAT_DOCUMENTS}개까지 첨부할 수 있습니다.")
+            if documents and message.strip().startswith("/"):
+                raise ValueError("문서 첨부와 명령어는 따로 보내 주세요.")
+            for document_id in documents:  # 이 대화에 올린 것인지 차례를 기다리기 전에 확인
+                state.core.knowledge.resolve_id(document_id, (f"draft:{sid}", f"session:{sid}"))
+            return message, attachments, documents
 
         def _account_routes(self, body: dict) -> bool:
             """로그인·로그아웃·이 PC 주인으로 돌아가기. 처리했으면 True."""
@@ -1561,6 +2367,7 @@ def main(argv: list[str] | None = None) -> None:
     saved = core.storage.get_state("web.current_session")
     session_id = saved if saved and core.storage.session_exists(saved) else core.get_or_create_session(resume=True)
     state = WebAppState(core=core, session_id=session_id, settings=settings)
+    state.archive_sync()  # 꺼져 있던 동안 쌓인 메시지(터미널 대화 등)도 월별 기록에
     server = make_server(state, args.port)
     host, port = server.server_address[:2]
     print(f"Project ALEX Local Web: http://{host}:{port}")

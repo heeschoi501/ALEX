@@ -301,6 +301,107 @@ class RtlLoopTests(unittest.TestCase):
                          "사용자 취소")
 
 
+# 의존 블록(ADR-103): 시험기는 받은 의존 파일 경로를 report 에 남기고, 설계에 GOOD 이 있으면 통과.
+DEP_RUNNER = textwrap.dedent("""
+    import json, sys
+    code, report, deps = open(sys.argv[1], encoding="utf-8").read(), sys.argv[2], sys.argv[3:]
+    json.dump({"t_top": {"ok": "GOOD" in code and len(deps) > 0, "problems": [], "about": " ".join(deps)}},
+              open(report, "w", encoding="utf-8"))
+""")
+FIFO = "module fifo #(parameter W = 8) (input clk, input [W-1:0] d, output [W-1:0] q);\n  assign q = d;\nendmodule\n"
+
+
+def make_dep(root: Path, name: str = "fifo", verified: bool = True, deps: list | None = None) -> Path:
+    import hashlib
+    folder = root / name
+    folder.mkdir(parents=True)
+    (folder / "spec.md").write_text("fifo", encoding="utf-8")
+    (folder / f"{name}.v").write_text(FIFO.replace("module fifo", f"module {name}"), encoding="utf-8")
+    test = ["{python}", "verify/runner.py", "{file}", "{report}"] + (["{deps}"] if deps else [])
+    (folder / "rtl.json").write_text(json.dumps({"top": name, "file": f"{name}.v", "test": test, "deps": deps or []}),
+                                     encoding="utf-8")
+    sha = hashlib.sha256((folder / f"{name}.v").read_text(encoding="utf-8").encode()).hexdigest()
+    (folder / "rtl-run.json").write_text(json.dumps({"verified": verified, "final_sha256": sha}), encoding="utf-8")
+    return folder
+
+
+def make_top(root: Path, deps: list, with_placeholder: bool = True) -> Path:
+    folder = root / "soc"
+    (folder / "verify").mkdir(parents=True)
+    (folder / "verify" / "runner.py").write_text(DEP_RUNNER, encoding="utf-8")
+    (folder / "spec.md").write_text("soc 는 fifo 를 쓴다.", encoding="utf-8")
+    test = ["{python}", "verify/runner.py", "{file}", "{report}"] + (["{deps}"] if with_placeholder else [])
+    (folder / "rtl.json").write_text(json.dumps({"top": "soc", "file": "soc.v", "test": test, "deps": deps}), encoding="utf-8")
+    return folder
+
+
+class DepsTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.tools = self.root / "no-tools"
+
+    def test_verified_block_is_given_read_only_with_its_ports(self):
+        dep = make_dep(self.root)
+        project = RtlProject.load(make_top(self.root, ["fifo"]))
+        self.assertEqual(project.deps, ((dep / "fifo.v").resolve(),))
+        self.assertIn("module fifo #(parameter W = 8) (input clk", project.prompt_spec)
+        self.assertIn("다시 정의하지 말고 인스턴스로", project.prompt_spec)
+        redefine = "```verilog\n" + FIFO + "module soc(input clk); wire GOOD; endmodule\n```"
+        good = "```verilog\nmodule soc(input clk); wire GOOD; fifo u(.clk(clk), .d(8'd0), .q()); endmodule\n```"
+        model = Scripted(redefine, good)
+        result = run_rtl(model, project, self.tools)
+        self.assertTrue(result.verified)
+        self.assertIn("검증된 블록 fifo 를 이 파일에서 다시 정의했다", result.rounds[0].problem)
+        report = json.loads((result.run_dir / "round-2.json").read_text(encoding="utf-8"))
+        self.assertIn("fifo.v", report["t_top"]["about"])               # 시험기가 의존 파일을 받았다
+        self.assertIn("module fifo", model.requests[0])                  # 처음 요청에도 포트가 보인다
+        self.assertEqual(FIFO, (dep / "fifo.v").read_text(encoding="utf-8"))  # 의존 블록은 그대로
+        record = json.loads((project.root / "rtl-run.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(record["final_sha256"]), 64)
+        self.assertEqual(record["deps"], [str((dep / "fifo.v").resolve())])
+
+    def test_the_new_block_can_be_used_by_the_next_project(self):
+        make_dep(self.root)
+        top = RtlProject.load(make_top(self.root, ["fifo"]))
+        run_rtl(Scripted("```verilog\nmodule soc(input clk); wire GOOD; endmodule\n```"), top, self.tools)
+        from jarvis.rtl_loop import verified_now
+        self.assertTrue(verified_now(top))
+        top.target.write_text(top.target.read_text(encoding="utf-8") + "// 손댐\n", encoding="utf-8")
+        self.assertFalse(verified_now(top))                               # 검증 뒤 바뀌면 다시 확인해야 한다
+
+    def test_transitive_blocks_come_first(self):
+        make_dep(self.root, "mem")
+        make_dep(self.root, "cache", deps=["mem"])
+        project = RtlProject.load(make_top(self.root, ["cache"]))
+        self.assertEqual([path.name for path in project.deps], ["mem.v", "cache.v"])
+        self.assertEqual(set(project.dep_modules), {"mem", "cache"})
+
+    def test_unverified_changed_missing_placeholder_cycle_and_outside_are_refused(self):
+        make_dep(self.root, "fifo", verified=False)
+        with self.assertRaisesRegex(ValueError, "검증되지 않았거나"):
+            RtlProject.load(make_top(self.root, ["fifo"]))
+        import shutil
+        shutil.rmtree(self.root / "soc")
+        shutil.rmtree(self.root / "fifo")
+        dep = make_dep(self.root)
+        (dep / "fifo.v").write_text(FIFO + "// 검증 뒤 손댐\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "검증 뒤 바뀌었습니다"):
+            RtlProject.load(make_top(self.root, ["fifo"]))
+        shutil.rmtree(self.root / "soc")
+        with self.assertRaisesRegex(ValueError, "\\{deps\\}"):
+            RtlProject.load(make_top(self.root, ["fifo"], with_placeholder=False))
+        shutil.rmtree(self.root / "soc")
+        with self.assertRaisesRegex(ValueError, "같은 RTL 폴더"):
+            RtlProject.load(make_top(self.root, ["../elsewhere"]))
+        shutil.rmtree(self.root / "soc")
+        a = make_dep(self.root, "a", deps=["b"])
+        make_dep(self.root, "b", deps=["a"])
+        with self.assertRaisesRegex(ValueError, "순환"):
+            RtlProject.load(a)
+
+
 class RtlRepairTests(unittest.TestCase):
     def test_edits_are_atomic_and_use_positions_in_the_original_code(self):
         answer = json.dumps({"diagnosis": "independent edits", "edits": [

@@ -363,14 +363,37 @@ class DependencyTests(unittest.TestCase):
         import dependency_audit
 
         self.assertEqual(dependency_audit.audit(), [])
-        # 학습 패키지는 학습 일꾼에만. 2026-10-11 문서 지식 기능의 PDF 일꾼(pypdf, 별도 venv)도 별도 환경이지만 학습 패키지는 없다.
+        # 학습 패키지는 학습 일꾼에만. 문서·OCR·음성·영상 일꾼도 파일별 허용 패키지만 쓴다.
         training = {"torch", "transformers", "peft", "huggingface_hub"}
         self.assertEqual({path for path, roots in dependency_audit.SEPARATE_ENV.items() if roots & training},
                          {"scripts/lora_worker.py"})
-        self.assertEqual(set(dependency_audit.SEPARATE_ENV), {"scripts/lora_worker.py", "scripts/pdf_extract_worker.py"})
+        self.assertEqual(dependency_audit.SEPARATE_ENV, {
+            "scripts/lora_worker.py": {"torch", "transformers", "peft", "huggingface_hub"},
+            "scripts/pdf_extract_worker.py": {"pypdf"},
+            "scripts/hwp_extract_worker.py": {"olefile", "cryptography"},
+            "scripts/ocr_worker.py": {"pypdfium2", "rapidocr"},
+            "scripts/stt_worker.py": {"numpy", "sherpa_onnx"},
+            "scripts/video_masks.py": {"rembg", "PIL"},
+        })
         # ALEX 쪽 지휘 스크립트는 표준 라이브러리만 — 앱 환경에 torch 를 들이지 않는다
         self.assertFalse({"torch", "transformers", "peft", "huggingface_hub"}
                          & dependency_audit.imported_roots(ROOT / "scripts" / "lora.py"))
+
+    def test_training_packages_stay_blocked_in_core_and_nontraining_workers(self):
+        import dependency_audit
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "jarvis").mkdir()
+            (root / "scripts").mkdir()
+            (root / "jarvis" / "core.py").write_text("import torch\n", encoding="utf-8")
+            (root / "scripts" / "lora_worker.py").write_text("import torch\n", encoding="utf-8")
+            (root / "scripts" / "ocr_worker.py").write_text("import rapidocr\nimport torch\n", encoding="utf-8")
+            with patch.object(dependency_audit, "ROOT", root):
+                self.assertEqual(dependency_audit.audit(), [
+                    (Path("jarvis/core.py"), "torch"),
+                    (Path("scripts/ocr_worker.py"), "torch"),
+                ])
 
 
 class FakeTokenizer:

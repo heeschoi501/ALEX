@@ -10,7 +10,7 @@ fixes its own code under test-based guardrails, and learns from approved experie
 |---|---|
 | **로컬 우선 AI 코어** | 규칙 라우터가 질문을 일반·코딩·클라우드로 나누고, 기본은 로컬 전용. 클라우드는 사용자 승인 게이트 + 비밀 정보 자동 차단(API 키·토큰·자격 증명) 뒤에서만 |
 | **기억과 성장** | SQLite 세션·장기 메모·할 일. 경험 저장소(불변 본문 + 해시 무결성, train/eval 결정적 분할) → 사람이 승인한 교정만 다음 답의 교훈으로 재사용 |
-| **자기 코드 고치기** | `/dev-auto`: 격리 복사본에서 오픈소스 코딩 에이전트(OpenCode)가 고치고, ALEX 가 판정 — 합격 테스트는 읽기 전용, 전체 회귀 검사(파일 단위 병렬, 197초 → 61초), 불필요한 변경 덜어내기, 최종 적용은 사용자 승인 |
+| **자기 코드 고치기** | `/dev-auto`·`/build`: ALEX 자체 하네스 또는 외부 OpenCode를 선택. 격리 수정 → 관련 테스트 독립 확인 → 실패 시 재수정 → 전체 회귀 → 사용자 승인. 별도 `/code`에서 권한·계획·질문·되돌리기 지원 |
 | **채팅 코딩** | 코드를 답으로 주고, 보이지 않는 임시 폴더에서 실행해 시작 오류를 스스로 고침(Python 감사 훅 기반 실행 가드 — OS 격리는 아님: 작업 폴더 밖 쓰기·네트워크·하위 프로세스·레지스트리 쓰기 차단) |
 | **가중치 학습** | LoRA 파이프라인(transformers + PEFT) — 승인된 '질문 → 좋은 답'만 학습, 어댑터를 합쳐 GGUF → Ollama 등록, 정체성 회귀 채점. 학습 데이터는 문서·작업 교훈에서 큰 모델이 만들고 채점(7점 이상)한 뒤 사람이 묶음 승인 |
 | **모델 서버** | Ollama(Qwen3.8-27B, 3비트 양자화 · KV 8비트로 16GB 에 전부 올려 약 65 tok/s) 또는 Strata(Qwen3.8-Flash-Next 125B MoE 를 RAM·GPU 에 나눠 실행) 중 선택 |
@@ -19,16 +19,16 @@ fixes its own code under test-based guardrails, and learns from approved experie
 
 ## 어떻게 만들었나
 
-- **측정으로 결정** — 설계 결정 85건을 근거·검증과 함께 기록(`DECISIONS.md`), 실측 기록(`PERFORMANCE.md`). 예: 모델을 바꾸기 전에 지시문 유무 A/B 로
+- **측정으로 결정** — 설계 결정과 후속 검토를 근거·검증과 함께 기록(`DECISIONS.md`), 실측 기록(`PERFORMANCE.md`). 예: 모델을 바꾸기 전에 지시문 유무 A/B 로
   원인이 지시문이 아니라 모델·구조임을 가렸고, 공개 벤치마크와 이 PC 실측을 함께 보고 모델·양자화를 골랐다.
-- **검사가 기준** — 공개본 테스트 1,342개(Python 3.10·3.11·3.12 모두 릴리스 PASS, 2026-10-12), 릴리스 검사(`scripts/verify_release.py`: Python 3.10 문법 호환, 의존성 감사, 라우터 골든 코퍼스, 보안 스모크, 알파·베타 스모크).
+- **검사가 기준** — 최신 공개본 테스트 1,615개(실패 0·skip 13), Python 3.11 릴리스 PASS(2026-10-23; 3.10 문법 검사 통과, 이번 버전의 다른 Python 실제 실행은 미검증), 릴리스 검사(`scripts/verify_release.py`: Python 3.10 문법 호환, 의존성 감사, 라우터 골든 코퍼스, 보안 스모크, 알파·베타 스모크).
   Core 기본 실행은 **표준 라이브러리만** 쓴다. 학습·PDF 일꾼과 생성 코드 검사 일꾼의 선택 패키지는 파일별로 감사한다.
 - **여러 AI 와 협업** — Claude Code·Codex 가 번갈아 구현·리뷰하고, 인계 문서와 결정 기록으로 이어 갔다. 사람(나)은 방향·승인·검증 기준을 정했다.
 
 ## 구조
 
 ```
-jarvis/        앱 (router · core · providers · storage · developer(/dev-auto) · opencode_worker · code_check · build_loop · web · launcher …)
+jarvis/        앱 (router · core · providers · storage · developer(/dev-auto) · harness · opencode_worker · code_check · build_loop · web · launcher …)
 tests/         단위·통합 검사 (가짜 Ollama·Strata·OpenCode 서버로 실모델 없이)
 scripts/       릴리스 검사, 평가(코드·정체성·라우터), LoRA 학습·데이터, 경험 관리
 docs/ · *.md   설계 결정, 성능 실측, 보안 경계, 학습 연구, 리뷰 기록
@@ -36,6 +36,8 @@ logs/probe/    코딩 에이전트 평가 도구와 과제
 ```
 
 **빠른 실행:** `python -m jarvis.web` (모델 없이 Mock 모드) · 실제 모델은 아래 "빠른 시작" 참고.
+
+> **2026-10-22 갱신:** ALEX 자체 코딩 하네스·독립 관련 검사·실패 재수정과 최신 연결 기능을 반영했습니다. [설정·검사·남은 작업 인수인계](docs/HANDOFF_20261022.md) · [하네스 검토와 실제 측정의 한계](docs/CODEX_HARNESS_REVIEW_20261022.md). 공개 기본값은 `opencode`이며 `coding_worker=harness`로 선택합니다.
 
 > **2026-10-12 보완:** 대기 중 요청의 취소·연결 종료가 실행 중 응답의 중단 신호를 바꾸지 않도록 수정하고, wheel에 PWA manifest·아이콘을 포함했습니다. [검증 결과·업데이트·롤백 안내](docs/CODEX_HARDENING_20261012.md).
 > **2026-10-12 추가 검증:** 쿠키·동시 로그인, 업로드 응답 경쟁, 프로젝트 첫 전송, Python 3.10 검사 집계·Linux 글꼴·공개 배포를 보완했습니다. [전체 검증·복구 기록](docs/FULL_VALIDATION_20261012.md) · [GPT-5.6 Luna 비교 도구(실모델 미실측)](docs/MODEL_COMPARISON_GPT56_LUNA_20261012.md).

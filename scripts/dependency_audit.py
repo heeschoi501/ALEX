@@ -15,7 +15,11 @@ LOCAL_TOP_LEVEL = {"jarvis", "scripts", "tests"}
 # 별도 환경에서만 도는 파일과 그 파일에만 허용하는 패키지. ALEX 앱 환경에는 없고 필요도 없다 —
 # LoRA 학습 일꾼은 C:\ALEX\tools\lora\venv 의 파이썬으로만 실행된다(ADR-084). 목록 밖 패키지는 여전히 실패.
 SEPARATE_ENV = {"scripts/lora_worker.py": {"torch", "transformers", "peft", "huggingface_hub"},
-                "scripts/pdf_extract_worker.py": {"pypdf"}}
+                "scripts/pdf_extract_worker.py": {"pypdf"},
+                "scripts/hwp_extract_worker.py": {"olefile", "cryptography"},
+                "scripts/ocr_worker.py": {"pypdfium2", "rapidocr"},
+                "scripts/stt_worker.py": {"numpy", "sherpa_onnx"},
+                "scripts/video_masks.py": {"rembg", "PIL"}}
 # Only the isolated generated-code worker may optionally prewarm pygame fonts.
 # It is never imported by the Core at startup and is not a mandatory dependency.
 OPTIONAL_WORKER_IMPORTS = {"jarvis/build_runner.py": {"pygame"}}

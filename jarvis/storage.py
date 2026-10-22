@@ -8,7 +8,7 @@ Study focus:
 """
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -363,6 +363,8 @@ class Storage:
                         expires_at TEXT NOT NULL,
                         FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
                     );
+                    -- 기억 찾기 색인(2026-10-18): 예전에는 최근 기억 50개 안에서만 골라, 기억이 많아지면 오래된 관련 기억이 조용히 빠졌다.
+                    CREATE VIRTUAL TABLE IF NOT EXISTS memory_search USING fts5(owner UNINDEXED, key UNINDEXED, terms);
                     -- 프로젝트(2026-10-11, Gemini Gems·Claude Projects 처럼): 이름 + 지침 + 자료 + 그 안의 대화.
                     CREATE TABLE IF NOT EXISTS projects (
                         id TEXT PRIMARY KEY,
@@ -382,6 +384,7 @@ class Storage:
                 )
                 self._migrate_sessions(conn)
                 self._migrate_owners(conn)
+                self._sync_memory_search(conn)
                 conn.execute(
                     "INSERT INTO schema_meta(key, value) VALUES ('schema_version', ?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -402,6 +405,22 @@ class Storage:
             )
         if "title" not in columns:
             conn.execute("ALTER TABLE sessions ADD COLUMN title TEXT NOT NULL DEFAULT ''")
+
+    @staticmethod
+    def _memory_terms(key: str, value: str) -> str:
+        from .knowledge import search_terms  # 학습 자료 검색과 같은 낱말 조각(한글은 두 글자 조각 — 조사·어미가 달라도 맞는다)
+        return " ".join(sorted(search_terms(f"{key} {value}")))
+
+    @classmethod
+    def _sync_memory_search(cls, conn: sqlite3.Connection) -> None:
+        """기억 색인이 기억 표와 어긋나면(처음 만들 때·예전 DB) 통째로 다시 만든다."""
+        count = conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+        if conn.execute("SELECT COUNT(*) FROM memory_search").fetchone()[0] == count:
+            return
+        conn.execute("DELETE FROM memory_search")
+        conn.executemany("INSERT INTO memory_search(owner, key, terms) VALUES (?, ?, ?)",
+                         [(row["owner"], row["key"], cls._memory_terms(row["key"], row["value"]))
+                          for row in conn.execute("SELECT owner, key, value FROM memories")])
 
     @staticmethod
     def _migrate_owners(conn: sqlite3.Connection) -> None:
@@ -621,6 +640,9 @@ class Storage:
                     """,
                     (owner, clean_key, clean_value, self._next_memory_timestamp(conn)),
                 )
+                conn.execute("DELETE FROM memory_search WHERE owner = ? AND key = ?", (owner, clean_key))
+                conn.execute("INSERT INTO memory_search(owner, key, terms) VALUES (?, ?, ?)",
+                             (owner, clean_key, self._memory_terms(clean_key, clean_value)))
         except sqlite3.DatabaseError as exc:
             raise StorageError(self._db_help(exc)) from exc
 
@@ -639,6 +661,7 @@ class Storage:
         try:
             with self._connection() as conn:
                 cursor = conn.execute("DELETE FROM memories WHERE owner = ? AND key = ?", (owner, key.strip()))
+                conn.execute("DELETE FROM memory_search WHERE owner = ? AND key = ?", (owner, key.strip()))
                 return cursor.rowcount > 0
         except sqlite3.DatabaseError as exc:
             raise StorageError(self._db_help(exc)) from exc
@@ -655,6 +678,26 @@ class Storage:
         except sqlite3.DatabaseError as exc:
             raise StorageError(self._db_help(exc)) from exc
         return {str(row["key"]): str(row["value"]) for row in rows}
+
+    def search_memories(self, terms: Iterable[str], owner: str = OWNER, limit: int = 50) -> dict[str, str]:
+        """질문의 낱말 조각이 들어 있는 기억을 오래된 것까지 모두 찾아 관련도 순으로(색인 검색). 없으면 빈 dict."""
+        words = sorted({str(term) for term in terms if str(term).strip()})[:80]
+        if not words:
+            return {}
+        expression = " OR ".join('"' + word.replace('"', '""') + '"' for word in words)
+        try:
+            with self._connection() as conn:
+                keys = [row["key"] for row in conn.execute(
+                    "SELECT key FROM memory_search WHERE memory_search MATCH ? AND owner = ? "
+                    "ORDER BY bm25(memory_search) LIMIT ?", (expression, owner, max(1, limit)))]
+                found = {}
+                for key in keys:
+                    row = conn.execute("SELECT value FROM memories WHERE owner = ? AND key = ?", (owner, key)).fetchone()
+                    if row is not None:
+                        found[str(key)] = str(row["value"])
+                return found
+        except sqlite3.DatabaseError as exc:
+            raise StorageError(self._db_help(exc)) from exc
 
     # --------------------------------------------------------- session navigation / export
 
@@ -965,6 +1008,19 @@ class Storage:
                 return cursor.rowcount > 0
         except sqlite3.DatabaseError as exc:
             raise StorageError(self._db_help(exc)) from exc
+
+    def messages_after(self, last_id: int, limit: int = 5000) -> list[dict]:
+        """월별 대화 기록(archive.py)용 — last_id 다음 메시지들을 대화방 정보(주인·제목·프로젝트 이름)와 함께, 오래된 순으로."""
+        try:
+            with self._connection() as conn:
+                rows = conn.execute(
+                    "SELECT m.id, m.session_id, m.role, m.content, m.created_at, s.owner, s.title, "
+                    "COALESCE(p.name, '') AS project FROM messages m JOIN sessions s ON s.id = m.session_id "
+                    "LEFT JOIN projects p ON p.id = s.project_id WHERE m.id > ? ORDER BY m.id ASC LIMIT ?",
+                    (int(last_id), int(limit))).fetchall()
+        except sqlite3.DatabaseError as exc:
+            raise StorageError(self._db_help(exc)) from exc
+        return [dict(row) for row in rows]
 
     def export_session_markdown(self, session_id: str, destination: Path | None = None) -> Path:
         """세션 전체를 로컬 Markdown 으로 내보낸다. Cloud 전송은 하지 않는다."""

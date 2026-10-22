@@ -118,6 +118,64 @@ def strata_command(folder: Path, port: int) -> list[str]:
             "--port", str(port)]
 
 
+def embed_dir() -> Path:
+    return Path(os.getenv("JARVIS_EMBED_DIR") or (ROOT.parent / "tools" / "embed"))
+
+
+def embedding_command(folder: Path, port: int, threads: int) -> list[str]:
+    """기억 뜻 검색용 임베딩 서버(ADR-094). folder/embed.json 이 고정한 llama-server·모델을 **CPU 전용**으로 띄운다.
+
+    --device none·-ngl 0: 그래픽카드에 아무것도 올리지 않는다(Strata 가 16GB 중 약 14GB 를 쓴다).
+    -t 스레드: Strata 의 CPU 계산과 나눠 쓰도록 적게(기본 4/16). --pooling last 는 Qwen3-Embedding 방식(모델 카드).
+    문맥 4096 을 2슬롯으로(슬롯당 2048토큰 — 기억 하나·질문 하나에 충분, 메모리 약 0.5GB).
+    """
+    try:
+        config = json.loads((folder / "embed.json").read_text(encoding="utf-8"))
+        server, model = folder / config["server"], folder / config["model"]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise RuntimeError(f"임베딩 서버 설정(embed.json)을 읽지 못했습니다({folder}): {exc}") from exc
+    for path in (server, model):
+        if not path.is_file():
+            raise RuntimeError(f"임베딩 서버 파일이 없습니다: {path}")
+    return [str(server), "-m", str(model), "--embedding", "--pooling", "last", "--host", "127.0.0.1", "--port", str(port),
+            "--device", "none", "-ngl", "0", "-t", str(threads), "-tb", str(threads), "-c", "4096", "-b", "2048",
+            "-ub", "2048", "--parallel", "2", "--no-webui"]
+
+
+def ensure_embedding(host: str, threads: int, report, log_dir: Path, flags: int, wait_seconds: float = 60) -> bool:
+    """임베딩 서버가 떠 있게 한다. 실패해도 ALEX 는 켠다(기억은 낱말로만 찾는다) — 오류를 내지 않고 False."""
+    try:
+        if get_json(host + "/health").get("status") == "ok":
+            return True
+    except (OSError, ValueError):
+        pass
+    try:
+        command = embedding_command(embed_dir(), int(host.rsplit(":", 1)[1]), threads)
+    except RuntimeError as exc:
+        report(f"기억 뜻 검색을 쓰지 않습니다: {exc}")
+        return False
+    report("기억 검색 도우미(임베딩, CPU)를 켜는 중…")
+    if os.name == "nt":
+        flags |= subprocess.BELOW_NORMAL_PRIORITY_CLASS  # 대화(Strata)보다 뒤로
+    with (log_dir / "embedding-server.log").open("a", encoding="utf-8") as log:
+        process = subprocess.Popen(command, cwd=embed_dir(), stdout=log, stderr=log, stdin=subprocess.DEVNULL,
+                                   creationflags=flags)
+    (ROOT / "runtime").mkdir(exist_ok=True)
+    (ROOT / "runtime" / "embedding.pid").write_text(str(process.pid))
+    deadline = time.monotonic() + wait_seconds
+    while time.monotonic() < deadline:
+        try:
+            if get_json(host + "/health").get("status") == "ok":
+                return True
+        except (OSError, ValueError):
+            pass
+        if process.poll() is not None:
+            break
+        time.sleep(0.5)
+    report("기억 검색 도우미가 켜지지 않았습니다(logs/embedding-server.log). 기억은 낱말로만 찾습니다.")
+    return False
+
+
 def ensure_strata(host: str, report, log_dir: Path, flags: int, wait_seconds: float = 900) -> None:
     """Strata 모드면 Strata 서버가 떠 있게 한다. 처음 올릴 때 35~55GB 를 RAM 에 올리느라 1~3분 PC 가 느려진다(Strata 안내)."""
     try:
@@ -238,6 +296,8 @@ def launch(allow_download: bool = False, report=print) -> str:
                     succeeded = item.get("status") == "success"
                 if not succeeded:
                     raise RuntimeError("모델 다운로드가 완료되지 않았습니다. 다시 실행하면 이어받습니다.")
+    if settings.embedding_enabled:
+        ensure_embedding(settings.embedding_host, settings.embedding_threads, report, log_dir, flags)
     report("채팅창을 시작합니다…")
     with (log_dir / "web-server.log").open("a", encoding="utf-8") as log:
         web_process = subprocess.Popen([sys.executable, "-m", "jarvis.web", "--port", "8765"], cwd=ROOT, env=os.environ.copy(), stdout=log, stderr=log, creationflags=flags)

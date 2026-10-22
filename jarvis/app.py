@@ -8,16 +8,20 @@ Study focus:
 from __future__ import annotations
 
 import logging
+import json
 import os
 import re
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from types import SimpleNamespace
 
-from .config import ConfigError, Settings, load_settings
-from .core import CloudApprovalRequest, JarvisCore
+from .config import ConfigError, Settings, load_settings, local_config_path
+from .core import DOWNLOAD_REASON, CloudApprovalRequest, JarvisCore
 from .device import DeviceError, VSCodeLauncher, WakeOnLanTool
-from .router import Destination, explain, route_request
+from .embeddings import EmbeddingClient, MemoryVectors
+from .permissions import is_alex_program
+from .videolink import Transcriber, VideoReader
+from .router import Destination, RouteDecision, explain, route_request
 from .hardware import HardwareInfo, PerformanceProfile, detect_hardware
 from .lessons import LESSON_KINDS, usable as lesson_usable
 from .portable import PortableStateError, export_portable_state, import_portable_state
@@ -38,6 +42,7 @@ from .webread import WebReader
 from .workspace import SafeWorkspaceEditor
 from .developer import DeveloperMode
 from .opencode_worker import OpenCodeWorker
+from .cloudagent import CloudAgents
 from .imagegen import ComfyImageGenerator
 from .documents import DocumentError, command_export
 from .knowledge import KnowledgeError
@@ -85,6 +90,10 @@ HELP_TEXT = """사용 가능한 명령
   /image-prompt 프롬프트    입력한 문장을 그대로 그림 모델에 전달(기본 1024×1024)
                            앞에 --model=zimage|qwen|anime 를 붙이면 그 모델로(없으면 자동 선택)
   /video-prompt 프롬프트    입력한 문장을 그대로 영상 모델에 전달(기본 720p·5초)
+  /archive                 월별 대화 기록(data/archive/26년 11월.md …) 상태 — 답할 때마다 자동으로 적힘
+  /archive-year 연도        그해 월별 기록으로 연간 보고서(YY년 대화.md)
+  /video-swap 영상주소 [:: 설명]  영상의 움직임은 그대로 주인공만 바꾸기(먼저 '참고 그림 올리기' 로 새 주인공 사진, 최대 12초)
+  /video-long 초 설명 [| 다음 장면 | …]  5초 조각을 이어 10~60초 영상(조각마다 약 4분)
   /characters              저장한 캐릭터 목록. 그림 뒤 '이 캐릭터를 은비로 저장해줘' 라고 하면 저장된다
   /character save 이름      방금 그림을 그 이름의 캐릭터로 저장(이후 '은비가 ~ 장면 그려줘' 로 같은 모습 유지)
   /character delete 이름    저장한 캐릭터 지우기(그림 원본은 남는다)
@@ -127,6 +136,11 @@ HELP_TEXT = """사용 가능한 명령
   /undo-file 경로 --yes      해당 파일의 가장 최근 ALEX 백업으로 복구
   /undo-bundle ID --yes      적용한 묶음을 통째로 되돌림 (그 뒤 바뀐 파일이 있으면 거부)
   /build 요청               코딩 모델이 작업 폴더(data/builds)에 파일을 직접 만들고 검사가 통과할 때까지 고침
+  /download 주소 [--yes]    인터넷 파일을 data/downloads 에(말로 '내려받아줘' 도 됨). 실행 파일·1GB 넘으면 --yes 승인, 실행은 안 함
+  /cloud-default [claude|codex]   이름을 말하지 않고 넘길 때 먼저 맡길 쪽(지금 값 보기·바꾸기)
+  /cloud [claude|codex] [@하위폴더] 요청   어려운 일을 클라우드에(말로 '클라우드로 넘겨줘'도 됨). 프로젝트 폴더 복사본에서 고치고 ALEX 가 확인 → 승인해야 적용
+  /rtl-tests 폴더 [회수]   검증 쓰기: 규격·포트만 보고 시험기(verify/alex_tb.v)를 쓰고, 설계에 넣은 고장을 몇 개 잡는지로 확인·보강
+  /eda 폴더 [synth|formal|fpga]   RTL 프로젝트 합성(셀·래치)·형식 검증(*.sby)·FPGA 최고 주파수 — 종류를 빼면 셋 다
   /rtl 폴더 [회수] [--continue]  Verilog 설계: 모델이 쓰고 린트·시뮬레이션 결과로 스스로 고침(fabless 폴더의 규격·시험기 기준)
                            (채팅의 '~ 만들어줘' 는 코드를 답으로 주고 뒤에서 실행만 확인)
   /dev-start 파일[, 파일2…] :: 테스트[, 테스트2…] :: 목표   개발 작업 시작 (여러 파일이면 묶음 수정안, 테스트는 모두 통과해야 함)
@@ -485,6 +499,28 @@ def build_cloud_providers(settings: Settings) -> tuple[BaseLLMProvider, BaseLLMP
     ]
 
 
+def cloud_default(core: JarvisCore, choice: str) -> str:
+    """이름을 말하지 않고 클라우드로 넘길 때 먼저 맡길 쪽(ADR-102). jarvis.local.json 의 cloud_agent 한 칸만 바꾼다."""
+    labels = {"claude": "Claude Code", "codex": "Codex"}
+    current = core.cloud_agents.default
+    if not choice:
+        return (f"클라우드 기본: {labels[current]} — 이름을 말하지 않으면 먼저 맡기고, 한도·오류면 다른 쪽이 대신합니다.\n"
+                f"바꾸기: /cloud-default {'codex' if current == 'claude' else 'claude'}")
+    if choice not in labels:
+        return "사용법: /cloud-default claude 또는 /cloud-default codex"
+    path = local_config_path()
+    data = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    data["cloud_agent"] = choice
+    temporary = path.with_name(path.name + ".tmp")
+    try:
+        temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    core.cloud_agents.default = choice
+    return f"클라우드 기본을 {labels[choice]} 로 바꿨습니다(다시 시작해도 유지)."
+
+
 def build_summary_provider(general: BaseLLMProvider, settings: Settings) -> BaseLLMProvider:
     """Same local model, cheaper request settings for periodic conversation summaries."""
     if not isinstance(general, OllamaProvider) or not general.think:
@@ -505,6 +541,13 @@ def build_summary_provider(general: BaseLLMProvider, settings: Settings) -> Base
         num_gpu=general.num_gpu,
         keep_alive=general.keep_alive,
     )
+
+
+def build_memory_vectors(settings: Settings) -> MemoryVectors | None:
+    """기억 뜻 검색(ADR-094). 꺼져 있으면 None — 낱말 검색만. 서버가 안 떠 있어도 만든다(질문 때 없으면 낱말로 대신)."""
+    if not settings.embedding_enabled:
+        return None
+    return MemoryVectors(settings.data_dir / "embeddings.db", EmbeddingClient(settings.embedding_host))
 
 
 def build_core(
@@ -593,10 +636,11 @@ def build_core(
             context=settings.strata_num_ctx if settings.local_backend == "strata" else settings.opencode_context,
             timeout=settings.opencode_timeout,
             host=settings.strata_host if settings.local_backend == "strata" else settings.ollama_host,
-            backend=settings.local_backend) if settings.coding_worker == "opencode" else None,
+            backend=settings.local_backend) if settings.coding_worker == "opencode" else None,  # harness 는 아래에서
         rtl_root=Path(settings.rtl_root) if settings.rtl_root else Path(__file__).resolve().parents[2] / "fabless",
         rtl_tools_dir=Path(settings.rtl_tools_dir) if settings.rtl_tools_dir else Path("C:/oss-cad-suite"),
         image_generator=build_image_generator(settings),
+        memory_vectors=build_memory_vectors(settings),
         require_cloud_approval=settings.require_cloud_approval,
         approval_callback=approval_callback,
         response_chunk_callback=response_chunk_callback,
@@ -608,6 +652,22 @@ def build_core(
         summary_max_chars=settings.summary_max_chars,
         misroute_log_path=settings.log_dir / "misroute.jsonl",
     )
+    if settings.coding_worker == "harness":  # ALEX 코딩 하네스(ADR-112) — OpenCode 방식을 ALEX 코드로, 모델은 지금 코딩 모델
+        from .harness.worker import HarnessWorker
+        from .router import Destination as _Destination
+        harness = HarnessWorker(lambda: core.providers.get(_Destination.LOCAL_CODER), timeout=settings.opencode_timeout)
+        harness.before_run = core._release_media_for_worker
+        harness.progress = core._progress
+        harness.logger = core.logger
+        core.opencode_worker = harness
+        notes.append("Coding worker: ALEX harness (ADR-112)")
+    # 영상 링크 읽기(ADR-098): C:\ALEX\tools\video 에 yt-dlp·Deno 가 있으면 켠다
+    tools = Path(__file__).resolve().parents[2] / "tools"
+    video_reader = VideoReader(tools / "video", transcriber=Transcriber(tools / "whisper"))  # 받아쓰기(ADR-108)는 있으면 켬
+    core.video_reader = video_reader if video_reader.available() else None
+    if core.video_reader is not None:
+        notes.append("Video links: captions via yt-dlp (ADR-098)"
+                     + (", speech via whisper.cpp (ADR-108)" if video_reader.can_listen() else ""))
     saved_project = storage.get_state("active_project_relative")
     if saved_project and saved_project not in {"", "."}:
         try:
@@ -615,6 +675,7 @@ def build_core(
             notes.append(f"Restored project root: {restored}")
         except (ToolError, StorageError) as exc:
             notes.append(f"Saved project root restore skipped: {exc}")
+    core.cloud_agents = CloudAgents(settings.cloud_agent, settings.cloud_agent_timeout)
     return core, notes
 
 
@@ -751,6 +812,53 @@ def _bundle_as_proposal(bundle):
                            diff=bundle.diff, proposed_text=bundle.diff)
 
 
+
+# 자동 실행 권한(ADR-095): 이번 답의 수정안을 바로 적용한다. 단계 정의는 permissions.py.
+_APPLY_LINE = re.compile(r"^적용: /apply-edit ([A-Za-z0-9_-]+) --yes$", re.M)
+
+
+def auto_apply_proposals(core: JarvisCore, response: str) -> str:
+    """'자동 실행' 권한: 이번 답에 나온 수정안을 바로 적용하고, 답을 '적용함 + 되돌리는 법' 으로 바꿔 돌려준다.
+
+    적용 전에 원본을 백업한다(/apply-edit 과 같은 길). 사람이 diff 를 보고 승인한 것이 아니므로 '좋은 예' 경험으로는
+    기록하지 않는다. ALEX 자기 프로그램 파일을 바꾸는 수정안은 적용하지 않고 사람 확인으로 남긴다(permissions.py).
+    """
+    if core.workspace_editor is None:
+        return response
+    notes, applied = [], []
+    root = core.workspace_editor.allowed_root
+    for proposal_id in dict.fromkeys(_APPLY_LINE.findall(response)):
+        bundle = core.workspace_editor.get_bundle(proposal_id)
+        proposal = None if bundle is not None else core.workspace_editor.get(proposal_id)
+        paths = [c.relative_path for c in bundle.changes] if bundle is not None else [proposal.relative_path] if proposal else []
+        if any(is_alex_program(root / path) for path in paths):
+            notes.append(f"[자동 실행] 수정안 {proposal_id} 은 ALEX 자기 프로그램 파일을 바꾸므로 자동으로 적용하지 않았습니다. "
+                         "diff 를 확인한 뒤 위의 적용 명령으로 직접 적용하세요.")
+            continue
+        try:
+            if bundle is not None:
+                targets, backup = core.workspace_editor.apply_bundle(proposal_id)
+                notes.append(f"[자동 실행] 묶음 적용 — 파일 {len(targets)}개, 원본 백업: {backup}\n"
+                             f"되돌리기: /undo-bundle {proposal_id} --yes")
+            else:
+                target, backup = core.workspace_editor.apply(proposal_id)
+                notes.append(f"[자동 실행] 적용 — {target}, 원본 백업: {backup}\n"
+                             f"되돌리기: /undo-file {proposal.relative_path} --yes")
+        except ToolError as exc:
+            notes.append(f"[자동 실행] 수정안 {proposal_id} 을 적용하지 못했습니다: {exc}")
+            continue
+        applied.append(proposal_id)
+        DeveloperMode(core).approved(proposal_id)
+    if not notes:
+        return response
+    for proposal_id in applied:  # 이미 적용했으니 '적용·폐기' 안내는 지운다
+        response = re.sub(rf"^(?:적용: /apply-edit {proposal_id} --yes|폐기: /discard-edit {proposal_id})\n?", "",
+                          response, flags=re.M)
+    if applied and not _APPLY_LINE.search(response):
+        response = response.replace("아직 파일에는 적용되지 않았습니다. diff를 확인하세요.\n", "")
+    return response.rstrip() + "\n\n" + "\n".join(notes)
+
+
 def build_image_generator(settings: Settings) -> ComfyImageGenerator | None:
     """그림 그리기(ADR-073). 꺼져 있으면 None. 폴더 설정이 비면 ALEX 폴더 옆 comfyui\\ComfyUI_windows_portable."""
     if not settings.image_generation_enabled:
@@ -819,6 +927,29 @@ def handle_command(core: JarvisCore, session_id: str, text: str) -> tuple[str, b
                     "이어서 '고쳐줘' 라고 하면 같은 폴더에서 이어서 고칩니다."), True, session_id
         answer, _ = core.handle_build(session_id, request)
         return answer, True, session_id
+
+    # 어려운 일은 클라우드로(ADR-102). 웹은 이 명령을 뒤 작업으로 돌리며 클라우드가 일하는 동안 잠금을 푼다.
+    # 말로 내려받기(ADR-104)와 같은 길 — 승인 버튼은 '/download 주소 --yes'
+    if text == "/download" or text.startswith("/download "):
+        rest = text.removeprefix("/download").strip()
+        url = rest.removesuffix("--yes").strip()
+        if not url:
+            return ("사용법: /download 주소 [--yes] — data/downloads 에 받습니다. 실행 파일·1GB 넘는 파일은 --yes 로 승인해야 받고, "
+                    "받은 파일은 실행하지 않습니다. 말로 '이 파일 내려받아줘 주소' 도 됩니다."), True, session_id
+        matched = url + (" --yes" if rest.endswith("--yes") else "")
+        return core._handle_decision(session_id, text, RouteDecision(Destination.LOCAL_GENERAL, DOWNLOAD_REASON, matched))[0], \
+            True, session_id
+
+    if text == "/cloud" or text.startswith("/cloud "):
+        return core.handle_cloud(session_id, text), True, session_id
+    if text == "/cloud-default" or text.startswith("/cloud-default "):
+        return cloud_default(core, text.removeprefix("/cloud-default").strip().lower()), True, session_id
+
+    if text == "/rtl-tests" or text.startswith("/rtl-tests "):
+        return core.handle_rtl_tests(session_id, text), True, session_id
+
+    if text == "/eda" or text.startswith("/eda "):
+        return core.handle_eda(session_id, text), True, session_id
 
     if text == "/rtl" or text.startswith("/rtl "):
         parts = text.removeprefix("/rtl").split()
@@ -1032,6 +1163,31 @@ def handle_command(core: JarvisCore, session_id: str, text: str) -> tuple[str, b
         return core.handle_forced(session_id, prompt, Destination.TOOL_IMAGE_GEN, reason="direct media prompt",
                                   matched=model.group(1) if model else "manual")[0], True, session_id
 
+    # 월별 대화 기록(ADR-100)
+    if text == "/archive":
+        added = core.archive.sync()
+        files = sorted(core.archive.folder(OWNER).glob("*.md"))
+        listing = "\n".join(f"  {path.name} ({path.stat().st_size // 1024:,} KB)" for path in files[-14:]) or "  (아직 없음)"
+        return (f"월별 대화 기록: {core.archive.folder(OWNER)}\n방금 {added}개 메시지를 덧붙였습니다.\n{listing}\n"
+                "한 달에 파일 하나(글만). 1월 1일이 지나면 /archive-year 연도 로 연간 보고서를 만듭니다."), True, session_id
+    if text.startswith("/archive-year"):
+        year_text = text.removeprefix("/archive-year").strip()
+        if not year_text.isdigit():
+            return "사용법: /archive-year 2026", True, session_id
+        if not core.archive.months(int(year_text)):
+            return f"{year_text}년 월별 기록이 없습니다.", True, session_id
+        core.archive.sync()
+        summarizer = core.local_summarizer
+        path = core.archive.year_report(int(year_text), lambda messages: summarizer.generate(messages),
+                                        progress=getattr(core, "_progress", None))
+        return f"연간 보고서를 만들었습니다: {path}", True, session_id
+
+    # 영상 명령(ADR-099): 영상 속 대상 바꾸기·긴 영상. 대화 기록에 남도록 일반 영상과 같은 길(handle_forced)로.
+    for command, reason in (("/video-swap", "video swap"), ("/video-long", "video long")):
+        if text == command or text.startswith(command + " ") or text.startswith(command + "\n"):
+            return core.handle_forced(session_id, text, Destination.TOOL_VIDEO_GEN, reason=reason,
+                                      matched=command)[0], True, session_id
+
     if text == "/video-prompt" or text.startswith("/video-prompt ") or text.startswith("/video-prompt\n"):
         prompt = text.removeprefix("/video-prompt").strip()
         model = re.match(r"--model=(ltx|wan)(?:\s+|$)", prompt)
@@ -1165,6 +1321,7 @@ def handle_command(core: JarvisCore, session_id: str, text: str) -> tuple[str, b
             return str(exc), True, session_id
         if not removed:
             return f"세션을 찾을 수 없습니다: {target}", True, session_id
+        core.forget_session_documents(target)  # 그 대화에만 올린 문서도(ADR-096)
         if target == session_id:
             session_id = core.get_or_create_session(resume=False, owner=owner)
             core.last_route_event_id = None

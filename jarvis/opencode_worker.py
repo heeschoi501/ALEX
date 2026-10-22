@@ -68,6 +68,8 @@ def _copy_project(source: Path, target: Path) -> None:
 
 
 class OpenCodeWorker:
+    name, label = "opencode", "오픈코드"
+
     def __init__(self, home: Path, model: str, *, context: int = 32768, timeout: float = 900.0,
                  host: str = "http://127.0.0.1:11434", command: list[str] | None = None, backend: str = "ollama") -> None:
         self.home = Path(home)                      # C:\ALEX\tools\opencode — opencode.exe·xdg-cache(공급자 패키지)

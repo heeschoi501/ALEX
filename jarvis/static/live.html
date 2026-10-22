@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="jarvis-token" content="__TOKEN__">
+<meta name="theme-color" content="#000000">
+<title>ALEX 실시간 통역</title>
+<link rel="stylesheet" href="/live.css">
+</head>
+<body>
+<main id="board">
+  <div id="lines" aria-hidden="true"></div>
+  <section id="current" aria-live="polite">
+    <p id="source" class="source"></p>
+    <p id="korean" class="korean">시작을 누르면 듣기 시작합니다.<br><small>중국어·영어·일본어 → 한국어 자막. 한국어는 받아 적은 그대로.</small></p>
+  </section>
+</main>
+<footer id="bar">
+  <button id="toggle" type="button">시작</button>
+  <span id="status" class="status">대기</span>
+  <span id="timing" class="timing"></span>
+  <span class="spacer"></span>
+  <label class="record"><input type="checkbox" id="record" checked> 기록</label>
+  <button id="smaller" type="button" aria-label="글자 작게">가−</button>
+  <button id="bigger" type="button" aria-label="글자 크게">가+</button>
+  <a id="room" href="/" class="link">대화</a>
+</footer>
+<script src="/live.js"></script>
+</body>
+</html>

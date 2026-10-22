@@ -203,5 +203,78 @@ class WebHTTPTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 415)
 
 
+    def test_code_session_api(self):
+        """코딩 세션 API(ADR-112 — OpenCode 서버와 같은 일): 만들기 → 요청 → 사건 흐름 → 바뀐 내용·할 일·대화 → 되돌리기 → 지우기."""
+        class Fake:
+            think, model = False, "fake"
+
+            def __init__(self):
+                self.steps = [("", [{"function": {"name": "write", "arguments": {"filePath": "n.py", "content": "n = 1\n"}}}]),
+                              ("", [{"function": {"name": "todowrite", "arguments": {"todos": [{"content": "n.py", "status": "completed"}]}}}]),
+                              ("만들었습니다", [])]
+
+            def chat_step(self, messages, tools=None, on_chunk=None):
+                content, calls = self.steps.pop(0)
+                if on_chunk and content:
+                    on_chunk(content)
+                return content, calls
+
+        root = Path(self.temp.name).resolve()
+        (root / "proj").mkdir()
+        self.state.core._approved_file_root = root
+        fake = Fake()
+        self.state.code.provider_getter = lambda: fake
+        headers = {"X-Jarvis-Token": "test-token", "Content-Type": "application/json"}
+
+        def call(method, path, body=None):
+            data = json.dumps(body).encode("utf-8") if body is not None else (b"" if method == "POST" else None)
+            request = urllib.request.Request(self.base + path, data=data, headers=headers, method=method)
+            try:
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    return response.status, json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                return exc.code, json.loads(exc.read().decode("utf-8"))
+
+        self.assertEqual(call("POST", "/api/code/session", {"directory": "../outside"})[0], 400)
+        status, created = call("POST", "/api/code/session", {"directory": "proj", "tier": "auto"})
+        self.assertEqual(status, 200)
+        sid = created["session"]["id"]
+        request = urllib.request.Request(self.base + "/api/code/session", headers={"Content-Type": "application/json"},
+                                         data=b"{}", method="POST")
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(request, timeout=2)
+        self.assertEqual(ctx.exception.code, 403)  # 토큰 없으면 거절
+        status, _ = call("POST", f"/api/code/session/{sid}/prompt_async", {"parts": [{"type": "text", "text": "n.py 만들어"}]})
+        self.assertEqual(status, 200)
+        events = []
+        stream = urllib.request.Request(self.base + f"/api/code/event?session={sid}&since=0", headers=headers)
+        with urllib.request.urlopen(stream, timeout=10) as response:
+            self.assertEqual(response.headers["Content-Type"], "text/event-stream; charset=utf-8")
+            for raw in response:
+                line = raw.decode("utf-8").strip()
+                if line.startswith("data: "):
+                    events.append(json.loads(line[6:]))
+                    if events[-1]["type"] == "session.idle":
+                        break
+        types = [e["type"] for e in events]
+        self.assertEqual((types[0], types[1], types[-1]), ("session.created", "message.user", "session.idle"))
+        self.assertIn("message.delta", types)
+        self.assertEqual(events[-1]["result"]["text"], "만들었습니다")
+        self.assertIn("+n = 1", call("GET", f"/api/code/session/{sid}/diff")[1]["diff"])
+        self.assertEqual(call("GET", f"/api/code/session/{sid}/todo")[1]["todos"][0]["content"], "n.py")
+        self.assertEqual(call("GET", f"/api/code/session/{sid}/message")[1]["messages"][0]["content"], "n.py 만들어")
+        self.assertEqual([s["id"] for s in call("GET", "/api/code/session")[1]["sessions"]], [sid])
+        self.assertEqual(call("POST", f"/api/code/session/{sid}/revert", {"step": 0})[1]["files"], ["n.py"])
+        self.assertFalse((root / "proj" / "n.py").exists())
+        self.assertEqual(call("POST", f"/api/code/session/{sid}/permissions/per_x", {"response": "once"})[0], 404)
+        self.assertEqual(call("POST", f"/api/code/session/{sid}/delete")[0], 200)
+        self.assertEqual(call("GET", f"/api/code/session/{sid}")[0], 404)
+        status, page, _ = self._get("/code", {})
+        self.assertEqual(status, 200)
+        self.assertIn("test-token", page)
+        self.assertIn('src="/code.js"', page)
+        self.assertEqual(self._get("/code.js", {})[0], 200)
+        self.assertEqual(call("GET", "/api/code/path")[1]["root"], str(root))
+
 if __name__ == "__main__":
     unittest.main()

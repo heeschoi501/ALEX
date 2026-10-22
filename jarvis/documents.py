@@ -40,6 +40,36 @@ A = "http://schemas.openxmlformats.org/drawingml/2006/main"
 P = "http://schemas.openxmlformats.org/presentationml/2006/main"
 
 
+# 말로 문서 만들기(2026-10-22, ADR-104): '워드로 만들어줘'·'엑셀로 정리해줘'·'이거 PDF로 저장해줘'.
+# 형식을 직접 말하면(워드·엑셀·PDF·PPT) 만들어·저장해·정리해… 를 받고, 그냥 '문서' 는 '문서로 만들어줘' 처럼 '~로' 가 있을 때만
+# ('이 문서 정리해줘' 는 올린 문서 요약 요청이다). '만드는 법'·'만들어 주는 코드' 같은 물음·부탁은 걸리지 않는다.
+_DOC_VERB = r"(?:만들어|저장해|뽑아|내보내|변환해|바꿔|정리해|작성해|써)\s*(?:줘|주세요|줄래|봐|줄\s*수\s*있)"
+_DOC_FORMATS = (("파워\\s*포인트|pptx?|발표\\s*자료|슬라이드", "pptx"), ("엑셀|excel|xlsx|스프레드\\s*시트", "xlsx"),
+                ("워드|word|docx", "docx"), ("pdf", "pdf"))
+_DOC_EXPLICIT = re.compile(r"(?P<fmt>" + "|".join(words for words, _ in _DOC_FORMATS) + r")\s*(?:문서|파일|자료|형식)?\s*"
+                           r"(?:로|으로|를|을|파일로)?\s*" + _DOC_VERB, re.I)
+_DOC_GENERIC = re.compile(r"문서\s*(?:파일)?\s*(?:로|으로)\s*" + _DOC_VERB)
+_DOC_PREVIOUS = re.compile(r"(이거|이걸|이것|위\s*(?:의\s*)?(?:내용|답|글)|방금|앞(?:의)?\s*(?:답|내용)|이\s*(?:답|내용|글|대화)|"
+                           r"지금까지|그대로)")
+
+
+def document_request(text: str) -> tuple[str, str] | None:
+    """(형식, 'previous'|'new') — 앞 답을 파일로 저장할지, 요청대로 새로 써서 파일로 만들지. 문서 요청이 아니면 None."""
+    match = _DOC_EXPLICIT.search(text)
+    if match:
+        word = match.group("fmt").lower()
+        name = next(fmt for words, fmt in _DOC_FORMATS if re.fullmatch(words, word, re.I))
+    else:
+        match = _DOC_GENERIC.search(text)
+        if not match:
+            return None
+        name = "docx"
+    rest = re.sub(r"[\s\W\d_]+", "", (text[:match.start()] + text[match.end():]))
+    rest = re.sub(r"(파일|문서|형식|으로|로|좀|해서|그거|저거)", "", rest)
+    previous = bool(_DOC_PREVIOUS.search(text)) or len(rest) < 3
+    return name, "previous" if previous else "new"
+
+
 class DocumentError(ValueError):
     """A document cannot be created without losing or misrepresenting input."""
 

@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="jarvis-token" content="__TOKEN__">
+<title>ALEX 코딩</title>
+<link rel="stylesheet" href="/code.css">
+</head>
+<body>
+<aside id="side">
+  <div class="side-head"><strong>ALEX 코딩</strong><a href="/" class="link">대화로</a></div>
+  <form id="new-form">
+    <label>폴더 <input id="new-dir" autocomplete="off" spellcheck="false"></label>
+    <small id="root-note" class="muted"></small>
+    <label>권한
+      <select id="new-tier">
+        <option value="read">읽기만</option>
+        <option value="ask" selected>확인 후 실행</option>
+        <option value="auto">자동 실행</option>
+      </select>
+    </label>
+    <button class="primary" type="submit">새 세션</button>
+  </form>
+  <div class="side-label">세션</div>
+  <nav id="list" aria-label="코딩 세션"></nav>
+</aside>
+<div id="backdrop" hidden></div>
+<main id="main">
+  <header id="top">
+    <button id="menu" type="button" class="secondary narrow" aria-label="세션 목록">목록</button>
+    <div class="title"><strong id="title">세션을 고르거나 새로 만드세요</strong><small id="dir" class="muted"></small></div>
+    <span id="status" class="badge" hidden></span>
+    <button id="diff-open" type="button" class="secondary" disabled>바뀐 내용</button>
+    <button id="abort" type="button" class="secondary danger" disabled>중단</button>
+  </header>
+  <section id="todos" hidden></section>
+  <div id="scroll"><div id="log" aria-live="polite"></div></div>
+  <form id="composer">
+    <textarea id="input" rows="3" placeholder="무엇을 할까요? (Enter 보내기 · Shift+Enter 줄바꿈)" disabled></textarea>
+    <div class="row">
+      <select id="mode" disabled aria-label="모드">
+        <option value="build">실행</option>
+        <option value="plan">계획만</option>
+      </select>
+      <span id="hint" class="muted"></span>
+      <span class="spacer"></span>
+      <button id="send" class="primary" type="submit" disabled>보내기</button>
+    </div>
+  </form>
+</main>
+<dialog id="diff-dialog">
+  <div class="dialog-head">
+    <strong>바뀐 내용</strong><span class="spacer"></span>
+    <button id="revert" type="button" class="secondary danger">처음으로 되돌리기</button>
+    <button id="diff-close" type="button" class="secondary">닫기</button>
+  </div>
+  <pre id="diff" class="diff"></pre>
+</dialog>
+<script src="/markdown.js"></script>
+<script src="/code.js"></script>
+</body>
+</html>

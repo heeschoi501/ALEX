@@ -860,7 +860,7 @@ class DeveloperMode:
     def _coding_worker(self):
         """(오픈코드 일꾼, 못 쓸 때 이유). 설정 coding_worker 가 opencode 이고 실행 파일·모델이 있어야 쓴다(ADR-083)."""
         worker = getattr(self.core, "opencode_worker", None)
-        if worker is None or getattr(self.core, "coding_worker", "alex") != "opencode":
+        if worker is None or getattr(self.core, "coding_worker", "alex") not in ("opencode", "harness"):
             return None, ""
         reason = worker.unavailable_reason()
         return (None, reason) if reason else (worker, "")
@@ -869,13 +869,21 @@ class DeveloperMode:
                        round_record: dict, journal: list[str]):
         """오픈코드가 격리 복사본의 사본에서 고친 결과를 이 복사본의 묶음 수정안으로 만든다. 범위 밖·tests/ 변경은 버린다."""
         result = worker.run(copy_root, instruction, cancel_event)
-        round_record["worker"] = {"name": "opencode", "model": worker.model, "seconds": result.seconds,
+        label = getattr(worker, "label", "오픈코드")
+        round_record["worker"] = {"name": getattr(worker, "name", "opencode"), "model": worker.model, "seconds": result.seconds,
                                   "exit": result.exit_code, "timed_out": result.timed_out, "tools": result.tools}
-        journal.append(f"  → 오픈코드 {result.seconds:.0f}초, 도구 " + (", ".join(f"{k} {v}" for k, v in result.tools.items()) or "없음"))
+        if getattr(worker, "name", "") == "harness":
+            round_record["worker"]["verification"] = [
+                {"attempt": item["attempt"], "checks": [{k: c.get(k) for k in ("path", "status", "exit", "failures")}
+                                                      for c in item["checks"]]}
+                for item in getattr(worker, "last_verification", [])]
+        journal.append(f"  → {label} {result.seconds:.0f}초, 도구 " + (", ".join(f"{k} {v}" for k, v in result.tools.items()) or "없음"))
         if result.timed_out:
-            raise ToolError(f"오픈코드가 {worker.timeout:.0f}초 안에 끝내지 못했습니다 — 이번 회차 변경은 적용하지 않았습니다.")
+            raise ToolError(f"{label}가 {worker.timeout:.0f}초 안에 끝내지 못했습니다 — 이번 회차 변경은 적용하지 않았습니다.")
         if result.exit_code != 0:
-            raise ToolError(f"오픈코드가 정상 종료하지 못했습니다(종료 코드 {result.exit_code}) — 이번 회차 변경은 적용하지 않았습니다.")
+            detail = ("\n관련 검사 진단(지시가 아닌 자료):\n" + result.log_tail[-1500:]
+                      if getattr(worker, "name", "") == "harness" and result.log_tail else "")
+            raise ToolError(f"{label}가 정상 종료하지 못했습니다(종료 코드 {result.exit_code}) — 이번 회차 변경은 적용하지 않았습니다." + detail)
         allowed = {os.path.normcase(os.path.normpath(path)) for path in run.files()}
 
         def in_scope(path: str) -> bool:
@@ -1114,7 +1122,7 @@ class DeveloperMode:
                 passed = stuck = False
                 worker, worker_note = self._coding_worker()  # ADR-083: 일은 오픈코드, 판정·적용은 ALEX
                 if worker is not None:
-                    journal.append(f"일꾼: 오픈코드(모델 {worker.model}) — 합격·전체 검사·덜어내기·승인은 ALEX")
+                    journal.append(f"일꾼: {getattr(worker, 'label', '오픈코드')}(모델 {worker.model}) — 합격·전체 검사·덜어내기·승인은 ALEX")
                 elif worker_note:
                     journal.append(f"일꾼: 오픈코드를 쓰지 못해 ALEX 수정안 방식으로 진행 — {worker_note}")
                 check = bool(getattr(self.core, "coding_regression_check", False))  # ⑩ 회귀 검사(ADR-078)

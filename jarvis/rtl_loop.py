@@ -9,7 +9,10 @@ AutoChip(arXiv 2311.04887)의 피드백 순환을 참고한다: 생성 → 컴�
               "test": ["{python}", "verify/run_tests.py", "{file}", "--json", "{report}"], "max_rounds": 6}
   spec.md    설계 규격
   verify/    시험기(사람이 쓴 것) — 결과 JSON: {"시험이름": {"ok": bool, "problems": [...], "about": "...", "source": "..."}}
-모델은 `file` 하나만 쓴다. 시험기·규격·rtl.json 은 건드리지 못한다. 모델이 쓴 Verilog 는 시뮬레이터에서만 돈다 —
+  (선택) "deps": ["fifo3-growth", …]  — 같은 rtl_root 의 **검증된** 다른 프로젝트 설계(2026-10-22, ADR-103). 읽기 전용으로
+             린트·시험에 함께 들어가고(test 명령의 "{deps}" 자리에 파일 경로들), 모델에게는 그 모듈의 포트만 보여 준다.
+             검증 = 그 프로젝트 rtl-run.json 이 verified 이고 final_sha256 이 지금 파일과 같음(검증 뒤 바뀌면 다시 /rtl).
+모델은 `file` 하나만 쓴다. 시험기·규격·rtl.json·의존 블록은 건드리지 못한다. 모델이 쓴 Verilog 는 시뮬레이터에서만 돈다 —
 파일·명령 실행 시스템 태스크($system, $fopen 등)가 있으면 실행하지 않고 고치라고 돌려보낸다.
 """
 from __future__ import annotations
@@ -55,9 +58,11 @@ class RtlProject:
     test: list[str]
     max_rounds: int = MAX_ROUNDS
     expected_tests: tuple[str, ...] = ()
+    deps: tuple[Path, ...] = ()                                   # 검증된 블록 파일(의존의 의존 먼저)
+    dep_modules: dict[str, str] = field(default_factory=dict)     # 모듈 이름 → 포트 머리
 
     @classmethod
-    def load(cls, root: Path) -> "RtlProject":
+    def load(cls, root: Path, _stack: tuple[Path, ...] = ()) -> "RtlProject":
         root = Path(root).resolve()
         config = json.loads((root / PROJECT_FILE).read_text(encoding="utf-8"))
         if not isinstance(config, dict) or not isinstance(config.get("test"), list) or not config["test"]:
@@ -79,7 +84,38 @@ class RtlProject:
             raise ValueError(f"최상위 모듈 이름이 올바르지 않습니다: {project.top}")
         if not 1 <= project.max_rounds <= MAX_ALLOWED_ROUNDS:
             raise ValueError(f"최대 회수는 1~{MAX_ALLOWED_ROUNDS}여야 합니다.")
+        names = config.get("deps", [])
+        if not isinstance(names, list) or any(not isinstance(name, str) or not name.strip() for name in names):
+            raise ValueError("deps 는 같은 RTL 폴더 안의 검증된 프로젝트 폴더 이름 목록이어야 합니다.")
+        if names and "{deps}" not in project.test:
+            raise ValueError('deps 를 쓰면 rtl.json 의 test 명령에 "{deps}" 를 넣어 시험기가 의존 블록 파일도 함께 컴파일하게 하세요.')
+        files: list[Path] = []
+        for name in names:
+            dep_root = (root.parent / name).resolve()
+            if dep_root.parent != root.parent or dep_root == root:
+                raise ValueError(f"의존 블록은 같은 RTL 폴더의 다른 프로젝트여야 합니다: {name}")
+            if dep_root in _stack + (root,):
+                raise ValueError(f"의존 블록이 서로를 가리킵니다(순환): {name}")
+            dep = cls.load(dep_root, _stack + (root,))
+            if not verified_now(dep):
+                raise ValueError(f"의존 블록 '{name}' 이 검증되지 않았거나 검증 뒤 바뀌었습니다 — 먼저 /rtl {name} 로 "
+                                 "모든 시험을 통과시키세요(이미 통과한 것이면 /rtl {name} --continue 로 다시 확인).")
+            for path in (*dep.deps, dep.target.resolve()):
+                if path not in files:
+                    files.append(path)
+        project.deps = tuple(files)
+        for path in files:
+            project.dep_modules.update(module_headers(path.read_text(encoding="utf-8")))
         return project
+
+    @property
+    def prompt_spec(self) -> str:
+        """모델에게 주는 규격 — 의존 블록이 있으면 그 포트를 붙인다(다시 정의하지 말고 인스턴스로 쓰라고)."""
+        if not self.dep_modules:
+            return self.spec
+        headers = "\n\n".join(self.dep_modules.values())
+        return (f"{self.spec}\n\n[이미 검증된 블록 — 별도 파일로 함께 컴파일된다. 이 모듈들은 다시 정의하지 말고 인스턴스로 쓴다. "
+                f"그 밖의 모듈은 이 파일에 넣는다]\n```verilog\n{headers}\n```")
 
     @property
     def target(self) -> Path:
@@ -111,10 +147,46 @@ class RtlResult:
 def tools_env(tools_dir: Path) -> dict[str, str]:
     env = dict(os.environ)
     paths = [str(tools_dir / "bin"), str(tools_dir / "lib")]
+    riscv = riscv_bin()
+    if riscv is not None:
+        paths.append(str(riscv))
     env["PATH"] = os.pathsep.join(paths + [env.get("PATH", "")])
     env["VERILATOR_ROOT"] = str(tools_dir / "share" / "verilator")
     env["PYTHONUTF8"] = "1"
     return env
+
+
+def riscv_bin(base: Path | None = None) -> Path | None:
+    """RISC-V GCC(xPack, C:\\ALEX\\tools\\riscv) — 있으면 시험기가 riscv-none-elf-gcc 로 시험 프로그램을 만들 수 있다."""
+    base = base or Path(__file__).resolve().parents[2] / "tools" / "riscv"
+    found = sorted(base.glob("xpack-riscv-none-elf-gcc-*/bin"))
+    return found[-1] if found else None
+
+
+def _plain(code: str) -> str:
+    return re.sub(r'//[^\n]*|/\*.*?\*/|"(?:\\.|[^"\\])*"', '', code, flags=re.S)
+
+
+def defined_modules(code: str) -> set[str]:
+    return set(re.findall(r"^\s*(?:macro)?module\s+([A-Za-z_][A-Za-z0-9_$]*)", _plain(code), flags=re.M))
+
+
+def module_headers(code: str) -> dict[str, str]:
+    """모듈 이름 → 'module 이름 (...);' 머리(포트 목록까지). 의존 블록을 모델에게 보여 줄 때."""
+    headers = {}
+    for match in re.finditer(r"^\s*module\s+([A-Za-z_][A-Za-z0-9_$]*)[\s\S]*?\);", _plain(code), flags=re.M):
+        headers[match.group(1)] = match.group(0).strip()[:2000]
+    return headers
+
+
+def verified_now(project: "RtlProject") -> bool:
+    """마지막 /rtl 이 모든 시험을 통과했고, 그때의 설계 파일이 지금과 같은가."""
+    try:
+        record = json.loads((project.root / "rtl-run.json").read_text(encoding="utf-8"))
+        current = hashlib.sha256(project.target.read_text(encoding="utf-8").encode()).hexdigest()
+    except (OSError, ValueError):
+        return False
+    return bool(record.get("verified")) and record.get("final_sha256") == current
 
 
 def extract_code(answer: str) -> str:
@@ -178,8 +250,8 @@ def lint(project: RtlProject, tools_dir: Path, timeout: float = 120,
     exe = tools_dir / "bin" / ("verilator_bin.exe" if os.name == "nt" else "verilator_bin")
     if not exe.is_file():
         return -1, ""
-    done = _tool_run([str(exe), "--lint-only", "-Wall", "-Wno-DECLFILENAME", "--top-module", project.top, project.file],
-                     project, tools_dir, timeout, cancel_event)
+    done = _tool_run([str(exe), "--lint-only", "-Wall", "-Wno-DECLFILENAME", "--top-module", project.top, project.file,
+                      *(str(path) for path in project.deps)], project, tools_dir, timeout, cancel_event)
     lines = [line for line in (done.stdout + done.stderr).splitlines()
              if line.startswith(("%Warning", "%Error")) and not line.startswith("%Error: Exiting due to")]
     return len(lines) + (0 if done.returncode == 0 or lines else 1), "\n".join(lines[:20])
@@ -189,8 +261,13 @@ def run_tests(project: RtlProject, tools_dir: Path, report: Path, timeout: float
               cancel_event: threading.Event | None = None) -> tuple[dict, str]:
     """사람이 둔 시험기를 실행한다. (결과 JSON, 표준 출력 꼬리)."""
     report.unlink(missing_ok=True)
-    command = [part.replace("{python}", sys.executable).replace("{file}", str(project.target)).replace("{report}", str(report))
-               for part in project.test]
+    command: list[str] = []
+    for part in project.test:
+        if part == "{deps}":
+            command += [str(path) for path in project.deps]
+        else:
+            command.append(part.replace("{python}", sys.executable).replace("{file}", str(project.target))
+                           .replace("{report}", str(report)))
     done = _tool_run(command, project, tools_dir, timeout, cancel_event)
     report.with_suffix(".output.txt").write_text(done.stdout + done.stderr, encoding="utf-8")
     output = (done.stdout + done.stderr)[-3000:]
@@ -257,6 +334,10 @@ def run_rtl(generate: Callable[[list[Message]], str], project: RtlProject, tools
                               "strategy": "focused-repair-v1",
                               "seed_sha256": hashlib.sha256(seed.encode()).hexdigest(),
                               "spec_sha256": hashlib.sha256(project.spec.encode()).hexdigest(),
+                              # 검증된 블록으로 다른 프로젝트가 쓸 수 있는지 볼 때(verified_now) — 검증 순간의 파일
+                              "final_sha256": hashlib.sha256(project.target.read_text(encoding="utf-8").encode()).hexdigest()
+                              if result.verified and project.target.is_file() else "",
+                              "deps": [str(path) for path in project.deps],
                               "run_dir": str(rounds_dir), "rounds": [vars(r) for r in result.rounds]},
                              ensure_ascii=False, indent=1)
         (rounds_dir / "rtl-run.json").write_text(payload, encoding="utf-8")
@@ -286,9 +367,9 @@ def run_rtl(generate: Callable[[list[Message]], str], project: RtlProject, tools
             save()
             raise GenerationCancelled(f"RTL 작업을 중단했습니다. 지금까지의 코드: {project.target}")
         started = time.monotonic()
-        request = f"[설계 규격]\n{project.spec}"
+        request = f"[설계 규격]\n{project.prompt_spec}"
         if code:
-            messages = repair_messages(project.spec, code, last_feedback or '처음부터 다시 확인한다.')
+            messages = repair_messages(project.prompt_spec, code, last_feedback or '처음부터 다시 확인한다.')
         elif last_feedback:  # 아직 받아들인 코드가 없을 때도 지난 답이 거절된 이유는 알려 준다
             request += f"\n\n[지난 답의 문제]\n{last_feedback}"
             messages = [Message("system", RULES), Message("user", request)]
@@ -323,6 +404,9 @@ def run_rtl(generate: Callable[[list[Message]], str], project: RtlProject, tools
             problem = "답에 ```verilog 코드 블록이 없다. 전체 코드를 블록 하나로 다시 줘."
         elif code_problem(new_code):
             problem = code_problem(new_code)
+        elif clash := sorted(defined_modules(new_code) & set(project.dep_modules)):
+            problem = (f"검증된 블록 {', '.join(clash)} 를 이 파일에서 다시 정의했다. 그 모듈은 별도 파일로 함께 컴파일되니 "
+                       "정의를 빼고 인스턴스로만 써서 전체 코드를 다시 줘.")
         elif code and code_tokens(new_code) == code_tokens(code):
             problem = "실제 RTL 연산이 이전 코드와 같다(주석·공백 변경은 수정이 아니다). 같은 답을 반복하지 말고 실패 원인을 바꾸는 수정을 줘."
         else:

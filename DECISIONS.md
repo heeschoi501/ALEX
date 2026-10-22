@@ -1680,3 +1680,11 @@ RTX 5070 12GB 실측 IQ3_S 53 tok/s·프롬프트 1,620 tok/s. API 는 OpenAI �
 **결정:** 실행마다 부모가 작업 폴더 안에 빈 `.alex-tmp` 를 만들어 TEMP·TMP·TMPDIR 로 주고, 실행이 끝나면 치운다. 실행 중 감시(build_runner)는 os.remove·os.rmdir·os.chmod·os.truncate·os.rename 을 **경로가 모두 그 폴더 안일 때만** 허용한다(rename 은 양쪽, 파일 번호·dir_fd 상대 경로는 거절, 심볼릭 링크는 따라가 판정). 작업 파일·폴더와 그 밖의 지우기·이름 바꾸기는 지금처럼 금지하고, 생성 코드의 명시적 지우기(os.remove·shutil·.unlink 등)는 정적 검사가 계속 먼저 거절한다. 임시 폴더는 작업 파일 목록·정적 검사·API 요약에서 뺀다. 비교 도구(scripts/compare_python.py)도 같은 규칙을 쓰고, 과제의 준비 코드는 신뢰된 검사 코드라 보호 전에 실행한다.
 **검증:** test_build_loop 2개(임시 파일을 쓰는 프로그램이 통과하고 임시 폴더가 남지 않음 / getattr 로 정적 검사를 피한 작업 파일 지우기·임시 파일로 덮어쓰기·폴더 지우기는 실행 중 감시가 막고 파일 그대로) + test_model_compare 1개. 전체 1,350 중 실패 1(사용자 게임 파일 2dsoul 의존성 감사). code_check 로 TemporaryDirectory·csv 를 쓰는 프로그램이 ok_finished.
 **한계:** 운영체제 격리가 아니다(기존과 같음). 임시 폴더 안의 지우기만 늘었다.
+
+## ADR-112 — ALEX 자체 코딩 하네스 (2026-10-22 공개 기록)
+
+OpenCode의 코딩 절차·도구·권한·문맥 압축 방식을 ALEX 파이썬 코드로 옮겨 모델 서버와 직접 연결한다. 기존 외부 OpenCode 경로도 유지한다. MIT 출처와 라이선스를 보존하며 모델 학습으로 표현하지 않는다.
+
+목표 테스트 하나만 통과하고 관련 종료 계약을 놓친 사례에 따라 HarnessWorker에서 관련 검사를 독립 실행하고 실제 실패 출력으로 한 번 재수정한다. 검사 불명·전체 skip·단계 상한을 성공으로 처리하지 않는다. 직접 import 지도는 전체 회귀를 대체하지 않는다. 별도 `/code` 검증 공유와 호출 중 강제 시간 한도는 후속이다.
+
+개발 PC는 로컬 coding_worker=harness, 공개 기본 opencode 유지. 과거 비교와 오늘 단회 재검증은 조건이 달라 범용 우위를 주장하지 않는다. 상세 [하네스 검토](docs/CODEX_HARNESS_REVIEW_20261022.md)·[공개 인수인계](docs/HANDOFF_20261022.md).

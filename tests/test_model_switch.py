@@ -1,5 +1,6 @@
 """Engine switching contracts; no real models, GPUs, or downloads."""
 import json
+from dataclasses import replace
 import os
 from pathlib import Path
 import tempfile
@@ -185,6 +186,38 @@ class EngineSwitchTests(unittest.TestCase):
         self.assertIs(type(state.inactive_providers[0]), OllamaProvider)
         with patch("jarvis.providers.loaded_local_models", side_effect=ProviderError("malformed")), self.assertRaises(ProviderError):
             state.core._release_media_for_chat()
+
+    def test_harness_reasoning_save_keeps_worker_and_uses_new_provider(self):
+        from jarvis.harness.worker import HarnessWorker
+        self.state.settings = replace(self.state.settings, coding_worker="harness")
+        worker = HarnessWorker(lambda: self.state.core.providers.get(Destination.LOCAL_CODER))
+        self.state.core.opencode_worker = worker
+        old_provider = worker.provider_getter()
+        with patch.object(model_switch, "start_backend") as start, patch.object(model_switch, "release_current") as release:
+            result = self.state.save_settings({"strata_reasoning_effort": "high"})
+        self.assertTrue(result["saved"])
+        self.assertIs(self.state.core.opencode_worker, worker)
+        self.assertIsNot(worker.provider_getter(), old_provider)
+        self.assertEqual(worker.provider_getter().reasoning_effort, "high")
+        self.assertEqual(worker.before_run, self.state.core._release_media_for_worker)
+        self.assertEqual(load_settings().coding_worker, "harness")
+        start.assert_not_called()
+        release.assert_not_called()
+
+    def test_harness_engine_switch_keeps_worker_and_follows_selected_coder(self):
+        from jarvis.harness.worker import HarnessWorker
+        self.state.settings = replace(self.state.settings, coding_worker="harness")
+        worker = HarnessWorker(lambda: self.state.core.providers.get(Destination.LOCAL_CODER))
+        self.state.core.opencode_worker = worker
+        with patch.object(model_switch, "check_backend_install"), patch.object(model_switch, "release_current", return_value=[]), \
+             patch.object(model_switch, "start_backend"):
+            self.state.save_settings({"local_backend": "ollama", "desktop_general_model": "small:7b",
+                                      "desktop_coder_model": "coder:14b"})
+        self.assertIs(self.state.core.opencode_worker, worker)
+        self.assertIs(type(worker.provider_getter()), OllamaProvider)
+        self.assertEqual(worker.model, "coder:14b")
+        self.assertEqual(worker.before_run, self.state.core._release_media_for_worker)
+        self.assertEqual(load_settings().coding_worker, "harness")
 
 
 class ModelRuntimeTests(unittest.TestCase):

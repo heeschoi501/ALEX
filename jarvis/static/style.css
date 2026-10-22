@@ -195,6 +195,23 @@ h1{font-size:15px;margin:0;white-space:nowrap;text-overflow:ellipsis;overflow:hi
 .composer-tools{display:flex;align-items:center;gap:2px;min-width:0;margin-left:-8px}
 .composer-tools .icon-ghost{width:34px;height:34px}
 #model-label{font-size:12px;color:var(--muted);margin-left:8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* 대화별 권한(ADR-095) — 입력창의 고르기 버튼과 위로 열리는 메뉴 */
+.perm{position:relative;flex:none}
+.perm-button{display:inline-flex;align-items:center;gap:5px;height:30px;padding:0 9px;margin-left:4px;border-radius:999px;border:1px solid var(--line);background:none;color:var(--text-2);font-size:12.5px;white-space:nowrap}
+.perm-button:hover:not(:disabled){background:var(--hover);color:var(--text)}
+.perm-button .i{width:15px;height:15px}.perm-button .caret{width:13px;height:13px;margin-left:-2px}
+.perm-button[data-mode="read"]{color:var(--muted)}
+.perm-button[data-mode="auto"]{color:var(--warn);border-color:var(--warn-line)}
+.perm-menu{left:0;right:auto;width:330px;max-width:calc(100vw - 32px)}
+.perm-title{margin:4px 10px 6px;font-size:12px;color:var(--muted)}
+.menu .perm-option{justify-content:flex-start;align-items:flex-start;gap:10px;border-radius:8px}
+.perm-option strong{display:block;font-weight:600;font-size:13.5px}
+.perm-option small{display:block;color:var(--muted);font-size:12px;line-height:1.45;margin-top:2px}
+.perm-check{flex:none;width:16px;height:16px;margin-top:2px;border-radius:50%;border:1.5px solid var(--line-2)}
+.perm-option[aria-checked="true"] .perm-check{border:5px solid var(--accent)}
+.perm-option:disabled{opacity:.5;cursor:not-allowed}
+.perm-fixed{margin:4px 10px;font-size:11.5px;color:var(--muted);line-height:1.5}
+.perm-fixed b{color:var(--text-2);font-weight:600;margin-right:6px}
 .send-group{display:flex;gap:6px}
 .round-button{width:34px;height:34px;border-radius:50%;padding:0;display:grid;place-items:center;background:var(--accent);color:var(--on-accent)}
 .round-button:disabled{background:var(--surface-2);color:var(--muted);opacity:1}
@@ -206,6 +223,18 @@ h1{font-size:15px;margin:0;white-space:nowrap;text-overflow:ellipsis;overflow:hi
 .attachment-preview img{width:120px;height:80px;object-fit:contain}
 .attachment-preview span{font-size:11px;color:var(--muted)}
 .attachment-preview button{position:absolute;right:2px;top:2px;padding:3px 7px;background:#000b;color:#fff;border-radius:6px}
+/* 대화에 올린 문서(ADR-096) — 입력창의 문서 칩과 보낸 질문 아래 칩 */
+.attachment-file{display:flex;align-items:center;gap:9px;max-width:260px;padding:8px 30px 8px 10px;background:var(--surface-2);border:1px solid var(--line);border-radius:10px;position:relative}
+.attachment-file .i{flex:none;width:22px;height:22px;color:var(--text-2)}
+.attachment-file strong{display:block;font-size:12.5px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.attachment-file small{display:block;font-size:11px;color:var(--muted)}
+.attachment-file > span{min-width:0}
+.attachment-file button{position:absolute;right:4px;top:50%;transform:translateY(-50%);padding:3px 6px;color:var(--muted);border-radius:6px}
+.attachment-file button:hover:not(:disabled){background:var(--hover);color:var(--text)}
+.doc-chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;justify-content:flex-end}
+.doc-chip{display:inline-flex;align-items:center;gap:6px;max-width:100%;padding:5px 10px;border:1px solid var(--line);border-radius:999px;background:var(--surface);font-size:12px;color:var(--text-2)}
+.doc-chip .i{flex:none;width:14px;height:14px}
+.doc-chip span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
 /* 프로젝트 화면 */
 .project-view{padding-top:18px}
@@ -257,6 +286,16 @@ dialog .primary{margin-top:6px;padding:10px}
 .task span{flex:1}
 .task.done span{text-decoration:line-through;color:var(--muted)}
 .task button{padding:2px 6px;font-size:12px}
+.job{font-size:13.5px;padding:9px 2px;border-top:1px solid var(--line);overflow-wrap:anywhere}
+.job:first-child{border-top:0}
+.job-head{display:flex;gap:8px;align-items:baseline}
+.job-head strong{flex:1;min-width:0;font-weight:600}
+.job-status{font-size:12px;color:var(--muted);white-space:nowrap}
+.job-status.running,.job-status.paused{color:var(--accent)}
+.job-status.failed,.job-status.interrupted{color:#c0392b}
+.job pre{margin:6px 0 0;max-height:140px;overflow:auto;font-size:12px;white-space:pre-wrap;color:var(--muted)}
+.job .row{margin-top:6px;gap:6px;justify-content:flex-start}
+.job .row button{flex:none;width:auto}
 .memory{display:flex;gap:10px;align-items:flex-start;font-size:13.5px;padding:9px 2px;border-top:1px solid var(--line);overflow-wrap:anywhere}
 .memory:first-child{border-top:0}
 .memory div{flex:1;min-width:0}
@@ -290,6 +329,7 @@ dialog .primary{margin-top:6px;padding:10px}
   .project-grid{grid-template-columns:1fr}
   .message{font-size:15px}
   .footnote{display:none}
+  .composer{position:relative}.perm{position:static}.perm-menu{left:0;right:0;width:auto;max-width:none}
 }
 /* 홈 화면 앱(PWA)으로 열 때 휴대폰의 노치·홈 막대 자리를 비운다(2026-10-11) */
 @media (display-mode: standalone){header{padding-top:env(safe-area-inset-top);height:calc(56px + env(safe-area-inset-top))}.composer-area{padding-bottom:max(10px,env(safe-area-inset-bottom))}}
@@ -297,3 +337,7 @@ dialog .primary{margin-top:6px;padding:10px}
 .theme-picker{display:flex;gap:6px}.theme-picker button{flex:1;font-size:13px;padding:9px}
 .theme-picker button[aria-pressed="true"]{background:var(--accent);color:var(--on-accent);border-color:var(--accent)}
 #title{cursor:text;border-radius:6px;padding:3px 6px;margin-left:-6px}#title:hover{background:var(--hover)}
+
+/* Shared reasoning shortcut, 2026-10-22. */
+.reasoning-control{display:inline-flex;flex-direction:row;align-items:center;gap:4px;margin:0;flex-shrink:0;font-size:12px;color:var(--muted)}
+.reasoning-control select{width:auto;max-width:76px;min-height:30px;padding:3px 4px;font-size:12px;background:transparent;border-color:var(--line)}

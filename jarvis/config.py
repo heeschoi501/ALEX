@@ -156,11 +156,19 @@ class Settings:
     # RTL 모드(2026-10-10, ADR-087): /rtl 프로젝트 폴더의 뿌리(비우면 C:\ALEX\fabless)와 칩 도구(oss-cad-suite) 위치
     rtl_root: str = ""
     rtl_tools_dir: str = ""
+    # 어려운 일은 클라우드로(ADR-102): 요청할 때만, 이름을 말하지 않으면 이쪽(claude|codex). 한도면 다른 쪽이 대신.
+    cloud_agent: str = "claude"
+    cloud_agent_timeout: int = 1800
     # 자연어 그림 그리기(ADR-073): 이 PC 의 ComfyUI(127.0.0.1)로 Z-Image Turbo 를 돌린다. 기본 꺼짐 — 설치한 PC 에서 켠다.
     image_generation_enabled: bool = False
     # 비우면 ALEX 폴더 옆 comfyui\ComfyUI_windows_portable (C:\ALEX\comfyui\...) 을 쓴다.
     comfyui_dir: str = ""
     comfyui_url: str = "http://127.0.0.1:8188"
+    # 기억을 뜻으로 찾기(ADR-094): 이 PC 의 CPU 임베딩 서버(llama-server + Qwen3-Embedding 0.6B, C:\ALEX\tools\embed).
+    # 기본 꺼짐 — 설치한 PC 에서 켠다. 꺼져 있거나 서버가 없으면 낱말 검색만 쓴다. 그래픽카드는 쓰지 않는다.
+    embedding_enabled: bool = False
+    embedding_host: str = "http://127.0.0.1:8081"
+    embedding_threads: int = 4
     file_read_max_bytes: int = 100_000
     project_context_max_files: int = 1500
     project_context_max_bytes: int = 5_000_000
@@ -271,12 +279,16 @@ def validate(settings: Settings) -> Settings:
         raise ConfigError("coding_context_char_budget(JARVIS_CODING_CONTEXT_CHAR_BUDGET) 는 0(자동) 또는 1000~500000 사이여야 합니다.")
     if not 1 <= settings.coding_auto_attempts <= 5:
         raise ConfigError("coding_auto_attempts(JARVIS_CODING_AUTO_ATTEMPTS) 는 1~5 사이여야 합니다.")
-    if settings.coding_worker not in ("alex", "opencode"):
-        raise ConfigError("coding_worker(JARVIS_CODING_WORKER) 는 alex 또는 opencode 여야 합니다.")
+    if settings.coding_worker not in ("alex", "opencode", "harness"):
+        raise ConfigError("coding_worker(JARVIS_CODING_WORKER) 는 alex·opencode·harness(ALEX 코딩 하네스, ADR-112) 중 하나여야 합니다.")
     if not 4096 <= settings.opencode_context <= 262144:
         raise ConfigError("opencode_context(JARVIS_OPENCODE_CONTEXT) 는 4096~262144 사이여야 합니다.")
     if not 60 <= settings.opencode_timeout <= 7200:
         raise ConfigError("opencode_timeout(JARVIS_OPENCODE_TIMEOUT) 는 60~7200 초 사이여야 합니다.")
+    if settings.cloud_agent not in ("claude", "codex"):
+        raise ConfigError("cloud_agent 는 claude 또는 codex 여야 합니다.")
+    if not 60 <= settings.cloud_agent_timeout <= 4 * 3600:
+        raise ConfigError("cloud_agent_timeout 은 60~14400 초여야 합니다.")
     if settings.local_backend not in ("ollama", "strata"):
         raise ConfigError("local_backend(JARVIS_LOCAL_BACKEND) 는 ollama 또는 strata 여야 합니다.")
     if not settings.strata_host.startswith("http://") or \
@@ -299,6 +311,11 @@ def validate(settings: Settings) -> Settings:
         raise ConfigError("strata_context_char_budget 는 0(자동) 또는 1000~500000 사이여야 합니다.")
     if not 2 <= settings.strata_history_limit <= 200:
         raise ConfigError("strata_history_limit 는 2~200 사이여야 합니다.")
+    if not settings.embedding_host.startswith("http://") or \
+            (urlparse(settings.embedding_host).hostname or "").lower() not in {"localhost", "127.0.0.1", "::1"}:
+        raise ConfigError(f"embedding_host 는 이 PC 주소(http://127.0.0.1:포트)만 허용합니다. 현재 값: {settings.embedding_host!r}")
+    if not 1 <= settings.embedding_threads <= 32:
+        raise ConfigError("embedding_threads 는 1~32 사이여야 합니다.")
     if settings.desktop_max_output_tokens != 0 and (
         settings.desktop_max_output_tokens < 64 or settings.desktop_max_output_tokens > 8192
     ):
@@ -409,8 +426,9 @@ LOCAL_FIELDS = {
     "coding_num_ctx": int, "coding_num_gpu_layers": int, "coding_context_char_budget": int, "coding_auto_attempts": int, "coding_regression_check": bool, "coding_diagnostic_context": bool, "coding_build_loop_enabled": bool, "coding_code_check_enabled": bool, "coding_worker": str, "opencode_dir": str, "opencode_model": str, "opencode_context": int, "opencode_timeout": int,
     "local_backend": str, "strata_host": str, "strata_model": str, "strata_num_ctx": int, "strata_reasoning_effort": str,
     "strata_max_output_tokens": int, "strata_context_char_budget": int, "strata_history_limit": int,
-    "rtl_root": str, "rtl_tools_dir": str,
+    "rtl_root": str, "rtl_tools_dir": str, "cloud_agent": str, "cloud_agent_timeout": int,
     "image_generation_enabled": bool, "comfyui_dir": str, "comfyui_url": str,
+    "embedding_enabled": bool, "embedding_host": str, "embedding_threads": int,
 }
 
 
@@ -484,9 +502,14 @@ def load_settings() -> Settings:
         strata_history_limit=_env_int("JARVIS_STRATA_HISTORY_LIMIT", 24),
         rtl_root=os.getenv("JARVIS_RTL_ROOT", ""),
         rtl_tools_dir=os.getenv("JARVIS_RTL_TOOLS_DIR", ""),
+        cloud_agent=os.getenv("JARVIS_CLOUD_AGENT", "claude").strip().lower(),
+        cloud_agent_timeout=_env_int("JARVIS_CLOUD_AGENT_TIMEOUT", 1800),
         image_generation_enabled=_env_flag("JARVIS_IMAGE_GENERATION_ENABLED", False),
         comfyui_dir=os.getenv("JARVIS_COMFYUI_DIR", ""),
         comfyui_url=os.getenv("JARVIS_COMFYUI_URL", "http://127.0.0.1:8188"),
+        embedding_enabled=_env_flag("JARVIS_EMBEDDING_ENABLED", False),
+        embedding_host=os.getenv("JARVIS_EMBEDDING_HOST", "http://127.0.0.1:8081").strip().rstrip("/"),
+        embedding_threads=_env_int("JARVIS_EMBEDDING_THREADS", 4),
         file_read_max_bytes=_env_int("JARVIS_FILE_READ_MAX_BYTES", 100_000),
         project_context_max_files=_env_int("JARVIS_PROJECT_CONTEXT_MAX_FILES", 1500),
         project_context_max_bytes=_env_int("JARVIS_PROJECT_CONTEXT_MAX_BYTES", 5_000_000),
