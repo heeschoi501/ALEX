@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from .testevidence import input_digest
 
 PATH = re.compile(r'(?<![A-Za-z0-9_])(?:[A-Za-z_][A-Za-z0-9_.-]*[\\/])*[A-Za-z_][A-Za-z0-9_.-]*\.py')
 VERIFY_SKIP = {'__pycache__', '.git', '.opencode', '.claude', '.codex', 'node_modules', '.pytest_cache',
@@ -157,17 +158,24 @@ class TestIndex:
         """에이전트가 **마지막 수정 뒤에** 하네스 bash 로 직접 돌려 통과한 시험 파일 → 그 근거. 모델의 말이 아니라 실제 실행
         기록(종료 코드 0·실행 수 > 건너뜀 수)만 본다. 일부만 돌린 것(-k, 클래스·메서드 지정)은 세지 않는다."""
         passed: dict[str, str] = {}
+        current = input_digest(workspace.root)
+        if not current:
+            return passed
         for run in getattr(workspace, 'test_runs', []):
             words = [str(w) for w in run.get('words') or []]
             if run.get('edits') != workspace.edits or run.get('exit') != 0 or words[:3] != ['python', '-m', 'unittest']:
                 continue
-            ran = re.findall(r'Ran (\d+) tests? in ', run.get('tail', ''))
-            skipped = re.findall(r'OK \(skipped=(\d+)\)', run.get('tail', ''))
-            if not ran or int(ran[-1]) <= (int(skipped[-1]) if skipped else 0) or '-k' in words:
+            evidence = run.get('evidence') or {}
+            if run.get('inputs') != current or not evidence.get('successful') or any(w == '-k' or w.startswith('-k=') for w in words):
                 continue
             files = self._files_run(words[3:])
             for rel in files:
-                passed.setdefault(rel, ' '.join(words))
+                actual = evidence.get('files', {}).get(rel, {})
+                # A mixed suite cannot lend its passing count to an undiscovered/all-skipped file.
+                if actual.get('ran', 0) > 0 and actual.get('success', 0) > 0:
+                    path = workspace.root / rel
+                    if path.is_file() and path.read_bytes() == self.originals[rel]:
+                        passed.setdefault(rel, ' '.join(words))
         return passed
 
     def _files_run(self, args: list[str]) -> set[str]:
@@ -230,6 +238,12 @@ class TestIndex:
             skip = re.findall(r'OK \(skipped=(\d+)\)', output)
             if status == 'ok' and (not count or int(count[-1]) <= (int(skip[-1]) if skip else 0)):
                 status, reason = 'unreadable', '실제로 실행된 합격 검사가 없습니다.'
+            if status == 'ok':
+                wanted = ['python', '-m', 'unittest', 'discover', '-s', path.parent.as_posix(), '-p', path.name, '-v']
+                runs = [r for r in workspace.test_runs if r.get('words') == wanted]
+                actual = (runs[-1].get('evidence') or {}).get('files', {}).get(rel, {}) if runs else {}
+                if not actual.get('success', 0):
+                    status, reason = 'unreadable', '대상 파일에서 실제 통과한 검사 실행을 확인하지 못했습니다.'
             return {'path': rel, 'command': command, 'exit': code,
                     'status': 'verified' if status == 'ok' else 'failed' if status == 'failed' else 'unverified',
                     'failures': sorted(failures), 'reason': reason, 'output': output[-10000:]}

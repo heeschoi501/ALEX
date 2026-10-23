@@ -20,12 +20,14 @@ import subprocess
 import sys
 import threading
 import time
+import tempfile
 from typing import Any, Callable
 
 from . import edit as editing
 from . import patch as patching
 from .diagnostics import diagnose
 from .permission import ALLOW, ASK, DEFAULT_SHELL, Rule, evaluate, worker_rules
+from .testevidence import input_digest
 
 MAX_LINES = 2000          # 읽기·출력 기본 줄 수(OpenCode Truncate.MAX_LINES)
 MAX_BYTES = 50 * 1024     # 출력 상한(OpenCode Truncate.MAX_BYTES)
@@ -72,6 +74,13 @@ def find_skills(*folders: Path) -> dict[str, Skill]:
 
 
 @dataclass
+class ExecutionState:
+    edits: int = 0
+    test_runs: list[dict] = field(default_factory=list)
+    tool_seconds: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
 class Workspace:
     root: Path
     shell: ShellPolicy = field(default_factory=ShellPolicy)
@@ -90,8 +99,23 @@ class Workspace:
     _outputs: int = 0
     _step: int = 1   # 반복 밖에서 바로 쓸 때도 차례 1 — revert(0) 이 처음으로 돌린다
     read_max_lines: int = MAX_LINES  # 일꾼은 짧게 읽고 offset으로 이어 읽어 문맥 낭비를 줄인다.
-    edits: int = 0                   # 파일을 바꾼 횟수(쓰기·고치기·패치·되돌리기) — 시험 실행이 마지막 수정 뒤인지 가린다
-    test_runs: list[dict] = field(default_factory=list)   # bash 로 실제 실행한 명령·종료 코드·그때의 edits(일꾼 독립 검사가 씀)
+    _execution: ExecutionState = field(default_factory=ExecutionState, repr=False)
+
+    @property
+    def edits(self) -> int:
+        return self._execution.edits
+
+    @edits.setter
+    def edits(self, value: int) -> None:
+        self._execution.edits = value
+
+    @property
+    def test_runs(self) -> list[dict]:
+        return self._execution.test_runs
+
+    @test_runs.setter
+    def test_runs(self, value: list[dict]) -> None:
+        self._execution.test_runs = value
 
     def __post_init__(self) -> None:
         self.root = Path(self.root).resolve()
@@ -108,6 +132,7 @@ class Workspace:
                         rules=[*(self.rules or []), *extra_rules], ask=self.ask, fetch=self.fetch, search=self.search,
                         mcp=self.mcp, skills=self.skills)
         kid.history, kid.counts = self.history, self.counts
+        kid._execution = self._execution
         return kid
 
     # ── 경로
@@ -507,10 +532,19 @@ class Workspace:
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         # ALEX 의 시험 실행(developer.py)과 같은 UTF-8 모드 — 아니면 기본 인코딩으로 읽는 시험이 한글에서 가짜로 깨진다(2026-10-23)
         env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+        revision = self.edits
+        fingerprint = input_digest(self.root) if words[:3] == ['python', '-m', 'unittest'] else ''
+        evidence_dir = tempfile.TemporaryDirectory(prefix='alex-test-evidence-') if words[:3] == ['python', '-m', 'unittest'] else None
+        evidence_path = Path(evidence_dir.name) / 'result.json' if evidence_dir else None
+        if evidence_path is not None:
+            run = [sys.executable, str(Path(__file__).with_name('unittest_run.py')), str(evidence_path), *words[3:]]
+            env['PYTHONPYCACHEPREFIX'] = str(Path(evidence_dir.name) / 'pycache')
         try:
             process = subprocess.Popen(run, cwd=self.root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                        stdin=subprocess.DEVNULL, env=env, creationflags=flags)
         except OSError as exc:
+            if evidence_dir is not None:
+                evidence_dir.cleanup()
             return f"Error: could not run command: {exc}"
         chunks: list[bytes] = []
         reader = threading.Thread(target=lambda: chunks.append(process.stdout.read() if process.stdout else b""), daemon=True)
@@ -531,9 +565,25 @@ class Workspace:
         finally:
             if process.stdout is not None:
                 process.stdout.close()
+            # Cancel returns through finally too; no temporary evidence or open stream is left behind.
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
+            reader.join(5)
+            evidence = {}
+            try:
+                if evidence_path is not None and evidence_path.is_file():
+                    evidence = json.loads(evidence_path.read_text(encoding='utf-8'))
+            except (OSError, ValueError):
+                pass
+            finally:
+                if evidence_dir is not None:
+                    evidence_dir.cleanup()
         output = b"".join(chunks).decode("utf-8", errors="replace").replace("\r\n", "\n").rstrip()
-        self.test_runs.append({"words": words, "exit": None if timed_out else process.returncode, "edits": self.edits,
-                               "tail": output[-2000:]})
+        unchanged = bool(fingerprint and revision == self.edits and fingerprint == input_digest(self.root))
+        self.test_runs.append({"words": words, "exit": None if timed_out else process.returncode, "edits": revision,
+                               "tail": output[-2000:], 'inputs': fingerprint if unchanged else '',
+                               'evidence': evidence, 'seconds': round(time.monotonic() - started, 3)})
         output += (f"\n\n(Command timed out after {timeout:.0f} seconds and was terminated.)" if timed_out
                    else f"\n\n(exit code {process.returncode})")
         return self.truncate(output.strip(), direction="tail")
@@ -589,6 +639,7 @@ class Workspace:
             "webfetch": self.webfetch, "websearch": self.websearch}.get(name)
         self.counts[name] = self.counts.get(name, 0) + 1
         args = args if isinstance(args, dict) else {}
+        started = time.monotonic()
         try:
             if handler is None and self.mcp is not None and name.startswith("mcp__"):
                 if problem := self.permit(name, "*", args):
@@ -605,4 +656,7 @@ class Workspace:
             return f"Error: {exc}"
         except (OSError, ValueError) as exc:
             return f"Error: {exc}"
+        finally:
+            timings = self._execution.tool_seconds
+            timings[name] = timings.get(name, 0.0) + time.monotonic() - started
         return self.truncate(result) if name in ("read", "glob", "grep") and not result.startswith("<path>") else result

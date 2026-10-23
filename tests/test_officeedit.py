@@ -10,6 +10,32 @@ MD = "# 보고서\n\n첫 문단입니다.\n\n둘째 문단입니다.\n\n| 이름
 
 
 class OfficeEditTests(unittest.TestCase):
+    def test_local_text_correction_keeps_other_runs_tabs_breaks_and_package_parts(self):
+        from jarvis.officeedit import _set_paragraph_text
+        xml = ('<w:p><w:r><w:t>First </w:t></w:r><w:r><w:rPr><w:b/></w:rPr><w:t>bold</w:t></w:r>'
+               '<w:r><w:tab/><w:t>old</w:t><w:br/><w:t>end</w:t></w:r></w:p>')
+        fixed = _set_paragraph_text(xml, 'w', 'First bold\tnew\nend')
+        self.assertIn('<w:rPr><w:b/></w:rPr><w:t>bold</w:t>', fixed)
+        self.assertIn('<w:tab/>', fixed)
+        self.assertIn('<w:br/>', fixed)
+        self.assertIn('new', fixed)
+
+    def test_invalid_cell_and_external_formula_are_rejected(self):
+        for ref, value in [('A0', '1'), ('XFE1', '1'), ('A1048577', '1'), ('A1', '=WEBSERVICE("https://example.com")')]:
+            document = OfficeDocument(_xlsx('표', parse_markdown(MD)), '.xlsx')
+            sheet = next(iter(document.sheets))
+            with self.subTest(ref=ref, value=value), self.assertRaises(OfficeEditError):
+                document.apply([{'id': sheet + '!' + ref, 'text': value}])
+
+    def test_long_paragraph_is_shown_whole_or_omitted_never_silently_clipped(self):
+        body = 'x' * 2400 + ' IMPORTANT TAIL'
+        document = OfficeDocument(_docx('제목', parse_markdown(body)), '.docx')
+        outline, cut = document.outline(limit=6000)
+        self.assertIn('IMPORTANT TAIL', outline)
+        self.assertFalse(cut)
+        outline, cut = document.outline(limit=1000)
+        self.assertTrue(cut)
+        self.assertNotIn('xxxx', outline)
     def test_docx_replace_insert_delete_keeps_a_valid_file(self):
         document = OfficeDocument(_docx("보고서", parse_markdown(MD)), ".docx")
         outline, cut = document.outline()

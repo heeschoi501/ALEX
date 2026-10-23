@@ -86,7 +86,7 @@ class HarnessWorker:
                                 rules=RULES, lessons=self.lessons() if self.lessons else "",
                                 progress=self.progress, cancel_event=cancel_event,
                                 deadline=deadline)
-            verified, verification_error = False, ""
+            verified, verification_error, verification_seconds = False, "", 0.0
             try:
                 result = agent.run(prompt + index.hint())
                 for attempt in range(2):  # 마지막 관련 검사 실패에 한해 같은 대화로 한 번 재수정한다.
@@ -102,6 +102,7 @@ class HarnessWorker:
                         changed[path] = changed_names(old, new)
                     paths = index.select(changed) if changed else []
                     # 마지막 수정 뒤 에이전트가 하네스 bash 로 직접 돌려 통과한 파일은 그 실행 기록(종료 코드·실행 수)을 근거로 인정
+                    check_started = time.monotonic()
                     passed = index.already_passed(workspace)
                     rest = [p for p in paths if p not in passed]
                     if self.progress is not None and paths:
@@ -112,6 +113,7 @@ class HarnessWorker:
                               for p in paths if p in passed]
                     from ..developer import SUITE_WORKERS  # ALEX 전체 검사와 같은 수로 나란히
                     checks += index.verify(workspace, rest, deadline, workers=SUITE_WORKERS) if rest else []
+                    verification_seconds += time.monotonic() - check_started
                     self.last_verification.append({"attempt": attempt + 1, "paths": paths, "checks": checks})
                     verified = len(checks) == len(paths) and all(c["status"] == "verified" for c in checks)
                     if verified:
@@ -141,6 +143,9 @@ class HarnessWorker:
                             timed_out=result.stopped == "timeout" or time.monotonic() >= deadline,
                             seconds=round(time.monotonic() - started, 1), tools=dict(workspace.counts),
                             log_tail=(verification_error or result.error or result.text)[-1500:])
+            run.timings = {'model': round(sum(t['seconds'] for t in result.trace), 3),
+                           'independent_verification_wall': round(verification_seconds, 3),
+                           **{'tool_' + k: round(v, 3) for k, v in workspace._execution.tool_seconds.items()}}
             after = _hashes(work)
             for path in sorted(set(before) | set(after)):
                 if before.get(path) == after.get(path):

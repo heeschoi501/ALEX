@@ -251,6 +251,30 @@ class ResearchTests(unittest.TestCase):
         text = "a" * 1800 + "UNIQUE_MATCH " * 20 + "z" * 4000
         self.assertIn("UNIQUE_MATCH", _excerpt(text, ["unique_match"], 900))
 
+    def test_excerpt_covers_rare_second_question_and_keeps_bound(self):
+        text = ('common framework detail ' * 350) + ('skipped outcome meaning ' * 25) + ('other material ' * 300)
+        excerpt = _excerpt(text, ['common', 'framework', 'skipped', 'outcome'], 2400)
+        self.assertIn('skipped outcome', excerpt)
+        self.assertIn('common framework', excerpt)
+        self.assertLessEqual(len(excerpt), 2400)
+
+    def test_identifiers_keep_versions_and_separate_korean_particles(self):
+        worker = researcher(Reader())
+        worker.source_limit = 12
+        source = worker._add('official source', 'https://docs.example/unittest')
+        source.text = ('ordinary python module ' * 700 + 'version 3.11 requires __init__.py in subdirectories ' * 10
+                       + 'other material ' * 900 + 'skipped tests do not run ' * 10)
+        evidence = worker._evidence('Python 3.11 unittest discover가 __init__.py 없는 폴더와 skipped를 비교해줘', 2400)
+        self.assertIn('3.11 requires __init__.py', evidence)
+        self.assertIn('skipped tests do not run', evidence)
+
+    def test_small_search_budget_reserves_a_followup_for_missing_evidence(self):
+        reader = Reader({'q1': rows('https://a.example/'), 'q2': [], 'followup': rows('https://b.example/')})
+        model = Model({'queries': ['q1', 'q2']}, {'queries': ['followup'], 'gaps': []})
+        result = researcher(reader, model, limits=Limits(searches=2)).run('topic')
+        self.assertEqual(reader.searched, ['q1', 'followup'])
+        self.assertIn('추가 확인', [phase for _, phase in model.calls])
+
 
 class CoreResearchTests(unittest.TestCase):
     def setUp(self):

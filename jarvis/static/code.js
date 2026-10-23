@@ -199,7 +199,7 @@ function handle(e) {
     case 'permission.asked': permissionCard(e.request); break;
     case 'permission.replied': permissionDone(e.id, e.response); break;
     case 'question.asked': finished(e.result); questionCard(e.questions); paintTodos(e.todos); setStatus('question'); loadList(); break;
-    case 'session.idle': finished(e.result); paintTodos(e.todos); setStatus(e.result?.stopped === 'error' ? 'error' : 'idle'); loadList(); break;
+    case 'session.idle': finished(e.result); paintTodos(e.todos); setStatus(['error', 'unverified', 'timeout'].includes(e.result?.stopped) ? 'error' : 'idle'); loadList(); break;
     case 'session.aborted': note('중단을 요청했습니다.'); break;
     case 'session.reverted': note(e.files?.length ? `되돌렸습니다: ${e.files.join(', ')}` : '되돌릴 바뀐 내용이 없습니다.'); break;
     default: break;
@@ -312,6 +312,7 @@ async function open(sid) {
     $('mode').value = session.mode === 'plan' ? 'plan' : 'build';
     paintHistory(messages);
     endBubble();
+    if (session.status !== 'running' && session.last) finished(session.last);
     for (const request of session.permissions || []) permissionCard(request);
     if (session.status === 'question') questionCard(session.questions);
     paintTodos(session.todos);

@@ -26,7 +26,7 @@ FAKE = r'''
 import json, os, sys, time
 from pathlib import Path
 mode = os.environ.get("FAKE_OPENCODE_MODE", "fix")
-prompt = sys.argv[-1]
+prompt = sys.argv[-1] or sys.stdin.read()
 Path("seen_prompt.txt").write_text(prompt, encoding="utf-8")  # 범위 밖 새 파일 — ALEX 가 버려야 한다
 print(json.dumps({"type": "tool_use", "part": {"tool": "read"}}), flush=True)
 if mode == "sleep":
@@ -95,6 +95,23 @@ class WorkerTests(FakeOpenCode, unittest.TestCase):
         self.assertTrue(result.timed_out)
         self.assertLess(result.seconds, 20)
 
+    def test_long_unicode_request_uses_verbatim_stdin_and_not_argv(self):
+        request = ('한글 "quoted" \\path\n' * 6000) + 'END'
+        with self.worker.request_command(request) as (command, stdin):
+            self.assertEqual(stdin.read().decode('utf-8'), request)
+            self.assertLess(len(__import__('subprocess').list2cmdline(command)), 2000)
+            self.assertFalse(stdin.closed)
+        self.assertTrue(stdin.closed)
+        result = self.worker.run(self.project, request)
+        self.assertEqual(result.created['seen_prompt.txt'], request + __import__('jarvis.opencode_worker', fromlist=['RULES']).RULES)
+
+    def test_long_request_input_is_closed_on_error(self):
+        stdin = None
+        with self.assertRaises(RuntimeError):
+            with self.worker.request_command('long' * 30000) as (command, stdin):
+                raise RuntimeError('process failed')
+        self.assertTrue(stdin.closed)
+
     def test_cancel_stops_the_run(self):
         event = threading.Event()
         threading.Timer(0.5, event.set).start()
@@ -141,6 +158,13 @@ class WorkerTests(FakeOpenCode, unittest.TestCase):
     def test_a_missing_executable_or_model_is_reported(self):
         worker = OpenCodeWorker(Path(self.fake_dir.name) / "없음", "fake-model")
         self.assertIn("실행 파일이 없습니다", worker.unavailable_reason())
+
+    def test_process_start_failure_is_marked_as_infrastructure(self):
+        with patch('jarvis.opencode_worker.subprocess.Popen', side_effect=OSError('startup failed')):
+            result = self.worker.run(self.project, '고쳐라')
+        self.assertEqual(result.exit_code, -1)
+        self.assertEqual(result.infrastructure_error, 'startup failed')
+        self.assertEqual(result.changed, {})
 
 
 class AutoLoopWithOpenCodeTests(FakeOpenCode, TwoFileProject, unittest.TestCase):

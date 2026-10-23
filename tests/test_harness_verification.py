@@ -140,7 +140,66 @@ class RelatedVerificationTests(Fixture):
         self.assertEqual(index.already_passed(workspace), {})
         workspace.test_runs.append({'words': ['python', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_*.py', '-v'],
                                     'exit': 0, 'edits': 1, 'tail': 'Ran 2 tests in 0.1s\n\nOK'})
+        self.assertEqual(index.already_passed(workspace), {})  # stdout-only records are not execution evidence
+        self.put('calc.py', 'def add(a, b):\n    return a + b\n')
+        workspace.run('bash', {'command': 'python -m unittest discover -s tests -p test_*.py -v'})
         self.assertEqual(sorted(index.already_passed(workspace)), ['tests/test_contract.py', 'tests/test_target.py'])
+
+    def test_undiscovered_and_all_skipped_files_are_not_cached(self):
+        self.put('tests/test_ok.py', 'import unittest\nclass T(unittest.TestCase):\n def test_ok(self): pass\n')
+        self.put('tests/sub/test_hidden.py', 'import unittest\nclass T(unittest.TestCase):\n def test_hidden(self): self.fail()\n')
+        self.put('tests/test_skip.py', 'import unittest\n@unittest.skip("not available")\n'
+                 'class T(unittest.TestCase):\n def test_skip(self): self.fail()\n')
+        index, workspace = TestIndex(self.root, ''), Workspace(self.root)
+        workspace.run('bash', {'command': 'python -m unittest discover -s tests'})
+        self.assertEqual(set(index.already_passed(workspace)), {'tests/test_ok.py'})
+        self.assertTrue(workspace.test_runs[-1]['evidence']['successful'])
+
+    def test_child_changes_revert_and_external_same_timestamp_changes_invalidate_pass(self):
+        self.prepare()
+        self.put('calc.py', 'def add(a, b):\n    return a + b\n')
+        index, workspace = TestIndex(self.root, ''), Workspace(self.root)
+        child = workspace.child([])
+        child.run('bash', {'command': 'python -m unittest discover -s tests'})
+        self.assertEqual(len(index.already_passed(workspace)), 2)
+        child.run('read', {'filePath': 'calc.py'})
+        child.run('edit', {'filePath': 'calc.py', 'oldString': 'a + b', 'newString': 'a - b'})
+        self.assertEqual(workspace.edits, child.edits)
+        self.assertEqual(index.already_passed(workspace), {})
+        workspace.revert()
+        self.assertEqual(index.already_passed(child), {})
+        workspace.run('bash', {'command': 'python -m unittest discover -s tests'})
+        self.assertEqual(len(index.already_passed(child)), 2)
+        source = self.root / 'calc.py'
+        stat = source.stat()
+        source.write_text('def add(a, b):\n    return a - b\n', encoding='utf-8')
+        os.utime(source, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        self.assertEqual(index.already_passed(workspace), {})
+
+    def test_partial_selection_and_mutating_test_do_not_certify_inputs(self):
+        self.put('value.txt', 'before')
+        self.put('tests/test_mutate.py', 'import unittest, pathlib\nclass T(unittest.TestCase):\n'
+                 ' def test_mutate(self): pathlib.Path("value.txt").write_text("after")\n')
+        index, workspace = TestIndex(self.root, ''), Workspace(self.root)
+        workspace.run('bash', {'command': 'python -m unittest discover -s tests'})
+        self.assertEqual(index.already_passed(workspace), {})
+        workspace.run('bash', {'command': 'python -m unittest discover -s tests -k mutate'})
+        self.assertEqual(index.already_passed(workspace), {})
+
+    def test_duplicate_basenames_do_not_borrow_each_others_pass(self):
+        self.put('tests/one/test_same.py', 'import unittest\nclass T(unittest.TestCase):\n def test_ok(self): pass\n')
+        self.put('tests/two/test_same.py', 'import unittest\nclass T(unittest.TestCase):\n def test_bad(self): self.fail()\n')
+        index, workspace = TestIndex(self.root, ''), Workspace(self.root)
+        workspace.run('bash', {'command': 'python -m unittest discover -s tests/one -p test_same.py'})
+        self.assertEqual(set(index.already_passed(workspace)), {'tests/one/test_same.py'})
+
+    def test_independent_check_does_not_borrow_nested_file_success(self):
+        self.put('tests/test_empty.py', '# No tests here\n')
+        self.put('tests/pkg/__init__.py', '')
+        self.put('tests/pkg/test_empty.py', 'import unittest\nclass T(unittest.TestCase):\n def test_ok(self): pass\n')
+        index, workspace = TestIndex(self.root, ''), Workspace(self.root)
+        checks = index.verify(workspace, ['tests/test_empty.py'], time.monotonic() + 10)
+        self.assertEqual(checks[0]['status'], 'unverified')
 
     def test_parallel_verification_keeps_order_and_bash_runs_in_utf8_mode(self):
         self.prepare()

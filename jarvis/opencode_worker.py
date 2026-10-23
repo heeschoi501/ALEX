@@ -11,6 +11,7 @@ ALEX 가 지키는 것:
   운영체제 수준 격리는 아니다.
 """
 from __future__ import annotations
+from contextlib import contextmanager
 
 from dataclasses import dataclass, field
 import hashlib
@@ -53,6 +54,8 @@ class WorkerRun:
     seconds: float = 0.0
     tools: dict[str, int] = field(default_factory=dict)
     log_tail: str = ""
+    infrastructure_error: str = ''
+    timings: dict[str, float] = field(default_factory=dict)
 
 
 def _hashes(root: Path) -> dict[str, str]:
@@ -145,9 +148,27 @@ class OpenCodeWorker:
         return env
 
     def command_line(self, prompt: str, *, session: str = "", agent: str = "") -> list[str]:
+        if len(prompt.encode('utf-16-le')) > 12000:
+            raise ValueError('Long requests must use request_command(), not Windows argv')
         return (self.command or [str(self.executable())]) + [
             "run", "--model", self.model if self.free else f"ollama/{self.model}", "--format", "json",
             *(["--session", session] if session else []), *(["--agent", agent] if agent else []), prompt]
+
+    @contextmanager
+    def request_command(self, prompt: str, *, session: str = "", agent: str = ""):
+        """Long UTF-8 requests use stdin, verified against the installed CLI and a fake local model.
+
+        --file was rejected here: OpenCode's implicit file read can truncate the attachment. A
+        private seekable stdin file avoids pipe deadlocks and preserves the whole request, and
+        is closed/deleted on success/error/cancel. Small requests keep the existing argv behavior.
+        """
+        if len(prompt.encode('utf-16-le')) <= 12000:
+            yield self.command_line(prompt, session=session, agent=agent), subprocess.DEVNULL
+            return
+        with tempfile.TemporaryFile(mode='w+b', prefix='alex-opencode-request-') as stream:
+            stream.write(prompt.encode('utf-8'))
+            stream.seek(0)
+            yield self.command_line('', session=session, agent=agent), stream
 
     def run(self, project: Path, prompt: str, cancel_event: threading.Event | None = None) -> WorkerRun:
         if cancel_event is not None and cancel_event.is_set():
@@ -172,16 +193,19 @@ class OpenCodeWorker:
             data = Path(tmp) / "data"
             data.mkdir()
             env = self.environment(config, data)
-            command = self.command_line(prompt + RULES)
             log_path = Path(tmp) / "events.jsonl"
             started = time.monotonic()
             result = WorkerRun()
-            with log_path.open("wb") as log:
+            with self.request_command(prompt + RULES) as (command, stdin), log_path.open("wb") as log:
                 flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
                 if cancel_event is not None and cancel_event.is_set():
                     raise GenerationCancelled("오픈코드 작업을 중단했습니다.")
-                process = subprocess.Popen(command, cwd=work, env=env, stdout=log, stderr=subprocess.STDOUT,
-                                           stdin=subprocess.DEVNULL, creationflags=flags)
+                try:
+                    process = subprocess.Popen(command, cwd=work, env=env, stdout=log, stderr=subprocess.STDOUT,
+                                               stdin=stdin, creationflags=flags)
+                except OSError as exc:
+                    return WorkerRun(exit_code=-1, seconds=round(time.monotonic() - started, 1),
+                                     infrastructure_error=str(exc), log_tail='일꾼 프로세스 시작 실패: ' + str(exc))
                 while process.poll() is None:
                     if cancel_event is not None and cancel_event.is_set():
                         _kill_tree(process)

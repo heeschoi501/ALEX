@@ -1,3 +1,5 @@
+> **2026-10-23 추가 개선:** 검사 캐시 정확성·긴 요청 stdin 전달·Office 편집 연결·조사 발췌·검사 결과 UI. [적용 내역과 검증 범위](docs/CODEX_IMPROVEMENTS_20261023.md).
+
 # ALEX — 내 PC에서 도는 개인 AI
 
 **Adaptive Learning & Evolving eXperience.** 클라우드에 기대지 않고 집 PC(RTX 5080 16GB · RAM 96GB)에서 로컬 LLM으로 대화하고,

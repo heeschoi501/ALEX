@@ -673,6 +673,12 @@ class WebAppState:
     def code_chat_plan(self, viewer: Viewer, chat_sid: str, message: str) -> dict | None:
         """대화에서 말로 코딩 세션(2026-10-23, 사용자 "자연어로 할 수 있도록"). 이 대화에 이어진 세션이 허락·질문을 기다리면
         이번 말이 그 답이고, 방금 끝난 세션이면 '되돌려줘'·이어서 고치기, 아니면 새 코딩 요청인지(프로젝트 파일 + 고치기 말)."""
+        # Explicit Office requests and replies to the newest Office task win over an older code link.
+        if self.core.office_edits.matches(chat_sid, message):
+            if link := self.code_links.get(chat_sid):
+                link['fresh'] = False
+            return None
+        self.core.office_edits.deactivate(chat_sid)
         from .research import request as research_request
         if research_request(message) is not None:
             return None

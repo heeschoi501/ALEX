@@ -451,76 +451,84 @@ class CodeSessions:
         session.transcript.append({"role": "user", "content": text})
         say(f"[OpenCode 무료 모델 {session.model.split('/', 1)[1]} — 코드가 opencode.ai 로 전송됩니다]\n")
         flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
-        process = subprocess.Popen(worker.command_line(text, session=session.oc_session, agent="plan" if mode == "plan" else ""),
-                                   cwd=project, env=worker.environment(config, data), stdout=subprocess.PIPE,
-                                   stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, creationflags=flags)
-        lines: queue.Queue = queue.Queue()
+        with worker.request_command(text, session=session.oc_session, agent="plan" if mode == "plan" else "") as (command, stdin):
+            process = subprocess.Popen(command,
+                                       cwd=project, env=worker.environment(config, data), stdout=subprocess.PIPE,
+                                       stderr=subprocess.STDOUT, stdin=stdin, creationflags=flags)
+            try:
+                lines: queue.Queue = queue.Queue()
 
-        def pump() -> None:
-            for raw in process.stdout:
-                lines.put(raw)
-            lines.put(None)
-        threading.Thread(target=pump, daemon=True, name=f"alex-oc-{session.id[-6:]}").start()
-        texts, tools, errors, stopped = [], {}, [], "done"
-        while True:
-            if session.cancel.is_set() or (session.deadline and time.monotonic() >= session.deadline):
-                _kill_tree(process)
-                stopped = "cancelled" if session.cancel.is_set() else "timeout"
-                break
-            try:
-                raw = lines.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            if raw is None:
-                break
-            try:
-                event = json.loads(raw.decode("utf-8", "replace"))
-            except ValueError:
-                continue
-            if not isinstance(event, dict):
-                continue
-            session.oc_session = str(event.get("sessionID") or session.oc_session)
-            part = event.get("part") if isinstance(event.get("part"), dict) else {}
-            if event.get("type") == "text" and part.get("text"):
-                texts.append(str(part["text"]))
-                delta(str(part["text"]) + "\n")
-            elif event.get("type") == "tool_use":
-                tool = str(part.get("tool") or "")
-                tools[tool] = tools.get(tool, 0) + 1
-                state = part.get("state") if isinstance(part.get("state"), dict) else {}
-                args = state.get("input") if isinstance(state.get("input"), dict) else {}
-                target = args.get("filePath") or args.get("pattern") or args.get("command") or args.get("url") or ""
-                say(f"[OpenCode {tool} {str(target)[:120]}]\n")
-            elif event.get("type") == "error":
-                errors.append(json.dumps(event.get("error") or event, ensure_ascii=False)[:500])
-        try:
-            process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            _kill_tree(process)
-        if stopped == "done" and (process.returncode not in (0, None) or errors) and not texts:
-            stopped = "error"
-        notes = []
-        if stopped == "done" and not reading:
-            after = _hashes(project)
-            session.workspace.begin_step(len(session.transcript))   # 차례마다 되돌릴 수 있게
-            for rel in sorted(set(before) | set(after)):
-                if before.get(rel) == after.get(rel) or FREE_SKIP.intersection(Path(rel).parts):
-                    continue  # 복사에서 뺀 곳(기록·데이터·개인 설정)은 들이지도 않는다
-                if rel in after and Path(rel).suffix.lower() not in TEXT_SUFFIXES:
-                    notes.append(f"{rel}: 글 파일이 아니라 들이지 않았습니다")
-                    continue
-                content = (project / rel).read_text(encoding="utf-8", errors="replace") if rel in after else None
-                if problem := session.workspace.apply_external(rel, content, tool="opencode"):
-                    notes.append(f"{rel}: {problem}")
-        answer = "\n".join(texts).strip()
-        if notes:
-            say("[들이지 못한 변경] " + "; ".join(notes) + "\n")
-            answer = (answer + "\n\n" + "\n".join(notes)).strip()
-        session.transcript.append({"role": "assistant", "content": answer})
-        result = AgentResult(text=answer, stopped=stopped, steps=sum(tools.values()), seconds=round(time.monotonic() - started, 1),
-                             tools=tools, error="; ".join(errors)[:1000])
-        result.mode = mode or "build"   # _verify 가 읽는다(계획 모드면 검사 안 함)
-        return result
+                def pump() -> None:
+                    for raw in process.stdout:
+                        lines.put(raw)
+                    lines.put(None)
+                threading.Thread(target=pump, daemon=True, name=f"alex-oc-{session.id[-6:]}").start()
+                texts, tools, errors, stopped = [], {}, [], "done"
+                while True:
+                    if session.cancel.is_set() or (session.deadline and time.monotonic() >= session.deadline):
+                        _kill_tree(process)
+                        stopped = "cancelled" if session.cancel.is_set() else "timeout"
+                        break
+                    try:
+                        raw = lines.get(timeout=0.2)
+                    except queue.Empty:
+                        continue
+                    if raw is None:
+                        break
+                    try:
+                        event = json.loads(raw.decode("utf-8", "replace"))
+                    except ValueError:
+                        continue
+                    if not isinstance(event, dict):
+                        continue
+                    session.oc_session = str(event.get("sessionID") or session.oc_session)
+                    part = event.get("part") if isinstance(event.get("part"), dict) else {}
+                    if event.get("type") == "text" and part.get("text"):
+                        texts.append(str(part["text"]))
+                        delta(str(part["text"]) + "\n")
+                    elif event.get("type") == "tool_use":
+                        tool = str(part.get("tool") or "")
+                        tools[tool] = tools.get(tool, 0) + 1
+                        state = part.get("state") if isinstance(part.get("state"), dict) else {}
+                        args = state.get("input") if isinstance(state.get("input"), dict) else {}
+                        target = args.get("filePath") or args.get("pattern") or args.get("command") or args.get("url") or ""
+                        say(f"[OpenCode {tool} {str(target)[:120]}]\n")
+                    elif event.get("type") == "error":
+                        errors.append(json.dumps(event.get("error") or event, ensure_ascii=False)[:500])
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    _kill_tree(process)
+                if stopped == "done" and (process.returncode not in (0, None) or errors) and not texts:
+                    stopped = "error"
+                notes = []
+                if stopped == "done" and not reading:
+                    after = _hashes(project)
+                    session.workspace.begin_step(len(session.transcript))   # 차례마다 되돌릴 수 있게
+                    for rel in sorted(set(before) | set(after)):
+                        if before.get(rel) == after.get(rel) or FREE_SKIP.intersection(Path(rel).parts):
+                            continue  # 복사에서 뺀 곳(기록·데이터·개인 설정)은 들이지도 않는다
+                        if rel in after and Path(rel).suffix.lower() not in TEXT_SUFFIXES:
+                            notes.append(f"{rel}: 글 파일이 아니라 들이지 않았습니다")
+                            continue
+                        content = (project / rel).read_text(encoding="utf-8", errors="replace") if rel in after else None
+                        if problem := session.workspace.apply_external(rel, content, tool="opencode"):
+                            notes.append(f"{rel}: {problem}")
+                answer = "\n".join(texts).strip()
+                if notes:
+                    say("[들이지 못한 변경] " + "; ".join(notes) + "\n")
+                    answer = (answer + "\n\n" + "\n".join(notes)).strip()
+                session.transcript.append({"role": "assistant", "content": answer})
+                result = AgentResult(text=answer, stopped=stopped, steps=sum(tools.values()), seconds=round(time.monotonic() - started, 1),
+                                     tools=tools, error="; ".join(errors)[:1000])
+                result.mode = mode or "build"   # _verify 가 읽는다(계획 모드면 검사 안 함)
+                return result
+
+            finally:
+                if process.poll() is None:
+                    _kill_tree(process)
+                if process.stdout is not None:
+                    process.stdout.close()
 
     def _verify(self, session, result, index, before, edits_before=0, retry=None):
         records = []

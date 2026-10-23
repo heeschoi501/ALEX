@@ -19,6 +19,7 @@ import io
 import json
 import re
 import zipfile
+from difflib import SequenceMatcher
 
 SUFFIXES = (".docx", ".xlsx", ".pptx")
 OUTLINE_LIMIT = 60_000   # 모델에게 보여 줄 번호 붙은 내용 상한(넘으면 앞부분만 — 그 사실을 알린다)
@@ -43,6 +44,8 @@ def _unescape(text: str) -> str:
 
 
 def _escape(text: str) -> str:
+    if re.search(r'[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]', text):
+        raise OfficeEditError('문서에 넣을 수 없는 제어 문자가 포함돼 있습니다.')
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
@@ -79,7 +82,47 @@ def _paragraph_text(segment: str, ns: str) -> str:
 
 
 def _set_paragraph_text(segment: str, ns: str, text: str) -> str:
-    """첫 글자 조각에 새 글을, 나머지 조각은 비운다. 글자 조각이 없으면 문단 끝에 조각 하나."""
+    """Keep unchanged text in its original styled run; replacement inherits the run it touches.
+
+    This preserves bold/color/etc for ordinary local corrections, not arbitrary reflow fidelity.
+    Long/rebuilt paragraphs use the original first-run fallback to keep work bounded.
+    """
+    token = re.compile(rf'<{ns}:t(?:\s[^>]*)?>[^<]*</{ns}:t>|<{ns}:tab/>|<{ns}:br\b[^>]*?(?:/>|>.*?</{ns}:br>)', re.S)
+    matches = list(token.finditer(segment))
+    old = ''.join(_paragraph_text(m.group(), ns) for m in matches)
+    if matches and max(len(old), len(text)) <= 20000:
+        values, spans, pos = [''] * len(matches), [], 0
+        for match in matches:
+            size = len(_paragraph_text(match.group(), ns))
+            spans.append((pos, pos + size))
+            pos += size
+        for op, a, b, c, d in SequenceMatcher(None, old, text).get_opcodes():
+            if op == 'equal':
+                for n, (start, end) in enumerate(spans):
+                    lo, hi = max(a, start), min(b, end)
+                    if lo < hi:
+                        values[n] += old[lo:hi]
+            elif op in ('replace', 'insert'):
+                at = next((n for n, (start, end) in enumerate(spans) if start <= a < end), len(spans) - 1)
+                values[at] += text[c:d]
+        result, last = [], 0
+        for match, value in zip(matches, values):
+            result.append(segment[last:match.start()])
+            original = match.group()
+            if value == _paragraph_text(original, ns):
+                result.append(original)
+            elif re.match(rf'<{ns}:t(?:\s|>)', original):
+                body = _escape(value.replace('\r', ''))
+                if ns == 'w':
+                    body = body.replace('\t', '</w:t><w:tab/><w:t xml:space="preserve">')
+                    body = body.replace('\n', '</w:t><w:br/><w:t xml:space="preserve">')
+                result.append(f'<{ns}:t xml:space="preserve">{body}</{ns}:t>')
+            elif ns == 'a':
+                result.append(f'<a:r><a:t>{_escape(value)}</a:t></a:r>' if value else '')
+            else:
+                result.append(f'<w:t xml:space="preserve">{_escape(value)}</w:t>' if value else '')
+            last = match.end()
+        return ''.join(result) + segment[last:]
     text = text.replace("\r", "").replace("\n", " ")
     segment = re.sub(rf"<{ns}:tab/>", "", segment)
     segment = re.sub(rf"<{ns}:br\b[^>]*?(?:/>|>.*?</{ns}:br>)", "", segment, flags=re.S)
@@ -119,6 +162,13 @@ class OfficeDocument:
             raise OfficeEditError("워드(.docx)·엑셀(.xlsx)·파워포인트(.pptx)만 고칠 수 있습니다.")
         try:
             self.zip = zipfile.ZipFile(io.BytesIO(data))
+            infos = self.zip.infolist()
+            if len(data) > 32 * 1024 * 1024 or len(infos) > 5000 or sum(i.file_size for i in infos) > 128 * 1024 * 1024:
+                raise OfficeEditError('문서의 압축 해제 크기나 파일 수가 편집 한도를 넘습니다.')
+            if len({i.filename for i in infos}) != len(infos) or any(i.flag_bits & 1 for i in infos):
+                raise OfficeEditError('중복 항목이나 암호화된 문서는 편집하지 않습니다.')
+            if any('vbaproject' in i.filename.lower() or i.filename.startswith('_xmlsignatures/') for i in infos):
+                raise OfficeEditError('매크로나 전자서명이 있는 문서는 편집하지 않습니다.')
             self.parts = {name: self.zip.read(name) for name in self.zip.namelist()}
         except (zipfile.BadZipFile, KeyError) as exc:
             raise OfficeEditError("문서 파일을 열지 못했습니다(손상됐거나 암호가 걸린 파일).") from exc
@@ -201,7 +251,8 @@ class OfficeDocument:
         for item in self.items:
             if not item.text.strip() and self.suffix != ".docx":
                 continue
-            line = f"[{item.id}]{'(' + item.note + ')' if item.note else ''} {item.text.strip()[:2000]}"
+            # Never show a clipped paragraph as if it were complete: replacing it would silently lose its tail.
+            line = f"[{item.id}]{'(' + item.note + ')' if item.note else ''} {item.text}"
             if size + len(line) > limit:
                 cut = True
                 break
@@ -217,10 +268,20 @@ class OfficeDocument:
         if self.suffix == ".xlsx":
             for edit in edits:
                 cell = str(edit.get("id") or "")
-                if "!" not in cell or cell.split("!", 1)[0] not in self.sheets:
+                if "!" not in cell or cell.rsplit("!", 1)[0] not in self.sheets:
                     continue
+                ref = cell.rsplit('!', 1)[1]
+                if not re.fullmatch(r'[A-Z]{1,3}[1-9][0-9]{0,6}', ref):
+                    raise OfficeEditError('올바르지 않은 엑셀 셀 주소입니다: ' + ref)
+                col = 0
+                for ch in re.sub(r'\d', '', ref):
+                    col = col * 26 + ord(ch) - 64
+                if col > 16384 or int(re.sub(r'[A-Z]', '', ref)) > 1048576:
+                    raise OfficeEditError('엑셀 셀 범위를 넘었습니다: ' + ref)
                 before = by_id[cell].text if cell in by_id else ""
                 after = "" if edit.get("delete") else str(edit.get("text", edit.get("insert_after", "")))
+                if after.startswith('=') and re.search(r'WEBSERVICE\s*\(|HYPERLINK\s*\(|RTD\s*\(|\[|\||https?://', after, re.I):
+                    raise OfficeEditError('외부 연결이나 프로그램 실행을 포함한 새 수식은 적용하지 않습니다.')
                 self._set_cell(cell, after)
                 changes.append((cell, before, after))
             if any(c[2].startswith("=") for c in changes):
@@ -268,7 +329,7 @@ class OfficeDocument:
         return xml[start:end] if start >= 0 and end >= 0 else ""
 
     def _set_cell(self, cell: str, value: str) -> None:
-        sheet, ref = cell.split("!", 1)
+        sheet, ref = cell.rsplit("!", 1)
         part = self.sheets[sheet]
         xml = self._text(part)
         row_number = int(re.sub(r"[A-Z]", "", ref))
@@ -312,14 +373,16 @@ class OfficeDocument:
 
     def _recalculate_on_open(self) -> None:
         workbook = self._text("xl/workbook.xml")
-        if "fullCalcOnLoad" in workbook:
-            return
+        workbook = re.sub(r'\sfullCalcOnLoad="[^"]*"', '', workbook)
         if "<calcPr" in workbook:
             workbook = re.sub(r"<calcPr\b", '<calcPr fullCalcOnLoad="1"', workbook, count=1)
         else:
             workbook = workbook.replace("</workbook>", '<calcPr fullCalcOnLoad="1"/></workbook>')
         self.texts["xl/workbook.xml"] = workbook
         self.parts.pop("xl/calcChain.xml", None)   # 옛 계산 순서는 버리고 열 때 다시
+        part = 'xl/_rels/workbook.xml.rels'
+        if part in self.parts:
+            self.texts[part] = re.sub(r'<Relationship\b[^>]*Type="[^"]*/calcChain"[^>]*/>', '', self._text(part))
 
     def _pack(self) -> bytes:
         out = io.BytesIO()
@@ -366,6 +429,8 @@ def parse_edits(reply: str) -> list[dict]:
         edits = json.loads(text[start:end + 1])
     except json.JSONDecodeError as exc:
         raise OfficeEditError("모델의 고치기 목록을 읽지 못했습니다. 다시 시도해 주세요.") from exc
+    if not isinstance(edits, list) or len(edits) > 500 or any(not isinstance(e, dict) for e in edits):
+        raise OfficeEditError('문서 수정안은 500개 이하의 항목 배열이어야 합니다.')
     return [e for e in edits if isinstance(e, dict) and e.get("id")]
 
 

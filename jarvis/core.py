@@ -35,6 +35,7 @@ from .videolink import VIDEO_URL, VideoError, VideoReader, find_video_url
 from .digest import (CHUNK as DIGEST_CHUNK, MAX_TOKENS as DIGEST_MAX_TOKENS, piece_limit, split_pages, summarize as summarize_pieces,
                      summary_request)
 from .documents import DocumentError, document_request, export_document
+from .office import OfficeEdits
 from .fetcher import ASK_ABOVE, DownloadError, download_request, fetch, inspect as inspect_download, is_executable
 from .vision import ImageAttachmentStore
 from .videoedit import VideoEditError, VideoEditor, clips_for
@@ -264,6 +265,7 @@ REMEMBER_CORRECTION_TOOL = {
 # 영상 링크의 자막으로 답할 때의 라우팅 이유(ADR-098)
 VIDEO_REASON = "video transcript"
 DOCUMENT_REASON = "document request"   # ADR-104 말로 문서 만들기 — matched = '형식|previous' 또는 '형식|new'
+OFFICE_REASON = 'office edit request'
 DOWNLOAD_REASON = "download request"   # ADR-104 말로 내려받기 — matched = 주소(승인한 것이면 끝에 ' --yes')
 DIGEST_REASON = "whole document summary"  # ADR-106 긴 문서 전체 요약 — matched = 문서 id
 DIGEST_HINT = ("[문서 전체 요약] 첨부 문서 중 '조각별로 먼저 요약한 것' 은 원문 전체를 빠짐없이 다룬 것이다. 사용자가 말한 길이·형식에 "
@@ -463,6 +465,7 @@ class JarvisCore:
         self.memory_vectors = memory_vectors
         # ADR-095. 이번 요청의 권한(read|ask|auto). 웹이 요청마다 정하고 끝나면 'ask' 로 돌려놓는다.
         self.permission_mode = DEFAULT_PERMISSION
+        self.office_edits = OfficeEdits(self)
         # ADR-098. 영상 링크의 자막을 읽는 도구(app.build_core 가 붙인다). None 이면 예전처럼 페이지 글만.
         self.video_reader: VideoReader | None = None
         self._video_note = ""
@@ -680,6 +683,9 @@ class JarvisCore:
     # ------------------------------------------------------------------ execution
 
     def handle(self, session_id: str, text: str) -> tuple[str, RouteDecision]:
+        if self.office_edits.matches(session_id, text):
+            return self._handle_decision(session_id, text, RouteDecision(Destination.LOCAL_GENERAL, OFFICE_REASON))
+        self.office_edits.deactivate(session_id)
         topic = research_request(text)
         if topic is not None and not web_disabled(text):
             return self._handle_decision(session_id, text, RouteDecision(Destination.LOCAL_GENERAL, RESEARCH_REASON, topic))
@@ -1179,7 +1185,7 @@ class JarvisCore:
                                       and self.last_exchange.get("session_id") == session_id)
         # 취소 요청을 새 교정으로 기록하면 방금 만든 것을 다시 지우게 된다.
         # 그림을 고쳐 달라는 말("더 밝게 다시 그려줘")은 직전 답을 바로잡는 말이 아니다(ADR-073).
-        if not looks_like_undo_learning(text) and decision.destination not in (Destination.TOOL_IMAGE_GEN,
+        if decision.reason != OFFICE_REASON and not looks_like_undo_learning(text) and decision.destination not in (Destination.TOOL_IMAGE_GEN,
                                                                                 Destination.TOOL_VIDEO_GEN):
             self._learn_correction(session_id, text)
         self.last_route_event_id = self.storage.record_route_event(
@@ -1200,7 +1206,8 @@ class JarvisCore:
             response = f"요청을 처리하지 못했습니다: {exc}"
         else:
             if not self._answer_failed:
-                self._learn_found(session_id, text, response)
+                if decision.reason != OFFICE_REASON:
+                    self._learn_found(session_id, text, response)
                 if self._thinking_skipped:
                     response += "\n\n[생각이 길어져 답 쓸 자리가 모자라서, 생각 없이 바로 답했습니다.]"
                 response += (self._truncation_notice(self._research_destination or decision.destination) + self._tool_notice()
@@ -1223,6 +1230,8 @@ class JarvisCore:
         return response, decision
 
     def _execute(self, session_id: str, text: str, decision: RouteDecision) -> str:
+        if decision.reason == OFFICE_REASON:
+            return self.office_edits.execute(session_id, text)
         if decision.reason in (RESEARCH_REASON, AUTO_RESEARCH_REASON):
             return self._research_answer(decision.matched, automatic=decision.reason == AUTO_RESEARCH_REASON)
         # ADR-058: "방금 배운 거 취소" 는 말로 한다. 명령(/review ID 거절)을 외울 필요가 없다.
