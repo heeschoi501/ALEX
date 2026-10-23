@@ -188,6 +188,7 @@ class WebAppState:
     speech: SpeechRecognizer = field(default_factory=lambda: SpeechRecognizer(Path(__file__).resolve().parents[2] / "tools" / "stt"))
     live_history: dict[str, list[str]] = field(default_factory=dict)
     code: Any = None   # 코딩 세션(ADR-112 — OpenCode 서버 API 와 같은 일, harness.sessions.CodeSessions)
+    code_links: dict[str, dict] = field(default_factory=dict)   # 대화 id → 말로 연 코딩 세션 {code, since, fresh}(2026-10-23)
 
     def owner_viewer(self) -> Viewer:
         return Viewer(self.core.storage.get_user(OWNER))  # type: ignore[arg-type]
@@ -668,6 +669,39 @@ class WebAppState:
         if path != approved and approved not in path.parents:
             raise ValueError("승인된 파일 루트 밖의 폴더는 열 수 없습니다.")
         return path
+
+    def code_chat_plan(self, viewer: Viewer, chat_sid: str, message: str) -> dict | None:
+        """대화에서 말로 코딩 세션(2026-10-23, 사용자 "자연어로 할 수 있도록"). 이 대화에 이어진 세션이 허락·질문을 기다리면
+        이번 말이 그 답이고, 방금 끝난 세션이면 '되돌려줘'·이어서 고치기, 아니면 새 코딩 요청인지(프로젝트 파일 + 고치기 말)."""
+        from .research import request as research_request
+        if research_request(message) is not None:
+            return None
+        from .harness.intent import EDIT, REVERT, is_coding_request, permission_reply
+        if self.code is None or not viewer.is_admin:
+            return None
+        link = self.code_links.get(chat_sid)
+        session = self.code.sessions.get(link["code"]) if link else None
+        if session is not None:
+            pending = [p for p in session.permissions.values() if not p.answered.is_set()]
+            if pending and (reply := permission_reply(message)):   # 응·항상·아니가 아니면 평소 대화로(허락은 계속 기다림)
+                return {"kind": "permission", "session": session, "request": pending[0], "reply": reply}
+            if session.status == "running" and not pending:
+                return {"kind": "busy", "session": session}
+            if session.status == "question":
+                return {"kind": "answer", "session": session}
+            if link.get("fresh") and REVERT.search(message):
+                return {"kind": "revert", "session": session}
+            if link.get("fresh") and EDIT.search(message):
+                return {"kind": "continue", "session": session}
+        try:
+            root = self.code_root("")
+        except ValueError:
+            return None
+        if is_coding_request(message, root):
+            return {"kind": "new", "root": root}
+        if link:
+            link["fresh"] = False   # 다른 이야기를 했으면 '이어서 고치기'·'되돌려줘' 는 더 이상 이 세션 뜻이 아니다
+        return None
 
     def _code_fetch(self, url: str, _format: str = "markdown") -> str:
         from .webread import WebError
@@ -1963,6 +1997,101 @@ def _handler_factory(state: WebAppState):
             except ValueError as exc:
                 self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
 
+        def _code_chat_stream(self, viewer: Viewer, chat_sid: str, message: str, plan: dict, permission: str | None) -> None:
+            """말로 연 코딩 세션의 한 차례를 대화로 흘려 보낸다. 허락이 필요하거나 질문이 오거나 끝나면 이 차례를 마치고(채팅이 다시
+            입력을 받게) 대화에 남긴다. 허락은 다음 말('응'·'항상'·'아니')로 받는다. 이 웹 요청은 모델 차례를 잡지 않는다 —
+            세션이 모델을 부를 때마다 대기열에서 차례를 잡는다."""
+            code, storage = state.code, state.core.storage
+            host = self.headers.get("Host") or "127.0.0.1:8765"
+            link_url = lambda sid: f"{'https' if self._is_remote() else 'http'}://{host}/code?session={sid}"  # noqa: E731
+            self.send_response(HTTPStatus.OK)
+            self._security_headers("application/x-ndjson; charset=utf-8")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            gone = False
+
+            def emit(payload: dict) -> None:
+                nonlocal gone
+                if gone:
+                    return
+                try:
+                    self.wfile.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    gone = True   # 화면이 떠나도 세션은 계속 — 끝나면 대화에 남긴다
+
+            def finish(text: str) -> None:
+                storage.add_message(chat_sid, "assistant", text)
+                emit({"type": "done", "response": text, "session_id": chat_sid})
+
+            storage.add_message(chat_sid, "user", message)
+            kind, session = plan["kind"], plan.get("session")
+            emit({"type": "start", "request_id": "code-" + secrets.token_hex(6), "session_id": chat_sid})
+            try:
+                if kind == "busy":
+                    finish(f"코딩 세션이 아직 일하는 중입니다. 끝나면 이 대화에 결과를 남깁니다. 진행 화면: {link_url(session.id)}")
+                    return
+                if kind == "permission":
+                    code.reply_permission(session.id, plan["request"].id, plan["reply"])
+                    emit({"type": "chunk", "text": {"once": "[허락했습니다]\n", "always": "[이 세션 동안 허락합니다]\n",
+                                                    "reject": "[거절했습니다]\n"}[plan["reply"]]})
+                elif kind == "revert":
+                    files = code.revert(session.id, 0)
+                    state.code_links[chat_sid]["fresh"] = False
+                    finish("이번 코딩 세션의 변경을 처음 상태로 되돌렸습니다: " + (", ".join(files) or "바뀐 파일 없음"))
+                    return
+                elif kind in ("answer", "continue"):
+                    code.prompt(session.id, message)
+                else:
+                    tier = permission or state.session_permission(viewer, chat_sid)
+                    model = getattr(state.settings, "coding_free_model", "") if state.settings else ""
+                    session = code.create(viewer.id, plan["root"], tier, title=message.strip().splitlines()[0][:60], model=model)
+                    state.code_links[chat_sid] = {"code": session.id, "since": 0, "fresh": True}
+                    who = f"OpenCode 무료 {model[9:]}(opencode.ai)" if model else "이 PC 모델"
+                    emit({"type": "chunk", "text": f"[코딩 세션 시작 — 폴더 {session.root} · 권한 "
+                                                   f"{ {'read': '읽기 전용', 'ask': '확인 후 실행', 'auto': '자동 실행'}.get(tier, tier) } · {who}]\n"})
+                    code.prompt(session.id, message)
+                link = state.code_links[chat_sid]
+                since = link["since"]
+                while True:
+                    events = code.events(session.id, since, wait=15.0)
+                    if not events:
+                        emit({"type": "chunk", "text": ""})   # 끊긴 화면 알아채기
+                        continue
+                    final = ""
+                    for event in events:
+                        since = event["n"] + 1
+                        if event["type"] in ("progress", "message.delta"):
+                            emit({"type": "chunk", "text": event["text"]})
+                        elif event["type"] == "permission.asked":
+                            request = event["request"]
+                            diff = str((request.get("detail") or {}).get("diff") or "").strip()
+                            what = {"edit": "파일을 바꾸려", "bash": "명령을 실행하려"}.get(request["permission"], request["permission"] + " 하려")
+                            final = (f"{what} 합니다: `{request['pattern']}`\n" + (f"```diff\n{diff[:4000]}\n```\n" if diff else "")
+                                     + "진행할까요? '응'(이번만) · '항상'(이 세션 동안) · '아니'(거절)")
+                        elif event["type"] == "question.asked":
+                            final = "코딩 세션이 묻습니다:\n" + "\n".join(f"- {q.get('question', '')}" for q in event.get("questions") or [])
+                        elif event["type"] == "session.idle":
+                            result = event.get("result") or {}
+                            changed = re.findall(r"^\+\+\+ b/(.+)$", code.diff(session.id), re.M)
+                            checks = (session.last.verification if session.last is not None else None) or []
+                            check = {"verified": "통과", "unverified": "통과 못 함", "not_found": "연결된 시험 없음"}.get(
+                                checks[-1].get("status"), "") if checks else ""
+                            final = ((result.get("text") or result.get("error") or "코딩 세션이 끝났습니다.").strip()
+                                     + ("\n\n바뀐 파일: " + ", ".join(changed) if changed else "")
+                                     + (f"\n독립 검사: {check}" if check else "")
+                                     + (f"\n자세히·diff: {link_url(session.id)}" if changed else "")
+                                     + ("\n되돌리려면 '되돌려줘' 라고 하세요." if changed else ""))
+                        if final:
+                            break
+                    if final:
+                        link["since"], link["fresh"] = since, True
+                        finish(final)
+                        return
+            except (KeyError, ValueError) as exc:
+                finish(f"코딩 세션을 시작하지 못했습니다: {exc}")
+
         def _code_events(self, viewer: Viewer, query: dict) -> None:
             """사건 흐름(SSE, OpenCode /event 와 같은 뜻) — 'data: {사건}' 줄. 15초마다 빈 줄로 끊긴 연결을 알아챈다.
             ?session=…&since=N(이 번호부터). 토큰 머리글이 필요해 브라우저는 EventSource 대신 fetch 로 읽는다."""
@@ -2232,6 +2361,10 @@ def _handler_factory(state: WebAppState):
                     cloud = self.path == "/api/chat/stream" and parse_cloud_request(message) is not None
                     if cloud and not viewer.is_admin:
                         self._json(HTTPStatus.CONFLICT, {"error": "클라우드로 넘기기는 관리자만 쓸 수 있습니다."})
+                        return
+                    if (self.path == "/api/chat/stream" and not cloud and not attachments and not documents
+                            and (plan := state.code_chat_plan(viewer, session_id, message)) is not None):
+                        self._code_chat_stream(viewer, session_id, message, plan, permission)  # 말로 코딩 세션(2026-10-23)
                         return
                     with state.queue_cv:
                         if not state.owns(viewer, session_id):

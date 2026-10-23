@@ -73,6 +73,7 @@ const notice = text => { $('notice').textContent = text; };
 // 열려 있던 탭은 옛 토큰을 계속 보내고 서버는 403 을 준다. 예전에는 화면에 아무 일도
 // 일어나지 않은 것처럼 보여서 "대답이 없다" 로만 보였다. 원인과 해결을 같이 보여준다.
 let tokenExpired = false, appStopped = false;
+let opencodeSaving = false;  // 입력창 '오픈코드 API' 저장 중
 function showTokenExpired() {
   if (tokenExpired) return;
   tokenExpired = true;
@@ -446,6 +447,7 @@ function updateControls() {
   document.querySelectorAll('#file-form button, [data-command]').forEach(b => { b.disabled = busy || tokenExpired; });
   paintRequestBadges();
   syncReasoningControl();
+  syncOpencodeControl();
 }
 // 대화 목록은 날짜별로 묶는다(Claude·ChatGPT 처럼).
 function dayGroup(iso) {
@@ -1431,10 +1433,43 @@ function paintCoding(c) {
   for (const m of c.free_models || []) select.append(new Option(`OpenCode 무료 · ${m.name}`, m.id));
   if (c.free_model && ![...select.options].some(o => o.value === c.free_model)) select.append(new Option(`OpenCode 무료 · ${c.free_model} (목록에 없음)`, c.free_model));
   select.value = c.free_model || '';
+  paintOpencodeChoice(c);
   $('coding-model-note').textContent = c.free_model
     ? '무료 모델은 OpenCode 를 통해 opencode.ai 에서 돕니다 — 고친 코드·시험 출력이 그쪽으로 전송됩니다(이 PC 그래픽카드는 쓰지 않음).'
     : (c.free_models?.length ? `OpenCode 와 같은 목록에서 무료 모델 ${c.free_models.length}개를 고를 수 있습니다(코드가 opencode.ai 로 전송됨).` : '무료 모델 목록을 받지 못했습니다(인터넷 확인).');
 }
+// 입력창의 '오픈코드 API' 고르기(2026-10-23) — 설정의 코딩 모델과 같은 것(/api/coding coding_free_model)
+function paintOpencodeChoice(c) {
+  const select = $('opencode-model');
+  select.replaceChildren(new Option('연결 안 함', ''));
+  for (const m of c.free_models || []) select.append(new Option(m.name.replace(/ Free$/, ''), m.id));
+  if (c.free_model && ![...select.options].some(o => o.value === c.free_model)) select.append(new Option(c.free_model.slice(9), c.free_model));
+  select.value = c.free_model || '';
+  select.closest('label').classList.toggle('on', Boolean(c.free_model));
+  select.title = c.free_model ? `오픈코드 API 연결됨 — ${select.selectedOptions[0]?.text}: /dev-auto·/build 코딩이 opencode.ai 에서 돕니다` : '연결 안 함 — 코딩은 이 PC 모델';
+  syncOpencodeControl();
+}
+function syncOpencodeControl() {
+  const select = $('opencode-model');
+  if (select) select.disabled = !state?.is_admin || opencodeSaving || select.options.length < 2 || anyWork() || tokenExpired || appStopped;
+}
+async function loadOpencodeChoice() {
+  if (!state?.is_admin) return;
+  try { paintOpencodeChoice(await api('/api/coding')); } catch { /* 목록을 못 받으면 '연결 안 함' 만 */ }
+}
+$('opencode-model').addEventListener('change', async e => {
+  const value = e.target.value;
+  if (value && !confirm('오픈코드 API 를 연결할까요?\n/dev-auto·/build 코딩을 OpenCode 무료 모델이 하고, 고칠 코드와 시험 출력이 opencode.ai 로 전송됩니다.\n(개인 설정·대화 기록은 보내지 않습니다)')) {
+    loadOpencodeChoice(); return;
+  }
+  opencodeSaving = true; syncOpencodeControl();
+  try {
+    const c = await api('/api/coding', {coding_free_model: value});
+    paintCoding(c);
+    notice(value ? `오픈코드 API 연결: ${e.target.selectedOptions[0]?.text} — /dev-auto·/build 에 적용됩니다.` : '오픈코드 API 연결을 끊었습니다 — 코딩은 이 PC 모델로 합니다.');
+  } catch (err) { notice(err.message); loadOpencodeChoice(); }
+  finally { opencodeSaving = false; syncOpencodeControl(); }
+});
 $('coding-model').addEventListener('change', async e => {
   try { paintCoding(await api('/api/coding', {coding_free_model: e.target.value})); }
   catch (err) { $('coding-status').textContent = err.message; loadCoding(); }
@@ -1724,6 +1759,7 @@ async function pullModel(tag, btn) {
     const who = await api('/api/me');
     if (!who.user) { showLogin(who.can_use_owner); return; }
     await refresh(true); desiredSession = state.session_id; await models();
+    loadOpencodeChoice();  // 입력창의 '오픈코드 API' 고르기(관리자)
     if (serverRequests.size) notice('처리 중인 대화가 있습니다. 다른 방으로 이동할 수 있고, 완료되면 저장된 답변을 표시합니다.');
   } catch (e) { if (!tokenExpired && $('login-screen').hidden) notice('서버에 연결하지 못했습니다: ' + e.message); }
 })();

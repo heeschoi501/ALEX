@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 import base64
+import copy
 import functools
 import hashlib
 import json
@@ -72,6 +73,9 @@ from .code_check import MAX_REPAIRS, check_code, extract_python, footer, repair_
 from .diagnostics import collect_diagnostic_context
 from .insights import InsightStore, prompt_block
 from .webread import Page, WebError, WebReader
+from .research import (REASON as RESEARCH_REASON, AUTO_REASON as AUTO_RESEARCH_REASON, USAGE as RESEARCH_USAGE,
+                       Researcher, ResearchRequested, automatic_allowed, automatic_request, web_disabled, deep_disabled,
+                       request as research_request)
 from .workspace import (MAX_BUNDLE_FILES, ChangeBundle, EditProposal, SafeWorkspaceEditor, parse_change_blocks,
                         _CONTENT as _CONTENT_MARK, _END as _END_MARK, _REPLACE as _REPLACE_MARK, _SEARCH as _SEARCH_MARK)
 
@@ -229,11 +233,14 @@ WEB_SEARCH_TOOL = {
     "function": {
         "name": "web_search",
         "description": ("인터넷을 검색해 최신 자료를 가져온다. 모르는 것, 학습 이후에 생긴 일, 확인이 필요한 사실에 "
-                        "쓴다. 이미 아는 일반 지식이나 코드 작성에는 쓰지 않는다."),
+                        "쓴다. 여러 출처의 비교·상반된 주장 검증·종합 조사가 필요하면 depth=deep으로 고른다. "
+                        "사용자가 검색·딥서치 명령을 말할 필요는 없다. 이미 아는 일반 지식이나 코드 작성에는 쓰지 않는다."),
         "parameters": {
             "type": "object",
             "properties": {"query": {"type": "string",
-                                     "description": "짧은 검색어. 개인 정보·파일 경로·대화 내용은 넣지 않는다."}},
+                                     "description": "짧은 검색어. 개인 정보·파일 경로·대화 내용은 넣지 않는다."},
+                           "depth": {"type": "string", "enum": ["quick", "deep"],
+                                     "description": "간단한 사실 확인은 quick(기본), 복합 비교·근거 조사는 deep."}},
             "required": ["query"],
         },
     },
@@ -673,6 +680,9 @@ class JarvisCore:
     # ------------------------------------------------------------------ execution
 
     def handle(self, session_id: str, text: str) -> tuple[str, RouteDecision]:
+        topic = research_request(text)
+        if topic is not None and not web_disabled(text):
+            return self._handle_decision(session_id, text, RouteDecision(Destination.LOCAL_GENERAL, RESEARCH_REASON, topic))
         selected_path = None if self.member_mode else learn_path_request(text)
         if selected_path:
             try:
@@ -739,6 +749,17 @@ class JarvisCore:
             long_document = self._long_document(session_id, text)
             if long_document:
                 decision = RouteDecision(Destination.LOCAL_GENERAL, DIGEST_REASON, long_document)
+        if web_disabled(text) and decision.destination in WEB_DESTINATIONS:
+            decision = RouteDecision(Destination.LOCAL_GENERAL, "사용자 요청: 웹 검색 없이 답변")
+        elif (self.web_reader is not None and self.web_tool_enabled and not video
+              and decision.destination in (Destination.LOCAL_GENERAL, Destination.LOCAL_CODER,
+                                            Destination.TOOL_SYSTEM_INFO, Destination.CLOUD_REASONING, *WEB_DESTINATIONS)
+              and decision.reason not in (DIGEST_REASON, BUILD_COMMAND_REASON, BUILD_CONTINUE_REASON,
+                                          CODING_FOLLOWUP_REASON)
+              and self._public_research_topic(text) and not self._knowledge_session(session_id)):
+            topic = automatic_request(text)
+            if topic:
+                decision = RouteDecision(Destination.LOCAL_GENERAL, AUTO_RESEARCH_REASON, topic)
         return self._handle_decision(session_id, text, decision)
 
     def suggest_title(self, question: str, answer: str) -> str:
@@ -763,6 +784,7 @@ class JarvisCore:
         self._thinking_skipped = False
         self._learned = []
         self._web_answer = None
+        self._research_destination = None
         self._current_session, self._current_user_text = session_id, text
         self._correction_ready = False
         stored_text = text + "\n" + "\n".join(image.marker() for image in images)
@@ -1151,6 +1173,7 @@ class JarvisCore:
         self._tool_sources = []
         self._learned = []
         self._web_answer = None
+        self._research_destination = None
         self._current_session, self._current_user_text = session_id, text
         self._correction_ready = bool(self.auto_lessons and self.last_exchange is not None
                                       and self.last_exchange.get("session_id") == session_id)
@@ -1180,7 +1203,7 @@ class JarvisCore:
                 self._learn_found(session_id, text, response)
                 if self._thinking_skipped:
                     response += "\n\n[생각이 길어져 답 쓸 자리가 모자라서, 생각 없이 바로 답했습니다.]"
-                response += (self._truncation_notice(decision.destination) + self._tool_notice()
+                response += (self._truncation_notice(self._research_destination or decision.destination) + self._tool_notice()
                              + lesson_notice(self.last_lessons))
                 response += knowledge_notice(self.last_knowledge)
                 if self.last_knowledge:
@@ -1200,6 +1223,8 @@ class JarvisCore:
         return response, decision
 
     def _execute(self, session_id: str, text: str, decision: RouteDecision) -> str:
+        if decision.reason in (RESEARCH_REASON, AUTO_RESEARCH_REASON):
+            return self._research_answer(decision.matched, automatic=decision.reason == AUTO_RESEARCH_REASON)
         # ADR-058: "방금 배운 거 취소" 는 말로 한다. 명령(/review ID 거절)을 외울 필요가 없다.
         if looks_like_undo_learning(text):
             return self._undo_last_learning(session_id)
@@ -2169,6 +2194,72 @@ class JarvisCore:
 
     # ── 웹 읽기 (ADR-051) ────────────────────────────────────────────────
 
+    def research_local(self, session_id: str, topic: str) -> str:
+        if deep_disabled(topic):
+            return self.handle(session_id, topic)[0]
+        return self._handle_decision(session_id, topic, RouteDecision(
+            Destination.LOCAL_GENERAL, RESEARCH_REASON, topic.strip()))[0]
+
+    @staticmethod
+    def _public_research_topic(topic: str) -> bool:
+        return redact_sensitive_text(topic) == topic and not PRIVATE_QUERY.search(topic)
+
+    def _research_answer(self, topic: str, *, automatic: bool = False) -> str:
+        if not topic.strip():
+            return RESEARCH_USAGE
+        if self.web_reader is None:
+            return WEB_DISABLED_MESSAGE
+        if automatic:
+            self._progress("[여러 출처의 비교·검증이 필요해 딥서치로 조사합니다]\n")
+
+        def generate(messages: list[Message], phase: str) -> str:
+            tried = set()
+            for destination in (Destination.LOCAL_GENERAL, Destination.LOCAL_CODER):
+                provider = self.providers[destination]
+                if id(provider) in tried:
+                    continue
+                tried.add(id(provider))
+                researcher.check()
+                if not self._safe_health_check(provider):
+                    continue
+                try:
+                    # 이 요청의 출력·시간만 제한한다. 다음 대화의 모델 설정은 그대로 둔다.
+                    local = copy.copy(provider)
+                    cap = 8192 if phase == "보고서" else 1536
+                    if hasattr(local, "num_predict"):
+                        local.num_predict = min(cap, local.num_predict) if local.num_predict > 0 else cap
+                    if hasattr(local, "chat_step_controlled"):
+                        answer, _ = local.chat_step_controlled(messages, None, cancel_event=researcher.control,
+                                                              deadline=researcher.control.deadline,
+                                                              think=False if phase != "보고서" else None)
+                    else:
+                        answer = local.generate(messages)
+                    researcher.check()
+                    if answer.strip():
+                        if phase == "보고서" and hasattr(local, "last_metrics"):
+                            provider.last_metrics = local.last_metrics
+                        if phase == "보고서":
+                            self._research_destination = destination
+                        return answer
+                except GenerationCancelled:
+                    raise
+                except ProviderError:
+                    researcher.check()
+            raise ProviderError("로컬 조사 모델이 응답하지 못했습니다.")
+
+        researcher = Researcher(self.web_reader, generate,
+                                safe_query=lambda q: redact_sensitive_text(q) == q and not PRIVATE_QUERY.search(q),
+                                progress=self._progress, between=self._yield_turn,
+                                cancel_event=getattr(self, "command_cancel_event", None),
+                                context_chars=self.context_char_budget)
+        try:
+            result = researcher.run(topic)
+        except WebError as exc:
+            self._answer_failed = True
+            return f"딥서치를 진행하지 못했습니다: {exc}"
+        self._answer_failed = not result.generated or result.limited
+        return ("딥서치 — 질문에 맞춰 자동 선택\n\n" if automatic else "") + result.render()
+
     def web_read_local(self, session_id: str, url: str, question: str) -> str:
         """`/web` — 지정한 페이지 한 쪽을 읽고 LOCAL 모델에게만 묻는다.
 
@@ -2921,9 +3012,12 @@ class JarvisCore:
         if self.web_reader is not None:
             # ADR-056: 대화·코딩 경로에서는 모델에게 web_search 도구가 있다. 그때 "검색해줘 라고 치시라" 고
             # 안내하면 사용자에게 일을 떠넘기는 것이다(2026-09-25 사용자: "꼭 내가 명령어를 넣어야지만?").
-            if self._web_tool_active() and destination in (Destination.LOCAL_GENERAL, Destination.LOCAL_CODER):
+            if web_disabled(getattr(self, "_current_user_text", "")):
+                when_missing = "사용자가 이번 요청에서는 웹 검색 없이 답하라고 했다. 검색·딥서치를 실행하지 말고 확인 못 한 사실은 밝힌다. "
+            elif self._web_tool_active() and destination in (Destination.LOCAL_GENERAL, Destination.LOCAL_CODER):
                 when_missing = ("이번 질문에 웹 자료가 없는데 모르는 것·학습 이후의 일·확인이 필요한 사실이면 "
                                 "web_search 도구로 직접 찾아서 답한다. 사용자에게 검색 명령을 치라고 하지 않는다. "
+                                "여러 출처의 비교·검증·종합 조사가 필요하면 web_search의 depth를 deep으로 골라 딥서치한다. "
                                 "검색어에는 개인 정보나 대화 내용을 넣지 않는다. ")
             else:
                 when_missing = ("이번 질문에 웹 자료가 붙지 않았는데 최신 정보가 필요하면 '○○ 검색해줘' 라고 말하면 "
@@ -3118,6 +3212,10 @@ class JarvisCore:
         lessons = self._select_lessons(latest_user)
         if lessons:
             messages.append(Message("system", format_lessons(lessons)))
+        # 자기 기능 알기(2026-10-23, jarvis/selfknow.py) — 기능을 묻는 질문이면 실제 명령·화면에서 맞는 줄을
+        knowing = getattr(self, "self_knowledge", None)
+        if knowing is not None and (block := knowing.block(latest_user)):
+            messages.append(Message("system", block))
 
         self.last_knowledge = []
         project = self.storage.session_project(session_id)
@@ -3169,7 +3267,8 @@ class JarvisCore:
         return " ".join(facts)
 
     def _web_tool_active(self) -> bool:
-        return self.web_reader is not None and self.web_tool_enabled and not self.last_knowledge
+        return (self.web_reader is not None and self.web_tool_enabled and not self.last_knowledge
+                and not web_disabled(getattr(self, "_current_user_text", "")))
 
     def _run_web_tool(self, name: str, arguments: dict) -> str:
         """모델이 부른 web_search 를 앱이 실행한다(ADR-056). 돌려주는 글은 모델에게 가는 자료다.
@@ -3190,6 +3289,11 @@ class JarvisCore:
             self.logger.warning("web tool: refused a query that looked private")
             return ("검색어에 개인 정보로 보이는 것이 있어 검색하지 않았다. 그 부분 없이 답하거나, "
                     "무엇을 찾을지 사용자에게 확인한다.")
+        if arguments.get("depth") == "deep":
+            topic = getattr(self, "_current_user_text", "")
+            if not automatic_allowed(topic) or not self._public_research_topic(topic):
+                return "이번 요청은 자동 딥서치로 전환하지 않는다. 사용자의 검색 범위와 로컬 자료·개인 정보 경계를 지켜 현재 자료로 답한다."
+            raise ResearchRequested(topic)
         self._tool_queries.append(query)
         self.logger.info("web tool search: %s", query)
         # 검색과 두 번째 생성 동안 화면이 멈춘 것처럼 보이지 않게 알린다. 웹 화면은 끝에 최종 답으로 다시 그린다.
@@ -3876,6 +3980,14 @@ class JarvisCore:
                     finally:
                         provider.think = True
                     self._thinking_skipped = True
+            except ResearchRequested as requested:
+                # 도구 선택 차례는 여기서 끝내고 동일한 딥서치 실행기로 넘긴다.
+                # 재요약·중복 출처·자동 교훈 승격·클라우드 fallback을 만들지 않는다.
+                self._tool_queries, self._tool_sources = [], []
+                self._web_answer = None
+                self.last_lessons, self.last_knowledge = [], []
+                self._thinking_skipped = False
+                return self._research_answer(requested.topic, automatic=True)
             except GenerationCancelled:
                 raise
             except ProviderError as exc:

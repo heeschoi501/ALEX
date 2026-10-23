@@ -37,6 +37,8 @@ import urllib.parse
 import urllib.request
 import zlib
 
+from .http_control import interrupt_on_cancel
+
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ALEX-local-assistant"
 ALLOWED_SCHEMES = ("http", "https")
 TEXT_TYPES = ("text/html", "application/xhtml+xml", "text/plain")
@@ -388,8 +390,10 @@ class WebReader:
         self.max_results = max_results
         self._open = open_func or guarded_opener().open
 
-    def _get(self, url: str) -> tuple[str, str, str, bool]:
+    def _get(self, url: str, control=None) -> tuple[str, str, str, bool]:
         """(최종 주소, content-type, 글자, 잘렸는가)."""
+        if control is not None and control.is_set():
+            raise WebError("웹 읽기 요청이 취소되었거나 시간이 끝났습니다.")
         check_url(url, self.resolver)
         request = urllib.request.Request(url, headers={
             "User-Agent": USER_AGENT,
@@ -397,11 +401,15 @@ class WebReader:
             "Accept-Language": "ko,en;q=0.8",
         })
         try:
-            with self._open(request, timeout=self.timeout) as response:
+            timeout = self.timeout
+            if control is not None and control.deadline is not None:
+                timeout = max(0.001, min(timeout, control.deadline - time.monotonic()))
+            with self._open(request, timeout=timeout) as response:
                 content_type = response.headers.get_content_type()
                 if content_type not in TEXT_TYPES:
                     raise WebError(f"글이 아닌 문서는 읽지 않습니다: {content_type}")
-                raw = response.read(self.max_bytes + 1)
+                with interrupt_on_cancel(response, control):
+                    raw = response.read(self.max_bytes + 1)
                 final_url = response.geturl() or url
                 charset = response.headers.get_content_charset()
                 encoding = (response.headers.get("Content-Encoding") or "").lower()
@@ -419,12 +427,16 @@ class WebReader:
         except (http.client.HTTPException, OSError) as exc:
             raise WebError(f"읽는 중 연결이 끊겼습니다: {type(exc).__name__}") from None
 
+        if control is not None and control.is_set():
+            raise WebError("웹 읽기 요청이 취소되었거나 시간이 끝났습니다.")
         truncated = len(raw) > self.max_bytes
         raw = raw[: self.max_bytes]
         if encoding in ("gzip", "deflate"):
             # 요청에 Accept-Encoding 을 싣지 않지만 그래도 압축해 보내는 서버가 있다.
             try:
-                raw = zlib.decompressobj(32 + zlib.MAX_WBITS).decompress(raw, self.max_bytes)
+                expanded = zlib.decompressobj(32 + zlib.MAX_WBITS).decompress(raw, self.max_bytes + 1)
+                truncated = truncated or len(expanded) > self.max_bytes
+                raw = expanded[:self.max_bytes]
             except zlib.error:
                 raise WebError("압축을 풀지 못했습니다.") from None
         if not charset:
@@ -436,8 +448,8 @@ class WebReader:
             text = raw.decode("utf-8", errors="replace")
         return final_url, content_type, text, truncated
 
-    def fetch(self, url: str) -> Page:
-        final_url, content_type, text, truncated = self._get(url)
+    def fetch(self, url: str, *, control=None) -> Page:
+        final_url, content_type, text, truncated = self._get(url, control=control)
         if content_type == "text/plain":
             return Page(final_url, "", text.strip(), truncated)
         title, body = extract_text(text)
@@ -445,7 +457,9 @@ class WebReader:
             raise WebError("페이지에서 읽을 글을 찾지 못했습니다(스크립트로만 그리는 페이지일 수 있습니다).")
         return Page(final_url, title, body, truncated)
 
-    def search(self, query: str) -> list[SearchResult]:
+    def search(self, query: str, *, control=None) -> list[SearchResult]:
+        if control is not None and control.is_set():
+            raise WebError("웹 읽기 요청이 취소되었거나 시간이 끝났습니다.")
         query = (query or "").strip()
         if not query:
             raise WebError("검색어가 비어 있습니다.")
@@ -456,7 +470,7 @@ class WebReader:
             return list(cached[1])
         if now < self._blocked_until:
             raise WebError(f"{BLOCKED_MESSAGE} (약 {int(self._blocked_until - now) + 1}초 뒤에 다시 찾습니다)")
-        _, _, markup, _ = self._get(SEARCH_URL + urllib.parse.quote(query))
+        _, _, markup, _ = self._get(SEARCH_URL + urllib.parse.quote(query), control=control)
         results = parse_search_results(markup, self.max_results)
         if not results:
             if "anomaly" in markup.lower():

@@ -390,8 +390,8 @@ $('backdrop').addEventListener('click', () => { document.body.classList.remove('
     $('root-note').textContent = root ? `비우면 지금 프로젝트. 상대 경로는 ${root} 기준.` : '승인된 파일 루트가 없어 세션을 열 수 없습니다.';
   } catch (err) { note(err.message, 'error'); }
   await loadList();
-  let last = null;
-  try { last = localStorage.getItem('alex-code-session'); } catch { /* 저장소 막힘 */ }
+  let last = new URLSearchParams(location.search).get('session');   // 대화에서 연 세션(2026-10-23)
+  try { last = last || localStorage.getItem('alex-code-session'); } catch { /* 저장소 막힘 */ }
   if (last && [...$('list').querySelectorAll('.item')].length) {
     try { await api(`/api/code/session/${last}`); open(last); } catch { /* 지워진 세션 */ }
   }

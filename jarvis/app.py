@@ -16,7 +16,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from .config import ConfigError, Settings, load_settings, local_config_path
-from .core import DOWNLOAD_REASON, CloudApprovalRequest, JarvisCore
+from .core import MEMBER_BLOCKED, DOWNLOAD_REASON, CloudApprovalRequest, JarvisCore
 from .device import DeviceError, VSCodeLauncher, WakeOnLanTool
 from .embeddings import EmbeddingClient, MemoryVectors
 from .permissions import is_alex_program
@@ -128,6 +128,7 @@ HELP_TEXT = """사용 가능한 명령
   /grep 검색어              프로젝트 내용에서 관련 코드/문서 조각 찾기
   /ask-project 질문         관련 여러 파일 조각을 찾아 Local 모델에게 질문
   /search 검색어            웹 검색 + 상위 결과 한 쪽을 읽고 Local 모델이 답 (출처 표시)
+  /research 주제            딥서치 직접 요청(복합 비교·근거 조사는 일반 채팅에서도 자동 선택, /deepsearch 도 가능)
   /web 주소 :: 질문         웹 페이지 한 쪽을 읽고 Local 모델에게 질문 (읽기 전용)
   /edit-file 경로 :: 지시    Local 모델이 수정안을 만들고 diff만 표시 (자동 적용 없음)
   /edit-files 경로1, 경로2 :: 지시   여러 파일 부분 수정·새 파일을 한 묶음 수정안으로 (자동 적용 없음)
@@ -154,6 +155,7 @@ HELP_TEXT = """사용 가능한 명령
   /dev-check [이름]        프로젝트의 alex-checks.json 에 사용자가 적은 검사 명령 목록/실행
   /dev-outcomes            최근 개발 작업의 결과 기록(시험·수정안·적용·전체 검사) 요약
   /dev-learn               결과 기록에서 코딩 절차 교훈을 뽑는다(로컬 모델, ADR-070)
+  /self-check [개수]       스스로 점검: 자기 기능 질문을 스스로 풀고 틀린 것을 교훈으로(기본 5·최대 20, 그래픽카드 80℃ 넘으면 멈춤)
   /dev-insights [remove N|skill N [이름]] 코딩 절차 교훈 목록 / 지우기 / 골라서 스킬로 (붙이기: coding_insights_enabled)
   /dev-list                현재 프로젝트의 저장된 개발 작업 목록
   /dev-resume ID           저장된 작업 선택 (자동 실행 없음)
@@ -686,6 +688,21 @@ def build_core(
         misroute_log_path=settings.log_dir / "misroute.jsonl",
     )
     apply_coding_worker(core, settings, notes)
+    from .selfknow import SelfKnowledge  # 자기 기능 알기 — 명령 목록과 화면에서(2026-10-23)
+    core.self_knowledge = SelfKnowledge(HELP_TEXT, Path(__file__).resolve().parent / "static" / "index.html", extra=(
+        "말로 파일 고치기·수정 — 채팅에 '프로젝트에 있는 파일 이름 + 고쳐줘·수정해줘·추가해줘·바꿔줘' 라고 하면 코딩 세션이 그 파일을 "
+        "직접 읽고 쓰고 고친다(폴더는 지금 프로젝트, 권한은 입력창 선택, 관리자만). 허락은 채팅에서 '응'·'항상'·'아니' 로 답하고, "
+        "'되돌려줘' 로 되돌린다. '코딩 세션에서 ~해줘' 라고 해도 된다. 새 프로그램을 짜 달라는 말은 코드를 답으로 준다(파일로 만들려면 /build).",
+        # 권한·스스로 하는 일(2026-10-23 사용자 "alex 가 권한 생긴 거 인지하게") — 화면의 권한 메뉴는 title 이 없어 따로 적는다
+        "권한 — 입력창의 권한 고르기: 읽기 전용(읽기·찾기·답만, 파일 바꾸기·코드 실행·그림 없음) · 확인 후 실행(기본 — 파일을 바꾸기 전에 "
+        "diff 를 보이고 매번 허락을 받음) · 자동 실행(관리자만 — 묻지 않고 적용, 원본 백업·되돌리기). 이 PC 의 파일·명령·코딩 세션·클라우드 "
+        "넘기기는 관리자만. 설치·삭제·오래 걸리는 GPU 작업·게시는 늘 사람 승인, 비밀번호·결제·권한 규칙 수정은 늘 금지.",
+        "웹 검색·딥서치 — 대화 중 모르는 최신 사실은 ALEX 가 스스로 웹 검색을 하고(사용자가 '검색해줘' 라고 안 해도 됨), 여러 출처를 "
+        "비교·근거 조사해야 하는 질문은 스스로 딥서치로 넘어가 여러 검색·본문을 읽고 출처와 함께 보고한다(/research 로 직접 요청도 가능). "
+        "'검색 없이' 라고 하면 검색하지 않는다.",
+        "문서 — 워드·엑셀·PDF·PPT 만들기('워드로 만들어줘')와 올린 문서(PDF·워드·엑셀·PPT·한글) 읽기·요약은 된다. 올린 워드·엑셀·PPT 를 "
+        "서식 그대로 고친 사본으로 돌려주기와 PC 의 워드·엑셀 파일을 그 자리에서 고치기(수정)는 아직 연결 전이다 — 지금은 내용을 고쳐 "
+        "새 문서로 다시 만들어 준다(서식은 새로 잡힘). 글로 된 파일(.md·.txt·코드)은 말로 파일 고치기로 그 자리에서 고칠 수 있다.",))
     # 영상 링크 읽기(ADR-098): C:\ALEX\tools\video 에 yt-dlp·Deno 가 있으면 켠다
     tools = Path(__file__).resolve().parents[2] / "tools"
     video_reader = VideoReader(tools / "video", transcriber=Transcriber(tools / "whisper"))  # 받아쓰기(ADR-108)는 있으면 켬
@@ -1011,6 +1028,15 @@ def handle_command(core: JarvisCore, session_id: str, text: str) -> tuple[str, b
 
     if text == "/dev-outcomes":
         return DeveloperMode(core).outcomes(), True, session_id
+
+    if text == "/self-check" or text.startswith("/self-check "):  # 스스로 점검(2026-10-23 준비 — 사람이 부를 때만)
+        if getattr(core, "member_mode", False):
+            return MEMBER_BLOCKED, True, session_id
+        raw = text.removeprefix("/self-check").strip() or "5"
+        if not raw.isdigit():
+            return "사용법: /self-check [개수 1~20] — ALEX 가 자기 기능 질문을 스스로 풀고 틀린 것을 교훈으로 남김", True, session_id
+        from .selfcheck import run as self_check
+        return self_check(core, int(raw), say=lambda note: core._progress(note)), True, session_id
 
     if text == "/dev-insights" or text.startswith("/dev-insights ") or text == "/dev-learn":
         try:
@@ -1491,6 +1517,9 @@ def handle_command(core: JarvisCore, session_id: str, text: str) -> tuple[str, b
             return core.ask_file_local(session_id, relative_path, question), True, session_id
         except ToolError as exc:
             return str(exc), True, session_id
+
+    if text in ("/research", "/deepsearch") or text.startswith(("/research ", "/deepsearch ")):
+        return core.research_local(session_id, text.partition(" ")[2]), True, session_id
 
     if text == "/search" or text.startswith("/search "):
         return core.web_search_local(session_id, text.removeprefix("/search")), True, session_id
