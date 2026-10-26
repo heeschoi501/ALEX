@@ -30,7 +30,7 @@ from typing import Callable, ContextManager
 
 from ..http_control import RequestControl
 from ..freemodels import is_free_model
-from ..opencode_worker import secret_file
+from ..opencode_worker import secret_file, withhold
 from ..providers import GenerationCancelled, GenerationTimeout, Message
 from . import commands as cmds
 from . import permission as perm
@@ -93,22 +93,35 @@ FREE_COPY_LIMIT = 300 * 1024 * 1024
 FREE_SKIP = VERIFY_SKIP | {"__pycache__", ".git", ".opencode", "node_modules", ".pytest_cache"}
 
 
-def _copy_for_free(source: Path, target: Path) -> None:
+def _copy_for_free(source: Path, target: Path) -> list[str]:
     """무료 모델 세션 복사본 — 독립 검사 복사본처럼 기록·데이터·실행 환경·도구·개인 설정(.env·jarvis.local.json)은 뺀다(opencode.ai
-    로 보내지 않게). 300MB 가 넘으면 거절 — 더 좁은 폴더로 세션을 열게."""
-    def ignore(directory, names):
-        return {n for n in names if n in FREE_SKIP or n.endswith(".pyc") or secret_file(n)
-                or (Path(directory) / n).is_symlink()}
+    로 보내지 않게). 키·인증 파일과 내용에 비밀값 모양이 보이는 파일도 빼고 그 상대 경로를 돌려준다(그 경로의 변경은 들이지
+    않는다). 300MB 가 넘으면 거절 — 더 좁은 폴더로 세션을 열게."""
+    source = Path(source)
+    withheld: list[str] = []
+    skipped: set[Path] = set()
     total = 0
     for directory, dirs, files in os.walk(source):
-        skipped = ignore(directory, dirs + files)
-        dirs[:] = [d for d in dirs if d not in skipped]
+        here = Path(directory)
+        dirs[:] = [d for d in dirs if d not in FREE_SKIP and not secret_file(d) and not (here / d).is_symlink()]
         for name in files:
-            if name not in skipped:
-                total += (Path(directory) / name).stat().st_size
+            path = here / name
+            if name in FREE_SKIP or name.endswith(".pyc") or path.is_symlink():
+                skipped.add(path)
+            elif withhold(path):
+                skipped.add(path)
+                withheld.append(path.relative_to(source).as_posix())
+            else:
+                total += path.stat().st_size
                 if total > FREE_COPY_LIMIT:
                     raise ValueError("세션 폴더가 너무 큽니다(복사할 파일 300MB 초과) — 무료 모델 세션은 더 좁은 프로젝트 폴더로 열어 주세요.")
+
+    def ignore(directory, names):
+        here = Path(directory)
+        return {n for n in names if here / n in skipped or ((here / n).is_dir()
+                and (n in FREE_SKIP or secret_file(n) or (here / n).is_symlink()))}
     shutil.copytree(source, target, ignore=ignore)
+    return sorted(withheld)
 
 
 class _Gated:
@@ -440,7 +453,7 @@ class CodeSessions:
         project, data = base / "project", base / "data"
         shutil.rmtree(project, ignore_errors=True)
         try:
-            _copy_for_free(session.root, project)
+            withheld = set(_copy_for_free(session.root, project))
         except ValueError as exc:
             return AgentResult(text="", stopped="error", error=str(exc))
         data.mkdir(parents=True, exist_ok=True)
@@ -451,6 +464,9 @@ class CodeSessions:
                                      ensure_ascii=False), encoding="utf-8")
         session.transcript.append({"role": "user", "content": text})
         say(f"[OpenCode 무료 모델 {session.model.split('/', 1)[1]} — 코드가 opencode.ai 로 전송됩니다]\n")
+        if withheld:
+            say(f"[비밀값이 보여 보내지 않은 파일 {len(withheld)}개: " + ", ".join(sorted(withheld)[:5])
+                + (" …" if len(withheld) > 5 else "") + "]\n")
         flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
         with worker.request_command(text, session=session.oc_session, agent="plan" if mode == "plan" else "") as (command, stdin):
             process = subprocess.Popen(command,
@@ -509,6 +525,9 @@ class CodeSessions:
                     for rel in sorted(set(before) | set(after)):
                         if before.get(rel) == after.get(rel) or FREE_SKIP.intersection(Path(rel).parts):
                             continue  # 복사에서 뺀 곳(기록·데이터·개인 설정)은 들이지도 않는다
+                        if rel in withheld or any(secret_file(part) for part in Path(rel).parts):
+                            notes.append(f"{rel}: 보내지 않은 비밀 파일 자리라 들이지 않았습니다")
+                            continue
                         if rel in after and Path(rel).suffix.lower() not in TEXT_SUFFIXES:
                             notes.append(f"{rel}: 글 파일이 아니라 들이지 않았습니다")
                             continue

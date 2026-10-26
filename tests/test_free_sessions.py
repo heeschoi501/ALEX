@@ -87,6 +87,30 @@ class FreeSessionTests(Fixture):
         copied = sorted(p.relative_to(target).as_posix() for p in target.rglob('*') if p.is_file())
         self.assertEqual(copied, ['calc.py', 'tests/test_calc.py'])
 
+    def test_files_with_secret_contents_are_withheld_and_their_paths_not_overwritten(self):
+        # 2026-10-26: 이름이 평범해도 내용에 비밀값 모양이 보이면 보내지 않고, OpenCode 가 그 자리에 새 파일을 써도 원본을 덮지 않는다.
+        fake = self.prepare()
+        self.put('settings.py', 'API_KEY = "sk-abcdefghijklmnop1234"\n')
+        self.put('notes.md', '-----BEGIN RSA PRIVATE KEY-----\n' + 'MIIEow' * 20 + '\n-----END RSA PRIVATE KEY-----\n')
+        # 평범한 코드의 'password: str'·'api_key=' 는 비밀값이 아니다(이것까지 빼면 ALEX 의 core·web 이 빠졌다)
+        self.put('accounts.py', 'def login(name: str, password: str):\n    api_key = load()\n')
+        target = Path(self.temp.name) / 'copy'
+        from jarvis.harness.sessions import _copy_for_free
+        self.assertEqual(_copy_for_free(self.root, target), ['notes.md', 'settings.py'])
+        self.assertFalse((target / 'settings.py').exists() or (target / 'notes.md').exists())
+        self.assertTrue((target / 'accounts.py').exists())
+        script = Path(fake[1])
+        script.write_text(FAKE + "Path('settings.py').write_text('API_KEY = None\\n', encoding='utf-8')\n"
+                          "Path('.env').write_text('X=1\\n', encoding='utf-8')\n", encoding='utf-8')
+        sessions = CodeSessions(lambda: None, opencode_command=fake)
+        session = sessions.create('owner', self.root, 'auto', model='opencode/big-pickle')
+        sessions.prompt(session.id, 'calc.py 고쳐')
+        result = self.wait(sessions, session.id)
+        self.assertIn('return a + b', (self.root / 'calc.py').read_text())        # 평범한 변경은 들인다
+        self.assertIn('sk-abcdefghijklmnop1234', (self.root / 'settings.py').read_text())
+        self.assertFalse((self.root / '.env').exists())
+        self.assertIn('settings.py: 보내지 않은 비밀 파일 자리', result.text)
+
     def test_read_tier_tells_opencode_not_to_edit_and_brings_nothing_in(self):
         fake = self.prepare()
         sessions = CodeSessions(lambda: None, opencode_command=fake)

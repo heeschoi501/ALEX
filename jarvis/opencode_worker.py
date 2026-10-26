@@ -37,8 +37,36 @@ SECRET_NAMES = re.compile(r"(?i)^(\.env(\..*)?|id_rsa.*|id_ed25519.*|auth\.json|
 SECRET_SUFFIXES = {".pem", ".key", ".pfx", ".p12", ".keystore", ".jks"}
 
 
+SCAN_MAX_BYTES = 8_000_000
+# 파일 내용에는 실제 키 모양만 본다 — 대화 검사(core.SENSITIVE_HINTS)의 'api_key=·password:' 같은 말은 평범한 코드
+# (`password: str`)에도 걸려 ALEX 의 core·web·app 까지 빠졌다(2026-10-26 실측). 개인 키는 본문(base64)까지 있어야 한다.
+CONTENT_GENERIC = ("API key/token 형태", "password 형태", "private key 블록")
+PRIVATE_KEY_BODY = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----\s*[A-Za-z0-9+/=\s]{40,}")
+
+
 def secret_file(name: str) -> bool:
     return name == "jarvis.local.json" or Path(name).suffix.lower() in SECRET_SUFFIXES or SECRET_NAMES.match(name) is not None
+
+
+def withhold(path: Path) -> bool:
+    """밖으로 보내지 않을 파일 — 키·인증 파일 이름이거나, 글 파일 안에 실제 키 모양(sk-·ghp_·AKIA·JWT·개인 키 본문 …)이
+    보이면. 너무 커서 다 읽을 수 없는 글 파일·못 읽는 파일도 보내지 않는다."""
+    if secret_file(path.name):
+        return True
+    try:
+        with path.open("rb") as stream:
+            head = stream.read(4096)
+            if b"\0" in head:
+                return False  # 바이너리 — 키 파일 형식은 위의 이름·확장자로 거른다
+            if path.stat().st_size > SCAN_MAX_BYTES:
+                return True
+            data = head + stream.read()
+    except OSError:
+        return True
+    from .core import SENSITIVE_HINTS  # 부를 때 — core 가 이 모듈을 가져오므로
+    text = data.decode("utf-8", errors="ignore")
+    return PRIVATE_KEY_BODY.search(text) is not None or any(
+        pattern.search(text) for label, pattern in SENSITIVE_HINTS if label not in CONTENT_GENERIC)
 PERMISSION = {
     "edit": "allow",
     "webfetch": "deny",
@@ -64,6 +92,7 @@ class WorkerRun:
     log_tail: str = ""
     infrastructure_error: str = ''
     timings: dict[str, float] = field(default_factory=dict)
+    withheld: list[str] = field(default_factory=list)       # 무료 모델에 보내지 않은 파일(그 경로의 변경도 들이지 않는다)
 
 
 def _hashes(root: Path) -> dict[str, str]:
@@ -190,9 +219,11 @@ class OpenCodeWorker:
         with tempfile.TemporaryDirectory(prefix="alex-opencode-") as tmp:
             work = Path(tmp) / "project"
             _copy_project(project, work)
+            withheld: set[str] = set()
             if self.free:  # opencode.ai 로 가는 복사본 — 개인 설정·비밀 파일은 빼고(비교 기준 전에 지워서 '삭제'로 잡히지 않게)
                 for path in list(work.rglob("*")):
-                    if path.is_file() and secret_file(path.name):
+                    if path.is_file() and withhold(path):
+                        withheld.add(path.relative_to(work).as_posix())
                         path.unlink()
             before = _hashes(work)
             config = Path(tmp) / "opencode.json"
@@ -202,7 +233,7 @@ class OpenCodeWorker:
             env = self.environment(config, data)
             log_path = Path(tmp) / "events.jsonl"
             started = time.monotonic()
-            result = WorkerRun()
+            result = WorkerRun(withheld=sorted(withheld))
             with self.request_command(prompt + RULES) as (command, stdin), log_path.open("wb") as log:
                 flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
                 if cancel_event is not None and cancel_event.is_set():
@@ -236,7 +267,7 @@ class OpenCodeWorker:
                     result.tools[str(part["tool"])] = result.tools.get(str(part["tool"]), 0) + 1
             after = _hashes(work)
             for path in sorted(set(before) | set(after)):
-                if before.get(path) == after.get(path):
+                if before.get(path) == after.get(path) or path in withheld:  # 보내지 않은 파일을 새로 써도 원본을 덮지 않는다
                     continue
                 if path not in after:
                     result.deleted.append(path)

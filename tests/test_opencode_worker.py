@@ -382,5 +382,27 @@ class FreeModelWorkerTests(unittest.TestCase):
             self.assertEqual(run.deleted, [])  # 빼고 보낸 개인 파일이 '삭제'로 돌아오지 않는다
             self.assertTrue((project / "jarvis.local.json").exists())
 
+    def test_free_model_withholds_secret_contents_and_ignores_writes_to_those_paths(self):
+        # 2026-10-26: 내용에 비밀값 모양이 보이는 파일도 보내지 않고, 그 자리에 쓴 파일은 수정안에 넣지 않는다.
+        import tempfile as _tempfile
+        with _tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            project = root / "project"
+            (project / "jarvis").mkdir(parents=True)
+            (project / "jarvis" / "a.py").write_text("a = 0\n", encoding="utf-8")
+            (project / "jarvis" / "keys.py").write_text('TOKEN = "ghp_abcdefghijklmnopqrstuvwx"\n', encoding="utf-8")
+            script = root / "fake.py"
+            script.write_text("from pathlib import Path\n"
+                              "seen = Path('jarvis/keys.py').exists()\n"
+                              "Path('jarvis/keys.py').write_text('TOKEN = None\\n', encoding='utf-8')\n"
+                              "Path('jarvis/a.py').write_text('a = 1\\n', encoding='utf-8')\n"
+                              "Path('seen.txt').write_text(str(seen), encoding='utf-8')\n", encoding="utf-8")
+            run = OpenCodeWorker(root, "opencode/big-pickle", command=[sys.executable, str(script)]).run(project, "고쳐")
+            self.assertEqual(run.created.get("seen.txt"), "False")
+            self.assertEqual(run.withheld, ["jarvis/keys.py"])
+            self.assertEqual(run.changed, {"jarvis/a.py": "a = 1\n"})
+            self.assertNotIn("jarvis/keys.py", run.created)
+
+
 if __name__ == "__main__":
     unittest.main()
