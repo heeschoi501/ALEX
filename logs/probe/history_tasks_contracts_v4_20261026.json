@@ -131,6 +131,49 @@
   "refreshed": "manual"
  },
  {
+  "id": "hist_claude-backup-20261003-wan14b_core_test_imagegen",
+  "file": "jarvis/core.py",
+  "test": "tests/test_imagegen.py",
+  "edits": [
+   [
+    "        \"\"\"자연어 영상 부탁(ADR-075): 영어 프롬프트 → Ollama 모델 내림 → ComfyUI Wan 2.2(14B — 그림에서 시작하면 14B I2V, 없으면 5B,\n        5초, 'FHD' 면 SeedVR2).\n",
+    "        \"\"\"자연어 영상 부탁(ADR-075): 영어 프롬프트 → Ollama 모델 내림 → ComfyUI Wan 2.2(720p 5초, 'FHD' 면 SeedVR2).\n"
+   ],
+   [
+    "        self._progress(f\"[영상 만드는 중: {prompt}]\\n({plan.model}, 5초 영상에 약 {plan.minutes}분\"\n                       f\"{'(FHD 로 키우기 포함)' if plan.fhd else ''} 걸립니다. \"\n",
+    "        self._progress(f\"[영상 만드는 중: {prompt}]\\n(5초 영상에 약 4분{', FHD 로 키우기까지 약 8분' if plan.fhd else ''} 걸립니다. \"\n"
+   ],
+   [
+    "        lines = [f\"영상을 만들었습니다 — {result.model}{' + SeedVR2(FHD)' if result.fhd else ''}, ",
+    "        lines = [f\"영상을 만들었습니다 — Wan 2.2 5B{' + SeedVR2(FHD)' if result.fhd else ''}, "
+   ],
+   [
+    "            big = generator.video_plan(start or False, True)\n            lines.append(f\"더 큰 화면({big.size[0]}×{big.size[1]})이 필요하면 'FHD로 ○○ 영상 만들어줘'처럼 말해 주세요(약 {big.minutes}분).\")\n",
+    "            lines.append(\"더 큰 화면(1920×1056)이 필요하면 'FHD로 ○○ 영상 만들어줘'처럼 말해 주세요(약 8분).\")\n"
+   ],
+   [
+    "            clip, big = self.image_generator.video_plan(), self.image_generator.video_plan(fhd=True)\n",
+    ""
+   ],
+   [
+    "                         f\" 영상도 만든다({clip.model}): '○○ 영상 만들어줘' 하면 5초 영상({clip.width}×{clip.height}, 약 {clip.minutes}분), \"\n                         f\"'FHD로' 를 붙이면 {big.size[0]}×{big.size[1]}(약 {big.minutes}분), \"\n",
+    "                         \" 영상도 만든다(Wan 2.2): '○○ 영상 만들어줘' 하면 5초 영상(720p, 약 4분), 'FHD로' 를 붙이면 1920×1056(약 8분), \"\n"
+   ]
+  ],
+  "split": "history",
+  "dataset": "history-contracts-v3-20261004",
+  "backup": "claude-backup-20261003-wan14b",
+  "hunks": 6,
+  "changed_lines": 16,
+  "failing": [
+   "Wan14VideoTests.test_a_text_request_uses_14b_with_the_4_step_lora",
+   "Wan14VideoTests.test_direct_prompt_goes_to_14b_unchanged",
+   "Wan14VideoTests.test_the_chat_model_hears_the_14b_numbers"
+  ],
+  "other_failures": [],
+  "refreshed": "manual"
+ },
+ {
   "id": "hist_codex-backup-20260926-stage4-state_developer_test_developer",
   "file": "jarvis/developer.py",
   "test": "tests/test_developer.py",

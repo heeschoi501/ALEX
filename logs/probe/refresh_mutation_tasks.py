@@ -41,6 +41,29 @@ MANUAL = {
          "        self.core.local_summarizer = build_summary_provider(general, candidate)\n",
          "        self.core.providers[Destination.LOCAL_CODER] = coder\n"],
     ],
+    # 영상 계획(video_plan)의 모델·시간·크기 대신 5B 의 옛 숫자를 박아 넣은 버그. 지금 코드는 LTX 도 계획으로 고르므로
+    # 계획(plan.fhd 등)은 그대로 두고, 사용자·대화 모델에게 보이는 숫자만 옛 값으로 되돌린다.
+    "hist_claude-backup-20261003-wan14b_core_test_imagegen": [
+        ["        \"\"\"자연어 영상 부탁(ADR-075): 영어 프롬프트 → Ollama 모델 내림 → ComfyUI Wan 2.2(14B — 그림에서 시작하면 14B I2V,"
+         " 없으면 5B,\n        5초, 'FHD' 면 SeedVR2).\n",
+         "        \"\"\"자연어 영상 부탁(ADR-075): 영어 프롬프트 → Ollama 모델 내림 → ComfyUI Wan 2.2(720p 5초, 'FHD' 면 SeedVR2).\n"],
+        ["        self._progress(f\"[영상 만드는 중: {prompt}]\\n({plan.model}, 5초 영상에 약 {plan.minutes}분\"\n"
+         "                       f\"{'(FHD 로 키우기 포함)' if plan.fhd else ''} 걸립니다. \"\n",
+         "        self._progress(f\"[영상 만드는 중: {prompt}]\\n(5초 영상에 약 4분{', FHD 로 키우기까지 약 8분' if plan.fhd else ''}"
+         " 걸립니다. \"\n"],
+        ["        lines = [f\"영상을 만들었습니다 — {result.model}{' + SeedVR2(FHD)' if result.fhd else ''}, ",
+         "        lines = [f\"영상을 만들었습니다 — Wan 2.2 5B{' + SeedVR2(FHD)' if result.fhd else ''}, "],
+        ["            big = generator.video_plan(start or False, True)\n"
+         "            lines.append(f\"더 큰 화면({big.size[0]}×{big.size[1]})이 필요하면 'FHD로 ○○ 영상 만들어줘'처럼 말해 주세요"
+         "(약 {big.minutes}분).\")\n",
+         "            lines.append(\"더 큰 화면(1920×1056)이 필요하면 'FHD로 ○○ 영상 만들어줘'처럼 말해 주세요(약 8분).\")\n"],
+        ["            clip, big = self.image_generator.video_plan(), self.image_generator.video_plan(fhd=True)\n", ""],
+        ["                         f\" 영상도 만든다({clip.model}): '○○ 영상 만들어줘' 하면 5초 영상({clip.width}×{clip.height},"
+         " 약 {clip.minutes}분), \"\n"
+         "                         f\"'FHD로' 를 붙이면 {big.size[0]}×{big.size[1]}(약 {big.minutes}분), \"\n",
+         "                         \" 영상도 만든다(Wan 2.2): '○○ 영상 만들어줘' 하면 5초 영상(720p, 약 4분), 'FHD로' 를 붙이면"
+         " 1920×1056(약 8분), \"\n"],
+    ],
     # 자동으로 옮기면 그 구간에 나중에 생긴 /self-check 까지 지운다 — /dev-outcomes·/dev-learn·/dev-insights 만 지운다.
     "hist_claude-backup-20260930-outcomes_app_test_developer": [
         ["  /dev-outcomes            최근 개발 작업의 결과 기록(시험·수정안·적용·전체 검사) 요약\n"
