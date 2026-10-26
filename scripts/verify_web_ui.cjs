@@ -97,10 +97,14 @@ async function main() {
     assert(messages.some(m => m.content.includes('ALPHA_PRIVATE_MARKER')));
     const projectId = (await api('/api/state')).body.project.id;
     log('project create, upload, instructions and retrieval');
+    // 새 요청이 실제로 모델에 갈 때까지 기다린다 — 전에는 앞 요청의 기록을 읽어 보내지도 않은 글을 검사할 수 있었다.
+    const previousRecord = fs.readFileSync(record, 'utf8');
     await page.locator('#new-chat').click();
-    await page.locator('#input').fill('FSM testbench 설명해줘');
+    await page.locator('#input').fill('FSM testbench 설명해줘');  // 새 대화가 만들어지는 동안 친 글도 새 대화에 남는다
     await page.locator('#send').click();
     await page.waitForFunction(() => document.getElementById('send').disabled === false);
+    for (let i = 0; i < 100 && fs.readFileSync(record, 'utf8') === previousRecord; i++) await new Promise(r => setTimeout(r, 100));
+    assert.notEqual(fs.readFileSync(record, 'utf8'), previousRecord, 'the new chat must reach the model');
     messages = JSON.parse(fs.readFileSync(record, 'utf8'));
     assert(!messages.some(m => m.content.includes('ALPHA_PRIVATE_MARKER')));
     assert(!messages.some(m => m.content.includes('ALPHA_INSTRUCTION')));
