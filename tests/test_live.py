@@ -2,6 +2,7 @@
 
 가짜 받아쓰기 일꾼으로 흐름(받아쓰기 → 번역 → 기록)을 보고, 이 PC 에 실제 도구(C:\\ALEX\\tools\\stt)가 있으면 실제 SenseVoice 로
 모델에 딸린 시험 음성을 받아 적는다."""
+import gc
 import io
 import json
 from pathlib import Path
@@ -12,6 +13,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+import warnings
 import wave
 
 from jarvis.live import (LIVE_SYSTEM, MODEL_NAME, LiveError, SpeechRecognizer, check_wav, clean_translation, meaningful,
@@ -117,6 +119,21 @@ class RecognizerTests(unittest.TestCase):
         recognizer.mode = "en"
         self.assertEqual(recognizer.recognize(tone())[1], "en")
         self.assertEqual(recognizer.starts, 2)
+
+    def test_stopping_closes_the_worker_pipes(self):
+        # 2026-10-26: 멈춘 일꾼·닫기·쉬어서 내리기 모두 stdin/stdout 을 닫지 않아 ResourceWarning 이 났다.
+        recognizer = FakeRecognizer(self.folder, "crash")
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", ResourceWarning)
+            with self.assertRaisesRegex(LiveError, "멈췄습니다"):
+                recognizer.recognize(tone())
+            recognizer.mode = "en"
+            recognizer.recognize(tone())
+            process = recognizer._process
+            recognizer.close()
+            gc.collect()
+        self.assertTrue(process.stdin.closed and process.stdout.closed)
+        self.assertEqual([w for w in caught if issubclass(w.category, ResourceWarning)], [])
 
     def test_worker_errors_are_reported(self):
         recognizer = FakeRecognizer(self.folder, "error")
