@@ -1708,3 +1708,7 @@ OpenCode의 코딩 절차·도구·권한·문맥 압축 방식을 ALEX 파이�
 ## ADR-117 — 검사 통과 재사용에는 실제 실행과 현재 내용의 증거가 필요 (2026-10-23, Codex)
 
 stdout 합계와 discover 경로만으로 파일 통과를 추정하지 않는다. 별도 unittest 어댑터가 파일별 실행 ID·성공·skip을 기록한다. 부모·자식 수정 revision을 공유하고 검사 전후/현재 프로젝트 입력 SHA가 일치할 때만 캐시한다. 증거가 없거나 범위를 넘으면 독립 재검사한다. 독립 검사도 목표 파일의 성공을 확인하고 전체 회귀는 유지한다. 긴 외부 일꾼 요청은 Windows argv 대신 실제 CLI로 검증한 stdin을 사용한다. 새 기본 모델/일꾼을 선택하거나 사용자 설정을 바꾸는 결정은 아니다. 조사 발췌 보강도 한 주제 검증으로만 보고하고 범용 정확도를 주장하지 않는다.
+
+## ADR-118 — 밖으로 보내는 복사본의 키·인증 파일 목록을 하나로 (2026-10-26, Claude 클라우드)
+
+OpenCode 무료 모델 경로(코딩 세션 `_copy_for_free`, /dev-auto 일꾼 `OpenCodeWorker.run`)는 `.env`·`jarvis.local.json`·`.pem`/`.key` 만 빼고 보내 `id_rsa`·`credentials.json`·`secrets.*`·`.pfx`·`.netrc` 등이 opencode.ai 로 나갈 수 있었다. 클라우드 넘기기(ADR-102)가 이미 쓰던 이름 목록을 `opencode_worker.SECRET_NAMES`·`SECRET_SUFFIXES`·`secret_file()` 로 한 곳에 두고 세 경로가 함께 쓴다. 이름만 보는 거름이며 내용 속 비밀값 검사(클라우드 넘기기의 secret_patterns)는 무료 모델 경로에 아직 없다. 상세 [CLAUDE_CLOUD_20261026.md](docs/CLAUDE_CLOUD_20261026.md).
