@@ -19,7 +19,8 @@ SKIP = {".git", "__pycache__", "node_modules", "logs", "data", "runtime", "tools
 YES = re.compile(r"^\s*(응|네|예|ㅇㅇ|ㅇㅋ|오케이|ok|okay|yes|좋아|그래|진행|허락|해\s*줘|고고)\b", re.I)
 ALWAYS = re.compile(r"항상|계속\s*허락|전부\s*허락|다\s*허락|모두\s*허락")
 REVERT = re.compile(r"되돌려|원래대로|롤백")
-NO = re.compile(r"^\s*(아니|아뇨|노|no|거절|하지\s*마|취소|멈춰|중단)", re.I)
+# 짧은 '노·no' 는 낱말일 때만 — '노트에 …'·'no-op …' 같은 말을 거절로 읽지 않게(2026-10-26)
+NO = re.compile(r"^\s*(아니|아뇨|거절|하지\s*마|취소|멈춰|중단|(?:노+|no|nope)(?![\w-]))", re.I)
 
 
 def mentioned_files(text: str, root: Path, limit: int = 20000) -> list[str]:
