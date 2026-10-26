@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -31,6 +32,13 @@ from .providers import GenerationCancelled
 
 SKIP_PARTS = {"__pycache__", ".git", ".opencode", "node_modules", ".pytest_cache"}
 TEXT_SUFFIXES = {".py", ".md", ".txt", ".json", ".toml", ".cfg", ".ini", ".yml", ".yaml", ".js", ".html", ".css"}
+# 밖(opencode.ai·클라우드 에이전트)으로 보내는 복사본에서 이름만 보고 빼는 키·인증 파일 — cloudagent 도 이 목록을 쓴다.
+SECRET_NAMES = re.compile(r"(?i)^(\.env(\..*)?|id_rsa.*|id_ed25519.*|auth\.json|credentials.*|secrets?\..*|\.netrc|\.npmrc|\.pypirc)$")
+SECRET_SUFFIXES = {".pem", ".key", ".pfx", ".p12", ".keystore", ".jks"}
+
+
+def secret_file(name: str) -> bool:
+    return name == "jarvis.local.json" or Path(name).suffix.lower() in SECRET_SUFFIXES or SECRET_NAMES.match(name) is not None
 PERMISSION = {
     "edit": "allow",
     "webfetch": "deny",
@@ -184,8 +192,7 @@ class OpenCodeWorker:
             _copy_project(project, work)
             if self.free:  # opencode.ai 로 가는 복사본 — 개인 설정·비밀 파일은 빼고(비교 기준 전에 지워서 '삭제'로 잡히지 않게)
                 for path in list(work.rglob("*")):
-                    if path.is_file() and (path.name == "jarvis.local.json" or path.name.startswith(".env")
-                                           or path.suffix.lower() in (".pem", ".key")):
+                    if path.is_file() and secret_file(path.name):
                         path.unlink()
             before = _hashes(work)
             config = Path(tmp) / "opencode.json"

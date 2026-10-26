@@ -78,7 +78,9 @@ class FreeSessionTests(Fixture):
     def test_private_and_heavy_folders_are_not_copied_out(self):
         from jarvis.harness.sessions import _copy_for_free
         self.prepare()
-        for name in ('data/alex.db', 'logs/run.log', 'runtime/models/x.bin', '.env', 'jarvis.local.json', '.git/HEAD'):
+        for name in ('data/alex.db', 'logs/run.log', 'runtime/models/x.bin', '.env', 'jarvis.local.json', '.git/HEAD',
+                     # 2026-10-26: 키·인증 파일도 opencode.ai 로 보내지 않는다(cloudagent 와 같은 목록)
+                     'id_rsa', 'deploy/server.pem', 'credentials.json', 'config/secrets.toml', 'cert.pfx', '.netrc'):
             self.put(name, 'secret')
         target = Path(self.temp.name) / 'copy'
         _copy_for_free(self.root, target)

@@ -30,6 +30,7 @@ from typing import Callable, ContextManager
 
 from ..http_control import RequestControl
 from ..freemodels import is_free_model
+from ..opencode_worker import secret_file
 from ..providers import GenerationCancelled, GenerationTimeout, Message
 from . import commands as cmds
 from . import permission as perm
@@ -96,7 +97,7 @@ def _copy_for_free(source: Path, target: Path) -> None:
     """무료 모델 세션 복사본 — 독립 검사 복사본처럼 기록·데이터·실행 환경·도구·개인 설정(.env·jarvis.local.json)은 뺀다(opencode.ai
     로 보내지 않게). 300MB 가 넘으면 거절 — 더 좁은 폴더로 세션을 열게."""
     def ignore(directory, names):
-        return {n for n in names if n in FREE_SKIP or n.endswith(".pyc") or n.startswith(".env")
+        return {n for n in names if n in FREE_SKIP or n.endswith(".pyc") or secret_file(n)
                 or (Path(directory) / n).is_symlink()}
     total = 0
     for directory, dirs, files in os.walk(source):

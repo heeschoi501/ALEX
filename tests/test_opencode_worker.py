@@ -358,6 +358,8 @@ class FreeModelWorkerTests(unittest.TestCase):
             (project / "jarvis" / "a.py").write_text("a = 0\n", encoding="utf-8")
             (project / "jarvis.local.json").write_text('{"secret": 1}', encoding="utf-8")
             (project / ".env").write_text("TOKEN=x", encoding="utf-8")
+            (project / "id_rsa").write_text("KEY", encoding="utf-8")
+            (project / "credentials.json").write_text("{}", encoding="utf-8")
             script = root / "fake.py"
             script.write_text("import json, sys\nfrom pathlib import Path\n"
                               "Path('seen.json').write_text(json.dumps({'args': sys.argv[1:], "
@@ -375,6 +377,8 @@ class FreeModelWorkerTests(unittest.TestCase):
             self.assertEqual(seen["args"][:3], ["run", "--model", "opencode/big-pickle"])
             self.assertNotIn("jarvis.local.json", " ".join(seen["files"]))
             self.assertNotIn(".env", " ".join(seen["files"]))
+            self.assertNotIn("id_rsa", " ".join(seen["files"]))   # 2026-10-26: 키·인증 파일도 빼고 보낸다
+            self.assertNotIn("credentials.json", " ".join(seen["files"]))
             self.assertEqual(run.deleted, [])  # 빼고 보낸 개인 파일이 '삭제'로 돌아오지 않는다
             self.assertTrue((project / "jarvis.local.json").exists())
 
