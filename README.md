@@ -1,3 +1,5 @@
+> **2026-10-27 승인형 스킬·프로필(Codex)·교차 검토·자동 검사(CI):** `/growth review·approve` — 대화에서 배울 것을 제안하고 사람이 승인. 모든 push 에서 Linux·Windows 검사·웹 화면·비밀값 검사. [인수인계](docs/HANDOFF_20261027.md).
+
 > **2026-10-27 흡수·추적:** 흡수한 능력의 원본 변경 확인과 덩치 관리(`docs/upstreams.json`, `scripts/check_upstreams.py`). [종합 보고서 — 다른 AI 검토 요청](docs/GROWTH_ABSORPTION_REPORT_20261027.md).
 
 > **2026-10-27 Hermes Agent 참고(브랜치):** 배우지 말 것 규칙, 웹·자료 속 지시 경고, 프롬프트 캐시 순서(설정·기본 꺼짐), 코딩 교훈 보관, 지난 대화 본문 검색. [비교와 PC 측정](docs/HERMES_REFERENCE_20261027.md).
