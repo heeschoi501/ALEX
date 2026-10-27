@@ -1100,6 +1100,25 @@ class RegressionVerdictTests(TwoFileProject, unittest.TestCase):
         self.assertEqual((self.read('a.py'), self.read('b.py')), ('a = 0\n', 'b = 0\n'))
 
 
+class TestPathTests(unittest.TestCase):
+    def test_a_workspace_written_through_a_link_still_finds_its_tests(self):
+        # 2026-10-27 GitHub Windows 검사: 짧은 이름(C:\\Users\\RUNNER~1)으로 적힌 작업 폴더의 시험 파일을 '프로젝트에 없다' 고 거절했다.
+        # POSIX 에서는 심볼릭 링크로 같은 상황을 만든다(macOS 의 /var → /private/var 도 같다).
+        from jarvis import developer
+        with TemporaryDirectory() as temp:
+            real = Path(temp) / "real"
+            (real / "tests").mkdir(parents=True)
+            (real / "tests" / "test_x.py").write_text("", encoding="utf-8")
+            link = Path(temp) / "link"
+            try:
+                link.symlink_to(real, target_is_directory=True)
+            except OSError:
+                self.skipTest("이 환경에서는 심볼릭 링크를 만들 수 없다")
+            self.assertEqual(developer._test_path(link, "tests/test_x.py"), (real / "tests" / "test_x.py").resolve())
+            with self.assertRaisesRegex(ToolError, "없습니다"):
+                developer._test_path(link, "tests/test_missing.py")
+
+
 class SuiteReportTests(unittest.TestCase):
     def report(self, code, output):
         from jarvis.developer import _suite_report
@@ -1212,7 +1231,7 @@ class RegressionBoundaryTests(unittest.TestCase):
         def fingerprints(root, tests):
             nonlocal real_calls
             result = original(root, tests)
-            if root == case.root:
+            if Path(root).resolve() == case.root.resolve():   # 코드는 풀어 쓴 경로를 넘긴다(Windows 짧은 이름·링크)
                 real_calls += 1
                 if real_calls == 2:  # 덜어내기 뒤 최종 무결성 확인 시 취소
                     case.core.command_cancel_event.set()

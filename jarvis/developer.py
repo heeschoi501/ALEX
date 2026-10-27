@@ -370,7 +370,9 @@ def _test_path(workspace: Path, value: str) -> Path:
             or not _TEST_NAME.fullmatch(relative.name)):
         raise ToolError("테스트는 tests/test_*.py 파일 하나만 선택하세요.")
     resolved = (workspace / relative).resolve()
-    if workspace not in resolved.parents or not resolved.is_file():
+    # 작업 폴더도 같은 방식으로 풀어 비교한다 — Windows 짧은 이름(C:\Users\RUNNER~1)·심볼릭 링크(/var → /private/var)로 적힌
+    # 폴더는 풀면 글자가 달라져, 안에 있는 시험 파일을 '프로젝트에 없다' 고 거절했다(2026-10-27 GitHub Windows 검사).
+    if workspace.resolve() not in resolved.parents or not resolved.is_file():
         raise ToolError("선택한 테스트 파일이 현재 프로젝트에 없습니다.")
     return resolved
 
