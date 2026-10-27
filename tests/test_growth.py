@@ -1,6 +1,7 @@
 """Approval, provenance, native skill bundles and private profile boundaries."""
 import json
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -103,18 +104,25 @@ class StoreTests(unittest.TestCase):
         elsewhere = self.root / "elsewhere"
         elsewhere.mkdir()
         (elsewhere / "SKILL.md").write_text(SKILL, encoding="utf-8")
-        with self.assertRaises(GrowthError):
+        with self.assertRaisesRegex(GrowthError, "프로젝트 안의"):
             self.store.import_skill(OWNER, elsewhere / "SKILL.md", project)
         try:
             (project / "linked").symlink_to(elsewhere, target_is_directory=True)
         except OSError as exc:
             self.skipTest(f"symlinks unavailable: {exc}")
-        with self.assertRaises(GrowthError):
+        with self.assertRaisesRegex(GrowthError, "프로젝트 안의"):
             self.store.import_skill(OWNER, project / "linked/SKILL.md", project)
         (project / "linked").unlink()
+        (project / "real").mkdir()
+        (project / "real" / "SKILL.md").write_text(SKILL, encoding="utf-8")
+        (project / "linked").symlink_to(project / "real", target_is_directory=True)  # stays inside, still a link
+        with self.assertRaisesRegex(GrowthError, "링크"):
+            self.store.import_skill(OWNER, project / "linked/SKILL.md", project)
+        (project / "linked").unlink()
+        shutil.rmtree(project / "real")
         (project / "SKILL.md").write_text(SKILL, encoding="utf-8")
         (project / "credentials.json").write_text("{}", encoding="utf-8")
-        with self.assertRaises(GrowthError):
+        with self.assertRaisesRegex(GrowthError, "비밀 파일"):
             self.store.import_skill(OWNER, project / "SKILL.md", project)
         self.assertEqual(self.store.proposals(OWNER), [])
 

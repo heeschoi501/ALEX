@@ -351,18 +351,24 @@ class GrowthStore:
                 + selected.path.read_text(encoding="utf-8")[:budget])
 
     def import_skill(self, owner: str, source: Path, trusted_root: Path) -> dict | None:
-        source, trusted_root = Path(source), Path(trusted_root).resolve()
-        if source.name != "SKILL.md" or trusted_root not in source.resolve().parents:
+        # Containment is checked on resolved paths; the walk for links below the root uses the root as given,
+        # so a root reached through a link or a Windows short name (RUNNER~1) is not mistaken for an escape.
+        source, given = Path(source), Path(trusted_root)
+        if source.name != "SKILL.md" or given.resolve() not in source.resolve().parents:
             raise GrowthError("승인한 프로젝트 안의 SKILL.md를 지정하세요.")
+        try:
+            relative = source.relative_to(given)
+        except ValueError:
+            raise GrowthError("승인한 프로젝트 안의 SKILL.md를 지정하세요.") from None
         for path in [source, *source.parents]:
-            if path == trusted_root:
+            if path == given:
                 break
             if is_link(path):
                 raise GrowthError("링크로 연결된 외부 스킬은 가져오지 않습니다.")
         files = _files(source.parent)
         name, _description = parse_skill(files["SKILL.md"].decode("utf-8"))
         return self.propose(owner, "skill", "", name=name, bundle=files,
-                            evidence=[{"import": source.relative_to(trusted_root).as_posix()}])
+                            evidence=[{"import": relative.as_posix()}])
 
     def archive_skill(self, owner: str, name: str):
         with self.lock:
