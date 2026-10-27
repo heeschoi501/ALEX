@@ -58,7 +58,7 @@ class EnvironmentLineTests(unittest.TestCase):
             self.assertIn(piece, line, line)
 
     def test_project_root_is_present(self):
-        self.assertIn(str(self.root), self.core._environment_line())
+        self.assertIn(str(self.root.resolve()), self.core._environment_line())   # 풀어 쓴 경로(Windows 짧은 이름·링크)
 
     def test_local_only_is_stated(self):
         self.assertIn("로컬 전용", self.core._environment_line())

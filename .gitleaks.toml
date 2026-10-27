@@ -1,0 +1,21 @@
+# 비밀값 검사(.github/workflows/secrets.yml) 설정 — gitleaks 기본 규칙 + ALEX 가 일부러 둔 가짜 값만 허용.
+# 허용하는 것:
+#  - tests/ : 비밀값 거름·가림을 시험하려고 넣은 가짜 키(AKIA…·glpat-…·sk-…·개인 키 모양). 진짜 키를 시험에 넣지 않는다.
+#  - scripts/security_smoke.py : 같은 목적의 가짜 값.
+#  - '[REDACTED]' : jarvis/core.py 의 가림 결과 문자열(키가 아니라 가린 뒤의 모양).
+# 그 밖의 곳에서 걸리면 진짜로 본다 — 키를 지우는 것만으로는 부족하다(공개된 키는 새로 발급받는다).
+title = "ALEX gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "ALEX test fixtures and redaction placeholders"
+paths = [
+  '''^tests/''',
+  '''^scripts/security_smoke\.py$''',
+]
+regexTarget = "match"
+regexes = [
+  '''\[REDACTED\]''',
+]
