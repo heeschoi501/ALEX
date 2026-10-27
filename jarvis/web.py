@@ -635,12 +635,18 @@ class WebAppState:
                 return ""
             with self.ticket_running(ticket, "growth-review", lambda _chunk: None):
                 from .selfcheck import gpu_cool
-                from .growth import review
+                from .growth import GrowthError, review
                 if self.core.hardware.gpu and not gpu_cool():
                     return ""
-                reply = review(self.core, chosen[0])
+                before = len(self.core.growth_store.proposals(OWNER))
+                try:
+                    reply = review(self.core, chosen[0])
+                except GrowthError as exc:  # 형식이 틀린 답 — 같은 발언을 10분마다 다시 검토하지 않게 표시는 옮긴다
+                    self.core.logger.warning("growth review skipped: %s", exc)
+                    reply = ""
                 self.core.storage.set_state(f"growth.review.{chosen[0]}", str(chosen[1]))
-                self.core.storage.add_message(chosen[0], "assistant", reply)
+                if len(self.core.growth_store.proposals(OWNER)) > before:  # 승인할 것이 생겼을 때만 대화에 알린다
+                    self.core.storage.add_message(chosen[0], "assistant", reply)
                 return reply
         finally:
             with self.queue_cv:

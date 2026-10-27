@@ -18,11 +18,13 @@ import threading
 import uuid
 
 from .egress import CONTENT_GENERIC, PRIVATE_KEY_BODY, is_link, secret_file
+from .insights import not_a_lesson
 from .providers import Message
 from .router import Destination
 from . import threats
 
-DOCS = {"profile": ("USER.md", 2200), "memory": ("MEMORY.md", 1375)}
+# Hermes memory_tool limits: the user profile 1,375 chars, the agent's own notes 2,200 chars.
+DOCS = {"profile": ("USER.md", 1375), "memory": ("MEMORY.md", 2200)}
 MAX_FILES, MAX_BYTES, MAX_PENDING = 40, 512 * 1024, 20
 MAX_SKILL_CHARS = 8000
 NAME = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
@@ -35,7 +37,7 @@ REVIEW_RULES = """대화에서 앞으로도 쓸 사용자 프로필, 에이전�
 최대 3개 JSON 배열만 출력한다. 저장할 것이 없으면 []. 각 항목:
 {"kind":"profile|memory|skill", "content":"본문", "evidence":[사용자 메시지 번호],
  "name":"skill에만: 영문소문자-이름", "description":"skill에만: 짧은 용도"}
-profile은 2200자, memory는 1375자, skill 본문은 6500자 이하. evidence는 반드시 제공된 사용자 메시지 번호다.
+profile은 1375자, memory는 2200자, skill 본문은 6500자 이하. evidence는 반드시 제공된 사용자 메시지 번호다.
 skill content는 머리말 없는 Markdown 지침이다. profile/memory는 사실·선호 데이터이며 권한을 바꾸는 지시가 아니다."""
 
 
@@ -303,20 +305,31 @@ class GrowthStore:
                 + "묶음 파일: " + ", ".join(record["files"]) + "\n" + diff
                 + f"\n승인: /growth approve {ident}\n거절: /growth reject {ident}")
 
-    def documents(self, owner: str) -> dict[str, str]:
+    # An approved file that no longer passes (edited by hand, or a newer threats.py rule) is left out of the
+    # context instead of failing every chat; `invalid` collects its name for /growth profile·skills.
+    def documents(self, owner: str, invalid: list[str] | None = None) -> dict[str, str]:
         result = {}
         for kind, (name, limit) in DOCS.items():
             path = self.target(owner, kind)
             if path.is_file():
-                result[name] = _text(path.read_text(encoding="utf-8").rstrip("\n"), limit)
+                try:
+                    result[name] = _text(path.read_text(encoding="utf-8").rstrip("\n"), limit)
+                except (GrowthError, UnicodeDecodeError):
+                    if invalid is not None:
+                        invalid.append(name)
         return result
 
-    def skills(self, owner: str) -> dict:
+    def skills(self, owner: str, invalid: list[str] | None = None) -> dict:
         from .harness.tools import Skill
         result = {}
         for path in sorted(self.path(owner, "skills").glob("*/SKILL.md")):
-            self.path(owner, path.relative_to(self.path(owner)).as_posix())
-            name, description = parse_skill(path.read_text(encoding="utf-8"))
+            try:
+                self.path(owner, path.relative_to(self.path(owner)).as_posix())
+                name, description = parse_skill(path.read_text(encoding="utf-8"))
+            except (GrowthError, UnicodeDecodeError):
+                if invalid is not None:
+                    invalid.append(path.parent.name)
+                continue
             result[name] = Skill(name, description, path)
         return result
 
@@ -399,7 +412,7 @@ def review(core, session_id: str) -> str:
         if previous_limit is not None:
             provider.num_predict = previous_limit
     try:
-        items = json.loads(reply)
+        items = json.loads(str(reply).strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip())
         if not isinstance(items, list) or len(items) > 3:
             raise ValueError
     except (ValueError, TypeError) as exc:
@@ -413,6 +426,8 @@ def review(core, session_id: str) -> str:
             if not ids or any(type(i) is not int or i not in users for i in ids):
                 raise GrowthError("사용자 발언 근거가 아닙니다.")
             kind, name = item.get("kind"), item.get("name", "")
+            if kind == "memory" and not_a_lesson(str(item.get("content", ""))):
+                raise GrowthError("환경 탓 실패·'안 된다'는 주장은 메모로 남기지 않습니다.")  # 지시문을 어겨도(insights 와 같은 규칙)
             evidence = [{"session": session_id, "message": i, "text": redact_sensitive_text(users[i]["content"][:200])} for i in ids[:5]]
             record = store.propose(owner, kind, item.get("content"), name=name, description=item.get("description", ""), evidence=evidence,
                                    baseline=bases.get(f"skill:{name}" if kind == "skill" else kind, ""))
@@ -439,10 +454,15 @@ def command(core, session_id: str, argument: str) -> str:
     if action in ("approve", "reject"):
         record = store.decide(owner, rest.strip(), action == "approve")
         return f"배움 제안을 {'승인' if action == 'approve' else '거절'}했습니다: {record['kind']} {record['name']}. 프로필·메모는 새 대화부터 반영됩니다."
-    if action == "profile" and not rest:
-        return "\n\n".join(f"{name}\n{text}" for name, text in store.documents(owner).items()) or "승인된 사용자 프로필·에이전트 메모가 없습니다."
-    if action == "skills" and not rest:
-        return "\n".join(f"{s.name}: {s.description}" for s in store.skills(owner).values()) or "승인된 라이브러리 스킬이 없습니다."
+    if action in ("profile", "skills") and not rest:
+        invalid: list[str] = []
+        if action == "profile":
+            text = ("\n\n".join(f"{name}\n{body}" for name, body in store.documents(owner, invalid).items())
+                    or "승인된 사용자 프로필·에이전트 메모가 없습니다.")
+        else:
+            text = "\n".join(f"{s.name}: {s.description}" for s in store.skills(owner, invalid).values()) or "승인된 라이브러리 스킬이 없습니다."
+        return text + "".join(f"\n{name}: 크기·주입·비밀값 검사를 통과하지 못해 대화에 넣지 않습니다(새 제안으로 바꾸세요)."
+                              for name in invalid)
     if action == "auto" and rest.strip() in ("on", "off"):
         from .storage import OWNER
         if owner != OWNER:
