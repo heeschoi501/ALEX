@@ -53,7 +53,7 @@ jobs:
           node-version: "22"
       - name: Playwright + Chromium
         run: |
-          npm install --no-save --no-package-lock playwright@1.48.2
+          npm install --no-save --no-package-lock playwright@1.63.0
           npx playwright install --with-deps chromium
       - name: scripts/verify_web_ui.cjs
         run: node scripts/verify_web_ui.cjs python
