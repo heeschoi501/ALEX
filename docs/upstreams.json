@@ -1,0 +1,134 @@
+{
+  "about": "ALEX 가 흡수한 바깥 프로젝트·논문과 결론을 기다리는 실험(2026-10-27). scripts/check_upstreams.py 가 읽는다. status: core(뼈대 — 원본 변경을 따라간다) · experiment(설정으로 켜고 끔 — decide_by 까지 측정해 기본으로 만들고 옛 길을 지우거나, 이 기능을 지운다) · retired(지웠다 — git 기록과 ADR 에 남음). ref 는 마지막으로 원본과 맞춰 본 버전이다. 원본의 새 변경을 반영(또는 반영하지 않기로)한 뒤에 ref·commit·checked 를 사람이 고친다.",
+  "upstreams": [
+    {
+      "name": "opencode",
+      "kind": "git",
+      "repo": "https://github.com/anomalyco/opencode",
+      "ref": "v1.19.4",
+      "track": "tag:v1.",
+      "track_note": "기본 가지(dev)는 다음 판을 개발 중이라 파일 자리가 바뀌었다(packages/core/…, 2026-10-27). 배포판인 v1.x 꼬리표를 따라간다. 다음 큰 판이 배포되면 이 목록의 원본 파일 자리를 새로 맞춘다.",
+      "commit": "148842ef7cb1bc34192b3fff57d0f9721ab9c801",
+      "ported_from": "v1.18.34 (aec0b9a6d8898f68f923aaf08b7306d931fd9d76) — 하네스를 옮긴 판",
+      "license": "MIT — jarvis/harness/OPENCODE_LICENSE.txt",
+      "checked": "2026-10-27",
+      "history": [
+        {"date": "2026-10-27", "from": "v1.18.34", "to": "v1.19.4",
+         "changed": ["provider/provider.ts +6/−3", "cli/cmd/run.ts +4/−14"],
+         "decision": "반영할 것 없음 — provider.ts 는 설정한 모델의 reasoning_options 처리만 바뀌어 무료 모델 거름(입력 비용 0·지원 종료 제외)과 무관하다. run.ts 는 세션 공유를 없앤 것으로 ALEX 는 공유를 이미 끄고(share: disabled, OPENCODE_DISABLE_SHARE) --share 를 쓰지 않는다. 나머지 9곳은 원본이 그대로다."}
+      ],
+      "parts": [
+        {"id": "opencode-loop", "status": "core", "adr": "ADR-112",
+         "what": "한 차례 반복·하위 에이전트·되풀이 멈춤·단계 상한·문맥 줄이기",
+         "alex": ["jarvis/harness/agent.py"],
+         "upstream": ["packages/opencode/src/session/prompt.ts", "packages/opencode/src/session/processor.ts",
+                      "packages/opencode/src/session/compaction.ts", "packages/opencode/src/tool/task.ts"]},
+        {"id": "opencode-edit", "status": "core", "adr": "ADR-112", "what": "문자열 바꾸기(replace) 알고리즘",
+         "alex": ["jarvis/harness/edit.py"], "upstream": ["packages/opencode/src/tool/edit.ts"]},
+        {"id": "opencode-patch", "status": "core", "adr": "ADR-112", "what": "apply_patch 형식과 적용",
+         "alex": ["jarvis/harness/patch.py"],
+         "upstream": ["packages/opencode/src/patch/index.ts", "packages/opencode/src/tool/apply_patch.ts"]},
+        {"id": "opencode-tools", "status": "core", "adr": "ADR-112",
+         "what": "read·write·glob·grep·셸·todo·question·skill·webfetch·websearch 도구 동작",
+         "alex": ["jarvis/harness/tools.py"],
+         "upstream": ["packages/opencode/src/tool/read.ts", "packages/opencode/src/tool/write.ts",
+                      "packages/opencode/src/tool/glob.ts", "packages/opencode/src/tool/grep.ts",
+                      "packages/opencode/src/tool/shell.ts", "packages/opencode/src/tool/todo.ts",
+                      "packages/opencode/src/tool/question.ts", "packages/opencode/src/tool/skill.ts",
+                      "packages/opencode/src/tool/webfetch.ts", "packages/opencode/src/tool/websearch.ts",
+                      "packages/opencode/src/tool/truncate.ts"]},
+        {"id": "opencode-text", "status": "core", "adr": "ADR-112", "what": "도구 설명서·기본 지시문·계획 모드·탐색·요약 원문",
+         "alex": ["jarvis/harness/opencode_text.py"],
+         "upstream": ["packages/opencode/src/tool/read.txt", "packages/opencode/src/tool/edit.txt",
+                      "packages/opencode/src/tool/write.txt", "packages/opencode/src/tool/glob.txt",
+                      "packages/opencode/src/tool/grep.txt", "packages/opencode/src/tool/todowrite.txt",
+                      "packages/opencode/src/tool/task.txt", "packages/opencode/src/tool/question.txt",
+                      "packages/opencode/src/tool/skill.txt", "packages/opencode/src/tool/apply_patch.txt",
+                      "packages/opencode/src/tool/webfetch.txt", "packages/opencode/src/tool/websearch.txt",
+                      "packages/opencode/src/session/prompt/default.txt", "packages/opencode/src/session/prompt/plan.txt",
+                      "packages/opencode/src/session/prompt/build-switch.txt",
+                      "packages/opencode/src/agent/prompt/explore.txt", "packages/opencode/src/agent/prompt/compaction.txt"]},
+        {"id": "opencode-permission", "status": "core", "adr": "ADR-112", "what": "권한 규칙(마지막에 맞는 규칙이 이긴다)",
+         "alex": ["jarvis/harness/permission.py"],
+         "upstream": ["packages/opencode/src/permission/evaluate.ts", "packages/opencode/src/permission/index.ts",
+                      "packages/opencode/src/agent/agent.ts"]},
+        {"id": "opencode-commands", "status": "core", "adr": "ADR-112", "what": ".opencode/commands 의 명령 파일",
+         "alex": ["jarvis/harness/commands.py"],
+         "upstream": ["packages/opencode/src/command/index.ts", "packages/opencode/src/config/command.ts"]},
+        {"id": "opencode-diagnostics", "status": "core", "adr": "ADR-112", "what": "고친 직후 오류 알리기 형식",
+         "alex": ["jarvis/harness/diagnostics.py"], "upstream": ["packages/opencode/src/lsp/diagnostic.ts"]},
+        {"id": "opencode-prompt", "status": "core", "adr": "ADR-112", "what": "지시문·프로젝트 규칙 파일 붙이기",
+         "alex": ["jarvis/harness/prompt.py"],
+         "upstream": ["packages/opencode/src/session/system.ts", "packages/opencode/src/session/instruction.ts"]},
+        {"id": "opencode-free-models", "status": "core", "adr": "ADR-113", "what": "무료 모델 목록 거름(입력 비용 0·지원 종료 제외)",
+         "alex": ["jarvis/freemodels.py"], "upstream": ["packages/opencode/src/provider/provider.ts"]},
+        {"id": "opencode-worker", "status": "core", "adr": "ADR-083",
+         "what": "opencode run 을 일꾼으로 부르기(명령줄·JSON 사건 형식에 기댄다)",
+         "alex": ["jarvis/opencode_worker.py"], "upstream": ["packages/opencode/src/cli/cmd/run.ts"]}
+      ]
+    },
+    {
+      "name": "hermes-agent",
+      "kind": "git",
+      "repo": "https://github.com/NousResearch/hermes-agent",
+      "ref": "085f562af53a6fedadac3681e2c498fc71316132",
+      "commit": "085f562af53a6fedadac3681e2c498fc71316132",
+      "license": "MIT — jarvis/HERMES_LICENSE.txt",
+      "checked": "2026-10-27",
+      "parts": [
+        {"id": "hermes-threat-patterns", "status": "core", "adr": "ADR-120", "what": "프롬프트 주입·유출 패턴(+ ALEX 한국어 패턴)",
+         "alex": ["jarvis/threats.py"], "upstream": ["tools/threat_patterns.py"]},
+        {"id": "hermes-do-not-capture", "status": "core", "adr": "ADR-120", "what": "배우지 말 것(환경 실패·부정 주장·못 푼 시도)",
+         "alex": ["jarvis/insights.py"], "upstream": ["agent/background_review.py"]},
+        {"id": "hermes-curator-archive", "status": "core", "adr": "ADR-120", "what": "지우지 않고 보관",
+         "alex": ["jarvis/insights.py"], "upstream": ["agent/curator.py"]},
+        {"id": "hermes-session-search", "status": "core", "adr": "", "what": "지난 대화 본문 찾기(ALEX 는 색인 없이)",
+         "alex": ["jarvis/storage.py"], "upstream": ["tools/session_search_tool.py"]},
+        {"id": "hermes-frozen-prompt", "status": "experiment", "setting": "stable_prompt_prefix", "adr": "ADR-119",
+         "what": "바뀌지 않는 앞부분 + 차례별 내용은 질문 앞(프롬프트 캐시)",
+         "alex": ["jarvis/core.py"], "upstream": ["tools/memory_tool.py", "agent/prompt_builder.py"]}
+      ]
+    },
+    {
+      "name": "expel",
+      "kind": "paper",
+      "url": "https://arxiv.org/abs/2308.10144",
+      "parts": [
+        {"id": "expel-insights", "status": "experiment", "setting": "coding_insights_enabled", "adr": "ADR-070",
+         "what": "작업 기록에서 절차 교훈 뽑기(ADD·EDIT·UPVOTE·DOWNVOTE)", "alex": ["jarvis/insights.py"]}
+      ]
+    },
+    {
+      "name": "aider-repo-map",
+      "kind": "idea",
+      "url": "https://github.com/Aider-AI/aider",
+      "parts": [
+        {"id": "aider-api-map", "status": "experiment", "setting": "coding_api_map_enabled", "adr": "ADR-072",
+         "what": "고칠 파일이 쓰는 객체의 API 시그니처만 붙이기(repo map 을 좁힌 것)", "alex": ["jarvis/apimap.py"]}
+      ]
+    }
+  ],
+  "experiments": [
+    {"setting": "stable_prompt_prefix", "adr": "ADR-119", "decide_by": "2026-11-30",
+     "measure": "python -X utf8 scripts/measure_prompt_cache.py --live — 첫 글자 시간·답 비교"},
+    {"setting": "coding_insights_enabled", "adr": "ADR-070", "decide_by": "2026-11-30",
+     "measure": "scripts/run_pc_benchmarks.py --only devauto 를 켜고/끄고(coding_agent_eval.py --insights)"},
+    {"setting": "coding_auto_learn_enabled", "adr": "ADR-113", "decide_by": "2026-11-30",
+     "measure": "coding_insights_enabled 결정에 따른다(교훈을 안 쓰면 자동으로 뽑을 까닭도 없다)"},
+    {"setting": "fact_reminder_enabled", "adr": "ADR-071", "decide_by": "2026-11-30",
+     "measure": "오답 바로잡기 replay(scripts/desktop_screen.sh … screen) 를 켜고/끄고"},
+    {"setting": "coding_api_map_enabled", "adr": "ADR-072", "decide_by": "2026-11-30",
+     "measure": "coding_agent_eval.py --api-map 켜고/끄고"},
+    {"setting": "coding_regression_check", "adr": "ADR-078", "decide_by": "2026-11-30",
+     "measure": "coding_agent_eval.py --regression-check 켜고/끄고 — 새 회귀 수·시간"},
+    {"setting": "coding_diagnostic_context", "adr": "ADR-080", "decide_by": "2026-11-30",
+     "measure": "coding_agent_eval.py --diagnostics 켜고/끄고"}
+  ],
+  "duplicate_paths": [
+    {"job": "코드 고치기(/dev-auto·/build 일꾼)",
+     "paths": ["예전 모델 수정안(coding_worker=alex)", "OpenCode 일꾼(coding_worker=opencode)", "ALEX 하네스(coding_worker=harness)",
+               "클라우드 넘기기(/cloud — 사람이 고를 때만)"],
+     "decide_by": "2026-11-30",
+     "measure": "같은 v4 과제로 coding_worker 별 run_pc_benchmarks.py --only devauto — 진 일꾼은 내보낸다. 클라우드 넘기기는 성격이 달라 유지 후보"}
+  ]
+}
