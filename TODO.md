@@ -7,7 +7,8 @@
 1. 2026-10-26 클라우드 작업 확인 — 순서는 [CLAUDE_CLOUD_20261026.md](docs/CLAUDE_CLOUD_20261026.md#pc-에서-확인할-것-순서대로).
 2. 성능 평가 — `python -X utf8 scripts/run_pc_benchmarks.py` (자동 수정 v4 11과제·LiveCodeBench hard·GPQA). 결과 폴더를 넘기면 10-10·10-22 기록과 비교.
 3. 같은 조건 여러 회차 비교 — 소스·문맥·출력 상한을 고정하고 기존 OpenCode 경로와 ALEX 하네스를 여러 번 잰다([HANDOFF_20261022](docs/HANDOFF_20261022.md) 다음 순서 2). 한 번 잰 값으로 우열을 일반화하지 않는다.
-4. 딥서치 실제 주제 1건 — 출처 충실도·빠진 질문·걸린 시간 확인 후 개선([CODEX_DEEPSEARCH_20261023](docs/CODEX_DEEPSEARCH_20261023.md)).
+4. 프롬프트 순서(ADR-119) 측정 — `python -X utf8 scripts/measure_prompt_cache.py --live`. 빨라지고 답이 그대로면 `stable_prompt_prefix` 를 켠다([HERMES_REFERENCE_20261027](docs/HERMES_REFERENCE_20261027.md)).
+5. 딥서치 실제 주제 1건 — 출처 충실도·빠진 질문·걸린 시간 확인 후 개선([CODEX_DEEPSEARCH_20261023](docs/CODEX_DEEPSEARCH_20261023.md)).
 
 ## 클라우드(모델 없이)에서도 할 수 있는 것
 

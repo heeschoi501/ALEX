@@ -1712,3 +1712,12 @@ stdout 합계와 discover 경로만으로 파일 통과를 추정하지 않는�
 ## ADR-118 — 밖으로 보내는 복사본의 키·인증 파일 목록을 하나로 (2026-10-26, Claude 클라우드)
 
 OpenCode 무료 모델 경로(코딩 세션 `_copy_for_free`, /dev-auto 일꾼 `OpenCodeWorker.run`)는 `.env`·`jarvis.local.json`·`.pem`/`.key` 만 빼고 보내 `id_rsa`·`credentials.json`·`secrets.*`·`.pfx`·`.netrc` 등이 opencode.ai 로 나갈 수 있었다. 클라우드 넘기기(ADR-102)가 이미 쓰던 이름 목록을 `opencode_worker.SECRET_NAMES`·`SECRET_SUFFIXES`·`secret_file()` 로 한 곳에 두고 세 경로가 함께 쓴다. 이름만 보는 거름이며 내용 속 비밀값 검사(클라우드 넘기기의 secret_patterns)는 무료 모델 경로에 아직 없다. 상세 [CLAUDE_CLOUD_20261026.md](docs/CLAUDE_CLOUD_20261026.md).
+
+## ADR-119 — 프롬프트 캐시를 살리는 순서(설정, 기본 꺼짐) (2026-10-27, Claude 클라우드)
+
+대화 요청의 맨 앞 지시에 분 단위 시각이 있고, 그 뒤에 질문마다 다시 고르는 메모·교훈·자기 기능·자료가 와서 차례마다 요청이 거의 처음부터 달라졌다. 로컬 모델 서버는 앞 요청과 같은 앞부분만 다시 읽지 않으므로 매 차례 대화 전체를 다시 읽었다(이 PC 27b 입력 처리 초당 약 900~1,100토큰). `stable_prompt_prefix` 를 켜면 지시·요약·프로젝트 지침·대화 기록을 앞에 두고, 시각·메모·교훈·자기 기능·자료는 마지막 질문 바로 앞(시각이 맨 끝)에 둔다. 문맥이 넘쳐도 이 부분은 그 자리를 지키며 기존 system 예산을 나눠 쓴다. 꺼져 있으면 순서와 자르기는 예전과 같다. 답의 질이 달라질 수 있어 PC 측정(`scripts/measure_prompt_cache.py --live`) 뒤 사용자가 켠다. Hermes Agent 의 고정 시스템 프롬프트를 참고했다. 상세 [HERMES_REFERENCE_20261027.md](docs/HERMES_REFERENCE_20261027.md).
+
+## ADR-120 — 배우지 말 것·남의 글 속 지시·교훈 보관 (2026-10-27, Claude 클라우드)
+
+Hermes Agent(MIT)를 참고했다. ① `/dev-learn` 은 환경 탓 실패·'도구가 안 된다' 는 부정 주장·못 푼 시도·일시 오류를 교훈으로 쓰지 않는다 — 지시문에 적고, 어겨도 코드가 거른다(ALEX 의 '인터넷이 막혀 있다' 오답과 같은 꼴). ② `jarvis/threats.py`(Hermes 패턴 + 한국어)로 웹 페이지·검색 요약·저장 자료 조각에 지시 모양이 보이면 경고 줄을 붙이고 보이지 않는 글자를 뺀다. 교훈은 '따를 방식' 으로 붙으므로 지시 모양이 있으면 아예 뺀다. ③ 점수 0·사람이 뺀 코딩 교훈은 지우지 않고 보관함에 두며 되살릴 수 있다. 모델이 스스로 장기 메모를 쓰는 기능은 들이지 않는다(사람 승인 원칙). 상세 [HERMES_REFERENCE_20261027.md](docs/HERMES_REFERENCE_20261027.md).
+
