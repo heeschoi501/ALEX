@@ -24,6 +24,22 @@ class OperationTests(unittest.TestCase):
         self.assertEqual([(i.id, i.count) for i in items], [(1, 3)])  # 2는 3→0 으로 지워졌다, 없는 9는 무시
         self.assertIn("run2", items[0].sources)
 
+    def test_environment_failures_and_negative_tool_claims_are_not_learned(self):
+        # 2026-10-26(Hermes Agent 의 'Do NOT capture'): 환경 탓 실패·'도구가 안 된다' 는 교훈이 되면 고쳐진 뒤에도 스스로를 막는다.
+        from jarvis.insights import apply_operations_detailed
+        items, applied, skipped = apply_operations_detailed([], "\n".join([
+            "ADD: pytest 가 설치되지 않았으니 unittest 만 쓴다",
+            "ADD: ModuleNotFoundError: No module named pygame 이면 그 과제를 건너뛴다",
+            "ADD: 하네스의 bash 도구는 작동하지 않으니 시험을 돌리지 않는다",
+            "ADD: The grep tool does not work on Windows, read whole files instead",
+            "ADD: 트레이스백의 마지막 프레임부터 읽고 그 함수의 호출자를 grep 으로 찾는다",
+        ]), "run1")
+        self.assertEqual([i.text for i in items], ["트레이스백의 마지막 프레임부터 읽고 그 함수의 호출자를 grep 으로 찾는다"])
+        self.assertEqual((applied, skipped), (["ADD 1"], ["environment", "environment", "negative_claim", "negative_claim"]))
+        items, applied, skipped = apply_operations_detailed(items, "EDIT 1: 인터넷이 막혀 있으니 웹 문서를 찾지 않는다", "run2")
+        self.assertEqual((items[0].text, applied, skipped),
+                         ("트레이스백의 마지막 프레임부터 읽고 그 함수의 호출자를 grep 으로 찾는다", [], ["negative_claim"]))
+
     def test_the_list_is_capped_and_duplicates_are_skipped(self):
         text = "\n".join(f"ADD: 교훈 {n}" for n in range(20)) + "\nADD: 교훈 0"
         items, _ = apply_operations([], text, "run")
