@@ -655,6 +655,7 @@ def build_core(
         coding_insights=settings.coding_insights_enabled,
         coding_auto_learn=settings.coding_auto_learn_enabled,
         fact_reminder=settings.fact_reminder_enabled,
+        stable_prompt_prefix=settings.stable_prompt_prefix,
         coding_api_map=settings.coding_api_map_enabled,
         coding_num_ctx=settings.coding_num_ctx,
         coding_num_gpu=settings.coding_num_gpu_layers,
