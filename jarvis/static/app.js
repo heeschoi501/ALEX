@@ -591,18 +591,24 @@ async function newChat(projectId = '') {
   saveComposer();
   const before = $('input').value;
   const version = ++navigationVersion;
+  // '새 대화'를 누른 뒤 열릴 때까지 친 글은 새 대화의 것이다 — 전에는 옛 대화의 초안으로 저장되고 새 입력창은
+  // 비었다(2026-10-26 브라우저 검사). 새 대화를 불러오는 동안 친 글도 새 대화의 빈 초안이 덮었다(2026-10-27).
+  // 옛 대화 초안은 누를 때의 글 그대로 둔다. 초안 되살리기는 input 사건을 내지 않으므로 사람이 친 것만 잡힌다.
+  let typed = null;
+  const keep = () => { typed = $('input').value; };
+  $('input').addEventListener('input', keep);
   navigating = true; updateControls();
   try {
     const r = await api('/api/session/new', projectId ? {project_id: projectId} : {});
     if (version !== navigationVersion) return null;
-    // '새 대화'를 누른 뒤 만들어지는 동안 친 글은 새 대화의 것이다 — 전에는 옛 대화의 초안으로 저장되고 새 입력창은
-    // 비었다(2026-10-26 브라우저 검사). 옛 대화 초안은 누를 때의 글 그대로 둔다.
-    const typed = $('input').value !== before ? $('input').value : null;
     if (typed !== null) $('input').value = before;
     await openSession(r.session_id);
     if (typed !== null && state?.session_id === r.session_id) { $('input').value = typed; fitInput(); }
     return r.session_id;
-  } finally { if (version === navigationVersion) { navigating = false; updateControls(); } }
+  } finally {
+    $('input').removeEventListener('input', keep);
+    if (version === navigationVersion) { navigating = false; updateControls(); }
+  }
 }
 // 대화 목록의 [×] (2026-09-26 사용자: "대화목록 제거 기능도 필요할거 같은데"). /delete-session 명령을 치지 않아도
 // 되게 하고, 확인 창 없이는 보내지 않는다. 보던 대화를 지우면 서버가 새 대화를 만들어 그 ID 를 돌려준다.
