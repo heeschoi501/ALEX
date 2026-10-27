@@ -236,8 +236,10 @@ class GrowthStore:
             for record in records:
                 if record["status"] == "pending" and record["kind"] == kind and record.get("name") == name and record["digest"] == digest:
                     return record
-            if sum(r["status"] == "pending" for r in records) >= MAX_PENDING or len(records) >= 200:
-                raise GrowthError("배움 제안 보관 한도입니다. 먼저 대기 제안을 검토하고 기록을 정리하세요.")
+            # Only undecided proposals are capped (so review never piles up). Decided records are the
+            # history of what ALEX learned and why; they are kept, never trimmed (owner, 2026-10-27).
+            if sum(r["status"] == "pending" for r in records) >= MAX_PENDING:
+                raise GrowthError("대기 중인 배움 제안이 20개입니다. 먼저 /growth pending 을 검토해 승인·거절하세요.")
             ident = uuid.uuid4().hex[:24]
             for relative, data in bundle.items():
                 self._write(self.path(owner, f"proposals/{ident}/files/{relative}"), data)

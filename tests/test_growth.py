@@ -131,6 +131,18 @@ class StoreTests(unittest.TestCase):
             self.store.propose(OWNER, "profile", "가" * 1376)
         self.assertIsNotNone(self.store.propose(OWNER, "memory", "가" * 2200))
 
+    def test_decided_records_are_kept_and_do_not_stop_new_proposals(self):
+        for n in range(250):  # more than the old 200-record limit, written directly to stay fast
+            ident = f"{n:024x}"
+            self.store._save(OWNER, {"id": ident, "owner": OWNER, "kind": "memory", "name": "", "status": "rejected",
+                                     "base": "", "digest": ident, "files": ["MEMORY.md"], "evidence": [], "created": "2026-10-27T00:00:00+00:00"})
+        self.assertIsNotNone(self.store.propose(OWNER, "memory", "새로 확인된 메모"))
+        self.assertEqual(len(self.store.proposals(OWNER)), 251)
+        for n in range(19):
+            self.store.propose(OWNER, "memory", f"대기 메모 {n}")
+        with self.assertRaisesRegex(GrowthError, "대기 중인 배움 제안이 20개"):
+            self.store.propose(OWNER, "memory", "하나 더")
+
     def test_growth_store_in_a_custom_data_folder_is_excluded_from_outgoing_copies(self):
         from jarvis.egress import copy_for_free
         from jarvis.cloudagent import copy_project

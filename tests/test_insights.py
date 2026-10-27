@@ -54,6 +54,17 @@ class OperationTests(unittest.TestCase):
             self.assertEqual((len(store.load()), store.archived()), (1, []))
             self.assertIsNone(store.restore(1))
 
+    def test_the_archive_keeps_every_retired_lesson(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = InsightStore(Path(temp) / "coding-insights.json")
+            old = [{"id": n, "text": f"교훈 {n}", "count": 0, "archived_at": "2026-10-27", "reason": "점수 0"} for n in range(101, 351)]
+            items, _ = apply_operations([], "ADD: 실패 출력의 마지막 assert 부터 본다", "r1")
+            store.save(items, archive=old)
+            store.save([], reason="사람이 지움")
+            archived = store.archived()
+            self.assertEqual(len(archived), 251)  # once capped at 200, dropping the oldest
+            self.assertEqual((archived[0]["text"], archived[-1]["reason"]), ("교훈 101", "사람이 지움"))
+
     def test_learning_that_only_rejected_non_lessons_is_not_retried(self):
         from jarvis.insights import learning_consumed
         self.assertTrue(learning_consumed([], ["environment", "negative_claim"]))

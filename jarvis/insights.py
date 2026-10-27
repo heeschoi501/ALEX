@@ -20,7 +20,6 @@ import shutil
 INSIGHTS_FILE = "coding-insights.json"
 MAX_INSIGHTS = 12
 MAX_INSIGHT_CHARS = 220
-ARCHIVE_LIMIT = 200
 PROMPT_BUDGET = 1600
 _OPERATION = re.compile(r"^\s*(ADD|EDIT|UPVOTE|DOWNVOTE)\b\s*(\d+)?\s*[:：]?\s*(.*)$", re.I)  # \b: ADDITION 은 연산이 아니다
 
@@ -109,8 +108,9 @@ class InsightStore:
             shutil.copy2(self.path, self.path.with_name(f"{self.path.name}.damaged-{stamp}"))
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix(".tmp")
+        # 보관함은 자르지 않는다 — Hermes curator 의 "지우지 않고 보관만" 과 같게(전에는 200개를 넘으면 오래된 것부터 버렸다).
         temporary.write_text(json.dumps({"insights": [asdict(i) for i in insights], "learned": keys[-500:],
-                                         "archived": archive[-ARCHIVE_LIMIT:]}, ensure_ascii=False, indent=1), encoding="utf-8")
+                                         "archived": archive}, ensure_ascii=False, indent=1), encoding="utf-8")
         temporary.replace(self.path)
 
     def remove(self, insight_id: int) -> bool:

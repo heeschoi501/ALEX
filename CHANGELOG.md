@@ -2,6 +2,7 @@
 
 - `/growth review·pending·show·approve·reject·profile·skills·import·archive·restore·auto` — 대화에서 스킬·USER.md·MEMORY.md 변경안을 만들고 사람이 승인해야 반영(Codex, ADR-122). 자동 검토는 기본 꺼짐.
 - 교차 검토로 고침: 크기 상한(USER 1,375·MEMORY 2,200), 검사를 통과 못 하는 승인 파일이 대화를 멈추던 것, ```json 으로 감싼 답 거절, 형식 오류 시 같은 대화를 10분마다 다시 검토, '제안 0개' 알림이 대화에 쌓이던 것.
+- 기억을 지우던 200개 한도 두 곳을 없앰(Hermes 에서 온 숫자가 아님): 배움 제안 기록(넘으면 새 제안이 영영 막혔다 — 대기 중인 제안 20개만 제한)과 코딩 교훈 보관함(넘으면 오래된 것부터 버렸다).
 - 웹 화면: 새 대화를 불러오는 동안 친 글이 가끔 사라지던 것 수정(검사가 그 구간을 매번 재현).
 - GitHub Actions: 모든 push·PR 에서 `verify_release`(Ubuntu 3.10·3.11·3.13, Windows 3.11)·웹 화면(Chromium)·비밀값(gitleaks). Windows 짧은 경로에서 시험 파일 쓰기를 거부하던 버그 수정.
 - 흡수 목록: Hermes 기준 085f562 → 69f73ec(흡수한 8곳 그대로). OpenCode v2 배포 사실을 바로잡고 이동 시점은 보류.
