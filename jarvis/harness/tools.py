@@ -2,7 +2,7 @@
 skill·webfetch·websearch 와 같은 입력·출력 모양(MIT, OPENCODE_LICENSE.txt). 모델이 OpenCode 에서 받던 것과 같은 결과를 받아야
 같은 능력이 나온다. (task·question 은 반복(agent.py)이 직접 다룬다 — 하위 에이전트를 띄우고, 사람에게 묻고 멈춘다.)
 
-ALEX 가 지키는 것: 작업 폴더(root) 밖은 읽지도 쓰지도 않는다(잘라 둔 도구 출력 폴더만 읽기 예외). 이미 있는 파일은 읽은 뒤에만
+ALEX 가 지키는 것: 작업 폴더(root) 밖은 읽지도 쓰지도 않는다(도구 출력·승인 스킬 묶음만 읽기 예외). 이미 있는 파일은 읽은 뒤에만
 쓰고 고친다. 모든 도구는 권한 규칙(permission.py — 마지막으로 맞는 규칙, allow·ask·deny)을 거친다. 셸 명령은 셸 없이
 (파이프·리다이렉션 거절) 실행한다. 바꾸기 전 내용을 차례마다 남겨 되돌릴 수 있다(snapshot). 실패는 'Error: …' 글로 돌려준다.
 """
@@ -56,6 +56,7 @@ class Skill:
     name: str
     description: str
     path: Path
+    read_root: Path | None = None  # Only approval-backed bundles grant reads outside the project.
 
 
 def find_skills(*folders: Path) -> dict[str, Skill]:
@@ -136,7 +137,7 @@ class Workspace:
         return kid
 
     # ── 경로
-    def resolve(self, raw: Any, *, allow_output: bool = False) -> Path:
+    def resolve(self, raw: Any, *, allow_output: bool = False, allow_skills: bool = False) -> Path:
         if not isinstance(raw, str) or not raw.strip():
             raise ToolError("filePath is required")
         candidate = Path(raw.strip())
@@ -145,6 +146,12 @@ class Workspace:
         if allow_output and self.output_dir is not None:
             out = Path(self.output_dir).resolve()
             inside = inside or path == out or out in path.parents
+        if allow_skills and not inside:
+            for skill in self.skills.values():
+                root = skill.read_root
+                if root is not None and root.resolve() == root and (path == root or root in path.parents):
+                    inside = True
+                    break
         if not inside:
             raise ToolError(f"Path is outside the workspace ({self.root}): {raw}")
         return path
@@ -246,7 +253,7 @@ class Workspace:
 
     # ── 읽기·쓰기·고치기
     def read(self, args: dict) -> str:
-        path = self.resolve(args.get("filePath"), allow_output=True)
+        path = self.resolve(args.get("filePath"), allow_output=True, allow_skills=True)
         if not path.exists():
             near = sorted(p.name for p in path.parent.glob("*") if p.name.lower().startswith(path.stem[:3].lower()))[:5] \
                 if path.parent.is_dir() else []

@@ -324,8 +324,14 @@ class CodeSessions:
                 text = cmds.SHELL.sub(lambda m: session.workspace.run("bash", {"command": m.group(1)}), text)
             if session.model:  # OpenCode 무료 모델 — 이 PC 모델 차례(model_turn)를 쓰지 않는다
                 return self._free_turn(session, text, mode, say, delta)
+            from .tools import find_skills, SKILL_DIRS
+            skills = find_skills(*(session.root / d for d in SKILL_DIRS))
+            if self.library_skills is not None:
+                skills = {**self.library_skills(session.owner), **skills}
+            session.workspace.skills = skills
             agent = session.agent
             if agent is not None:
+                agent.update_skills(skills)
                 agent.deadline = session.deadline
             if subtask:
                 if agent is None:

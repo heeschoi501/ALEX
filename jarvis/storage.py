@@ -494,19 +494,22 @@ class Storage:
         except sqlite3.DatabaseError as exc:
             raise StorageError(self._db_help(exc)) from exc
 
-    def message_page(self, session_id: str, before: int | None = None, limit: int = 100) -> dict:
-        """Bounded keyset pagination; IDs avoid duplicates when messages arrive."""
+    def message_page(self, session_id: str, before: int | None = None, limit: int = 100, *, after: int | None = None) -> dict:
+        """Bounded keyset pagination; after reads oldest unseen rows first."""
         limit = max(1, min(200, limit))
+        order = "ASC" if after is not None else "DESC"
         try:
             with self._connection() as conn:
                 rows = conn.execute(
                     "SELECT id, role, content, created_at FROM messages WHERE session_id=? "
-                    "AND id < ? ORDER BY id DESC LIMIT ?",
-                    (session_id, before if before is not None else 9223372036854775807, limit + 1),
+                    f"AND id < ? AND id > ? ORDER BY id {order} LIMIT ?",
+                    (session_id, before if before is not None else 9223372036854775807,
+                     after if after is not None else 0, limit + 1),
                 ).fetchall()
         except sqlite3.DatabaseError as exc:
             raise StorageError(self._db_help(exc)) from exc
-        return {"messages": [dict(row) for row in reversed(rows[:limit])], "has_more": len(rows) > limit}
+        page = rows[:limit] if after is not None else reversed(rows[:limit])
+        return {"messages": [dict(row) for row in page], "has_more": len(rows) > limit}
 
     def get_messages(self, session_id: str, limit: int = 12) -> list[StoredMessage]:
         if limit < 1:

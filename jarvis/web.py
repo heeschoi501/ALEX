@@ -618,11 +618,14 @@ class WebAppState:
             return ""
         chosen = None
         for session in self.core.storage.list_sessions(limit=10, owner=OWNER):
-            rows = self.core.storage.message_page(session.session_id, limit=20)["messages"]
             previous = int(self.core.storage.get_state(f"growth.review.{session.session_id}") or "0")
-            fresh = [m["id"] for m in rows if m["role"] == "user" and m["id"] > previous and not m["content"].startswith("/")]
-            if len(fresh) >= 3:
-                chosen = session.session_id, max(fresh)
+            page = self.core.storage.message_page(session.session_id, after=previous, limit=20)
+            rows = page["messages"]
+            fresh = [m for m in rows if m["role"] == "user" and not m["content"].startswith("/")]
+            continuing = self.core.storage.get_state(f"growth.review.backlog.{session.session_id}") == "1"
+            # Drain a long backlog in bounded batches, including command-only pages.
+            if rows and (len(fresh) >= 3 or page["has_more"] or continuing):
+                chosen = session.session_id, rows, page["has_more"]
                 break
         if chosen is None:
             return ""
@@ -640,11 +643,12 @@ class WebAppState:
                     return ""
                 before = len(self.core.growth_store.proposals(OWNER))
                 try:
-                    reply = review(self.core, chosen[0])
+                    reply = review(self.core, chosen[0], rows=chosen[1])
                 except GrowthError as exc:  # 형식이 틀린 답 — 같은 발언을 10분마다 다시 검토하지 않게 표시는 옮긴다
                     self.core.logger.warning("growth review skipped: %s", exc)
                     reply = ""
-                self.core.storage.set_state(f"growth.review.{chosen[0]}", str(chosen[1]))
+                self.core.storage.set_state(f"growth.review.{chosen[0]}", str(chosen[1][-1]["id"]))
+                self.core.storage.set_state(f"growth.review.backlog.{chosen[0]}", "1" if chosen[2] else "0")
                 if len(self.core.growth_store.proposals(OWNER)) > before:  # 승인할 것이 생겼을 때만 대화에 알린다
                     self.core.storage.add_message(chosen[0], "assistant", reply)
                 return reply

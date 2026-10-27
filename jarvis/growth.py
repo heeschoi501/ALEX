@@ -226,7 +226,8 @@ class GrowthStore:
                     plain = data.decode("utf-8")
                 except UnicodeDecodeError:
                     continue  # binary assets are copied, never executed or scanned as text
-                _text(plain, MAX_BYTES)
+                if plain.strip():
+                    _text(plain, MAX_BYTES)
             target = self.target(owner, kind, name)
             current = _digest(_files(target))
             digest = _digest(bundle)
@@ -312,27 +313,33 @@ class GrowthStore:
     def documents(self, owner: str, invalid: list[str] | None = None) -> dict[str, str]:
         result = {}
         for kind, (name, limit) in DOCS.items():
-            path = self.target(owner, kind)
-            if path.is_file():
-                try:
+            try:
+                path = self.target(owner, kind)
+                if path.is_file():
                     result[name] = _text(path.read_text(encoding="utf-8").rstrip("\n"), limit)
-                except (GrowthError, UnicodeDecodeError):
-                    if invalid is not None:
-                        invalid.append(name)
+            except (GrowthError, UnicodeDecodeError, OSError):
+                if invalid is not None:
+                    invalid.append(name)
         return result
 
     def skills(self, owner: str, invalid: list[str] | None = None) -> dict:
         from .harness.tools import Skill
         result = {}
-        for path in sorted(self.path(owner, "skills").glob("*/SKILL.md")):
+        try:
+            paths = sorted(self.path(owner, "skills").glob("*/SKILL.md"))
+        except (GrowthError, OSError):
+            if invalid is not None:
+                invalid.append("skills")
+            return result
+        for path in paths:
             try:
                 self.path(owner, path.relative_to(self.path(owner)).as_posix())
                 name, description = parse_skill(path.read_text(encoding="utf-8"))
-            except (GrowthError, UnicodeDecodeError):
+            except (GrowthError, UnicodeDecodeError, OSError):
                 if invalid is not None:
                     invalid.append(path.parent.name)
                 continue
-            result[name] = Skill(name, description, path)
+            result[name] = Skill(name, description, path, read_root=path.parent.resolve())
         return result
 
     def skill_context(self, owner: str, question: str, budget: int = 2800) -> str:
@@ -393,12 +400,14 @@ class GrowthStore:
             return self.propose(owner, "skill", "", name=name, bundle=files, evidence=[{"restore": name}])
 
 
-def review(core, session_id: str) -> str:
+def review(core, session_id: str, *, rows: list[dict] | None = None) -> str:
     """One bounded local-model call; malformed/unsafe output never changes approved data."""
     owner = core.storage.session_owner(session_id)
     if not owner:
         raise GrowthError("대화의 주인을 확인할 수 없습니다.")
-    rows = [m for m in core.storage.message_page(session_id, limit=20)["messages"] if not m["content"].startswith("/")]
+    if rows is None:
+        rows = core.storage.message_page(session_id, limit=20)["messages"]
+    rows = [m for m in rows[:20] if not m["content"].startswith("/")]
     users = {m["id"]: m for m in rows if m["role"] == "user"}
     if not users:
         return "검토할 사용자 대화가 없습니다."
@@ -469,7 +478,7 @@ def command(core, session_id: str, argument: str) -> str:
                     or "승인된 사용자 프로필·에이전트 메모가 없습니다.")
         else:
             text = "\n".join(f"{s.name}: {s.description}" for s in store.skills(owner, invalid).values()) or "승인된 라이브러리 스킬이 없습니다."
-        return text + "".join(f"\n{name}: 크기·주입·비밀값 검사를 통과하지 못해 대화에 넣지 않습니다(새 제안으로 바꾸세요)."
+        return text + "".join(f"\n{name}: 크기·주입·비밀값 또는 경로·읽기 검사를 통과하지 못해 대화에 넣지 않습니다(파일을 확인하거나 새 제안으로 바꾸세요)."
                               for name in invalid)
     if action == "auto" and rest.strip() in ("on", "off"):
         from .storage import OWNER

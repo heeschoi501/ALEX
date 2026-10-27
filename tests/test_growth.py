@@ -98,6 +98,91 @@ class StoreTests(unittest.TestCase):
         self.store.decide(OWNER, restored["id"], True)
         self.assertIn("verify the change", self.store.skills(OWNER)["read-tests"].path.read_text())
 
+    def test_approved_bundle_references_are_readable_without_granting_writes_or_other_private_files(self):
+        project = self.root / "project"
+        project.mkdir()
+        record = self.store.propose(OWNER, "skill", "", name="read-tests", bundle={
+            "SKILL.md": SKILL.encode(), "references/guide.md": b"Check the existing behavior.\n"})
+        self.store.decide(OWNER, record["id"], True)
+        sessions = CodeSessions(lambda: None, library_skills=self.store.skills)
+        session = sessions.create(OWNER, project, "auto")
+        ref = self.store.skills(OWNER)["read-tests"].path.parent / "references/guide.md"
+        self.assertIn("Check the existing behavior.", session.workspace.run("read", {"filePath": str(ref)}))
+        self.assertIn("Check the existing behavior.", session.workspace.child([]).run("read", {"filePath": str(ref)}))
+        for tool, args in (("write", {"filePath": str(ref), "content": "changed"}),
+                           ("edit", {"filePath": str(ref), "oldString": "existing", "newString": "changed"})):
+            self.assertIn("outside the workspace", session.workspace.run(tool, args))
+        for private in (self.store.target(OWNER, "profile"),
+                        self.store.path(OWNER, "proposals") / f"{record['id']}.json"):
+            self.assertIn("outside the workspace", session.workspace.run("read", {"filePath": str(private)}))
+        other = sessions.create("another-user", project, "read")
+        self.assertIn("outside the workspace", other.workspace.run("read", {"filePath": str(ref)}))
+        self.assertEqual(ref.read_text(), "Check the existing behavior.\n")
+
+    def test_bundle_reference_links_cannot_expand_the_read_scope(self):
+        project = self.root / "project"
+        project.mkdir()
+        record = self.store.propose(OWNER, "skill", "Read tests first.", name="read-tests", description="Read tests")
+        self.store.decide(OWNER, record["id"], True)
+        sessions = CodeSessions(lambda: None, library_skills=self.store.skills)
+        session = sessions.create(OWNER, project, "read")
+        bundle = self.store.skills(OWNER)["read-tests"].path.parent
+        private = self.root / "private.md"
+        private.write_text("outside the approved bundle", encoding="utf-8")
+        try:
+            (bundle / "linked.md").symlink_to(private)
+        except OSError as exc:
+            self.skipTest(f"symlinks unavailable: {exc}")
+        self.assertIn("outside the workspace", session.workspace.run("read", {"filePath": str(bundle / "linked.md")}))
+        saved = bundle.with_name("saved-bundle")
+        bundle.rename(saved)
+        bundle.symlink_to(saved, target_is_directory=True)
+        self.assertIn("outside the workspace", session.workspace.run("read", {"filePath": str(bundle / "SKILL.md")}))
+
+    def test_import_preserves_empty_support_files_but_requires_a_skill_body(self):
+        project = self.root / "project"
+        source = project / "read-tests"
+        (source / "scripts").mkdir(parents=True)
+        (source / "assets").mkdir()
+        (source / "SKILL.md").write_text(SKILL, encoding="utf-8")
+        (source / "scripts/__init__.py").write_bytes(b"")
+        (source / "assets/placeholder.txt").write_bytes(b" \n")
+        record = self.store.import_skill(OWNER, source / "SKILL.md", project)
+        self.store.decide(OWNER, record["id"], True)
+        approved = self.store.skills(OWNER)["read-tests"].path.parent
+        self.assertEqual((approved / "scripts/__init__.py").read_bytes(), b"")
+        self.assertEqual((approved / "assets/placeholder.txt").read_bytes(), b" \n")
+        with self.assertRaisesRegex(GrowthError, "비어 있지"):
+            self.store.propose(OWNER, "skill", "", bundle={"SKILL.md": b""})
+
+    def test_existing_code_session_refreshes_skill_catalog_on_the_next_request(self):
+        from test_harness import Script, SessionTests
+        project = self.root / "project"
+        project.mkdir()
+        model = Script([("First reply", []), ("After approval", []), ("After update", []), ("After archive", [])])
+        sessions = CodeSessions(lambda: model, library_skills=self.store.skills)
+        session = sessions.create(OWNER, project, "read")
+
+        def ask(text):
+            since = session.first_event + len(session.events)
+            sessions.prompt(session.id, text)
+            event = SessionTests.wait_for(self, sessions, session.id, "session.idle", since)
+            self.assertEqual(event["result"]["stopped"], "done")
+            return model.seen[-1][0].content
+
+        self.assertNotIn("<name>read-tests</name>", ask("Before approval"))
+        record = self.store.propose(OWNER, "skill", "Read tests first.", name="read-tests", description="Original description")
+        self.store.decide(OWNER, record["id"], True)
+        self.assertIn("<name>read-tests</name>", ask("Use the approved skill"))
+        self.assertIn("read-tests", session.workspace.skills)
+        updated = self.store.propose(OWNER, "skill", "Read tests, then verify.", name="read-tests", description="Updated description")
+        self.store.decide(OWNER, updated["id"], True)
+        self.assertIn("Updated description", ask("Use the updated skill"))
+        self.store.archive_skill(OWNER, "read-tests")
+        self.assertNotIn("<name>read-tests</name>", ask("After archive"))
+        self.assertNotIn("read-tests", session.workspace.skills)
+        self.assertIn("unknown skill", session.workspace.run("skill", {"name": "read-tests"}))
+
     def test_import_refuses_escape_links_and_private_files(self):
         project = self.root / "project"
         project.mkdir()
@@ -127,9 +212,11 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.proposals(OWNER), [])
 
     def test_size_limits_follow_hermes_profile_and_memory(self):
-        with self.assertRaises(GrowthError):
-            self.store.propose(OWNER, "profile", "가" * 1376)
-        self.assertIsNotNone(self.store.propose(OWNER, "memory", "가" * 2200))
+        for kind, limit in (("profile", 1375), ("memory", 2200)):
+            with self.subTest(kind=kind):
+                self.assertIsNotNone(self.store.propose(OWNER, kind, "가" * limit))
+                with self.assertRaisesRegex(GrowthError, f"{limit}자 이하"):
+                    self.store.propose(OWNER, kind, "가" * (limit + 1))
 
     def test_decided_records_are_kept_and_do_not_stop_new_proposals(self):
         for n in range(250):  # more than the old 200-record limit, written directly to stay fast
@@ -229,8 +316,71 @@ class CoreTests(unittest.TestCase):
         skill.write_text("no frontmatter", encoding="utf-8")
         fresh = self.core.get_or_create_session(resume=False)
         self.assertFalse(any(m.local_only for m in self.core._build_messages(fresh)))
-        self.assertIn("USER.md: 크기·주입·비밀값 검사를 통과하지 못해", handle_command(self.core, fresh, "/growth profile")[0])
+        self.assertIn("USER.md: 크기·주입·비밀값 또는 경로·읽기 검사를 통과하지 못해", handle_command(self.core, fresh, "/growth profile")[0])
         self.assertIn("broken: 크기·주입", handle_command(self.core, fresh, "/growth skills")[0])
+
+    def test_linked_or_unreadable_approved_documents_do_not_break_chat(self):
+        self.approve("선호 언어는 한국어다.")
+        profile = self.store.target(OWNER, "profile")
+        original_read = Path.read_text
+
+        def unreadable(path, *args, **kwargs):
+            if path == profile:
+                raise PermissionError("profile cannot be read")
+            return original_read(path, *args, **kwargs)
+
+        with patch.object(Path, "read_text", unreadable):
+            fresh = self.core.get_or_create_session(resume=False)
+            self.assertFalse(any(m.local_only for m in self.core._build_messages(fresh)))
+            self.assertIn("USER.md:", handle_command(self.core, fresh, "/growth profile")[0])
+        saved = profile.with_name("saved-profile.md")
+        profile.rename(saved)
+        try:
+            profile.symlink_to(saved)
+        except OSError as exc:
+            self.skipTest(f"symlinks unavailable: {exc}")
+        fresh = self.core.get_or_create_session(resume=False)
+        self.assertFalse(any(m.local_only for m in self.core._build_messages(fresh)))
+        self.assertIn("USER.md:", handle_command(self.core, fresh, "/growth profile")[0])
+        self.assertEqual(saved.read_text(encoding="utf-8"), "선호 언어는 한국어다.\n")
+
+    def test_idle_review_drains_oldest_unreviewed_messages_without_skipping_backlog(self):
+        handle_command(self.core, self.session, "/growth auto on")
+        user_ids = []
+        for n in range(12):  # the final batch has only two user turns; finish it anyway
+            self.core.storage.add_message(self.session, "user", f"작업 선호 기록 {n}")
+            user_ids.append(self.core.storage.message_page(self.session)["messages"][-1]["id"])
+            self.core.storage.add_message(self.session, "assistant", f"확인 {n}")
+        model = self.core.providers[Destination.LOCAL_GENERAL].generate = Mock(return_value="[]")
+        with patch("jarvis.selfcheck.gpu_cool", return_value=True):
+            self.state.maybe_growth_review()
+            first = json.loads(model.call_args.args[0][1].content)["conversation"]
+            self.assertEqual([m["id"] for m in first if m["role"] == "user"], user_ids[:10])
+            self.assertEqual(int(self.core.storage.get_state(f"growth.review.{self.session}")), first[-1]["id"])
+            self.assertEqual(self.core.storage.get_state(f"growth.review.backlog.{self.session}"), "1")
+            self.state.maybe_growth_review()
+            batches = [json.loads(call.args[0][1].content)["conversation"] for call in model.call_args_list]
+            self.assertEqual([m["id"] for batch in batches for m in batch if m["role"] == "user"], user_ids)
+            self.assertEqual(self.core.storage.get_state(f"growth.review.backlog.{self.session}"), "0")
+            self.state.maybe_growth_review()
+            self.assertEqual(model.call_count, 2)
+
+    def test_idle_review_moves_through_command_only_pages_to_reach_unreviewed_turns(self):
+        handle_command(self.core, self.session, "/growth auto on")
+        for n in range(25):
+            self.core.storage.add_message(self.session, "user", "/status")
+            self.core.storage.add_message(self.session, "assistant", f"상태 {n}")
+        for n in range(3):
+            self.core.storage.add_message(self.session, "user", f"새 선호 {n}")
+        model = self.core.providers[Destination.LOCAL_GENERAL].generate = Mock(return_value="[]")
+        with patch("jarvis.selfcheck.gpu_cool", return_value=True):
+            self.state.maybe_growth_review()
+            self.state.maybe_growth_review()
+            model.assert_not_called()
+            self.state.maybe_growth_review()
+            model.assert_called_once()
+            conversation = json.loads(model.call_args.args[0][1].content)["conversation"]
+            self.assertEqual([m["text"] for m in conversation if m["role"] == "user"], [f"새 선호 {n}" for n in range(3)])
 
     def test_review_reads_fenced_json_and_keeps_environment_failures_out_of_memory(self):
         self.core.storage.add_message(self.session, "user", "시험은 unittest 로 돌린다. yosys 는 설치되지 않았다.")
@@ -282,7 +432,8 @@ class CoreTests(unittest.TestCase):
             self.state.queue.remove(ticket)
             self.assertEqual(self.state.maybe_growth_review(), "배움 제안 0개")
             self.assertEqual(self.state.maybe_growth_review(), "")
-            run.assert_called_once_with(self.core, self.session)
+            run.assert_called_once_with(self.core, self.session,
+                                        rows=self.core.storage.message_page(self.session, after=0, limit=20)["messages"])
         self.assertEqual(self.state.queue, [])
         self.assertIsNone(self.state.running)
 
