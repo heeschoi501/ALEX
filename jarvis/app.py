@@ -156,7 +156,7 @@ HELP_TEXT = """사용 가능한 명령
   /dev-outcomes            최근 개발 작업의 결과 기록(시험·수정안·적용·전체 검사) 요약
   /dev-learn               결과 기록에서 코딩 절차 교훈을 뽑는다(로컬 모델, ADR-070)
   /self-check [개수]       스스로 점검: 자기 기능 질문을 스스로 풀고 틀린 것을 교훈으로(기본 5·최대 20, 그래픽카드 80℃ 넘으면 멈춤)
-  /dev-insights [remove N|skill N [이름]] 코딩 절차 교훈 목록 / 지우기 / 골라서 스킬로 (붙이기: coding_insights_enabled)
+  /dev-insights [remove N|archived|restore N|skill N [이름]] 코딩 절차 교훈 목록 / 빼기(보관) / 보관함 / 되살리기 / 골라서 스킬로
   /dev-list                현재 프로젝트의 저장된 개발 작업 목록
   /dev-resume ID           저장된 작업 선택 (자동 실행 없음)
   /dev-status              저장된 개발 작업 상태·검증 이력

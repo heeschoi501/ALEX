@@ -40,6 +40,25 @@ class OperationTests(unittest.TestCase):
         self.assertEqual((items[0].text, applied, skipped),
                          ("트레이스백의 마지막 프레임부터 읽고 그 함수의 호출자를 grep 으로 찾는다", [], ["negative_claim"]))
 
+    def test_an_insight_voted_down_to_zero_is_archived_not_lost(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = InsightStore(Path(temp) / "coding-insights.json")
+            items, _ = apply_operations([], "ADD: 실패 출력의 마지막 assert 부터 본다", "r1")
+            store.save(items)
+            items, _ = apply_operations(store.load(), "DOWNVOTE 1\nDOWNVOTE 1", "r2")
+            store.save(items)
+            self.assertEqual(store.load(), [])
+            self.assertEqual([(a["id"], a["reason"]) for a in store.archived()], [(1, "점수 0")])
+            restored = store.restore(1)
+            self.assertEqual((restored.id, restored.count), (1, 1))
+            self.assertEqual((len(store.load()), store.archived()), (1, []))
+            self.assertIsNone(store.restore(1))
+
+    def test_learning_that_only_rejected_non_lessons_is_not_retried(self):
+        from jarvis.insights import learning_consumed
+        self.assertTrue(learning_consumed([], ["environment", "negative_claim"]))
+        self.assertFalse(learning_consumed([], ["environment", "empty"]))
+
     def test_the_list_is_capped_and_duplicates_are_skipped(self):
         text = "\n".join(f"ADD: 교훈 {n}" for n in range(20)) + "\nADD: 교훈 0"
         items, _ = apply_operations([], text, "run")
@@ -307,9 +326,16 @@ class CoreAndCommandTests(unittest.TestCase):
         listing = self.say("/dev-insights")
         self.assertIn("꺼짐", listing)
         second = re.search(r"^(\d+)\. \(점수 2\) 지워진", listing, re.M).group(1)
-        self.assertEqual(self.say(f"/dev-insights remove {second}"), "지웠습니다.")
+        self.assertIn("보관함에 남음", self.say(f"/dev-insights remove {second}"))
         self.assertNotIn("최소 수정", self.say("/dev-insights"))
         self.assertIn("사용법", self.say("/dev-insights delete x"))
+        # 2026-10-26(Hermes Agent curator: 지우지 말고 보관): 뺀 교훈은 보관함에 남고 되살릴 수 있다
+        archived = self.say("/dev-insights archived")
+        self.assertIn("[사람이 지움", archived)
+        self.assertIn("최소 수정", archived)
+        self.assertIn("되살렸습니다", self.say(f"/dev-insights restore {second}"))
+        self.assertIn("최소 수정", self.say("/dev-insights"))
+        self.assertIn("보관한 교훈이 없습니다", self.say("/dev-insights archived"))
 
 
 if __name__ == "__main__":
