@@ -1,3 +1,9 @@
+## 2026-10-27 (2차) — 흡수 목록·원본 변경 확인·덩치 보고, 종합 보고서
+
+- `docs/upstreams.json`: OpenCode 11곳·Hermes Agent 5곳·ExpeL·Aider 아이디어, 결론 안 난 실험 7개, 코드 고치기 4갈래(모두 2026-11-30 까지 결정).
+- `scripts/check_upstreams.py`: 흡수한 원본 파일만 판 사이 비교 + 덩치 + 지난 결정일. 첫 실행 OpenCode v1.18.34 → v1.19.4 에서 2곳 바뀜, 둘 다 반영할 것 없음(ADR-121).
+- 다른 AI 검토용 종합 보고서: docs/GROWTH_ABSORPTION_REPORT_20261027.md.
+
 ## 2026-10-27 — Hermes Agent 참고: 배우지 말 것·남의 글 속 지시·프롬프트 순서(설정)·교훈 보관·지난 대화 검색
 
 - `/dev-learn` 이 환경 탓 실패·'도구가 안 된다' 같은 부정 주장을 교훈으로 들이지 않음(지시문 + 코드 거름, ADR-120).
