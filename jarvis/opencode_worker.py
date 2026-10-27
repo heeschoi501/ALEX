@@ -18,7 +18,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import re
 import shutil
 import subprocess
 import sys
@@ -28,45 +27,13 @@ import time
 from typing import Callable
 import urllib.request
 
+# Retain these imports for existing callers (including cloudagent).
+from .egress import SECRET_NAMES, SECRET_SUFFIXES, copy_for_free, free_path_blocked, is_link, secret_file, withhold
+
 from .providers import GenerationCancelled
 
 SKIP_PARTS = {"__pycache__", ".git", ".opencode", "node_modules", ".pytest_cache"}
 TEXT_SUFFIXES = {".py", ".md", ".txt", ".json", ".toml", ".cfg", ".ini", ".yml", ".yaml", ".js", ".html", ".css"}
-# 밖(opencode.ai·클라우드 에이전트)으로 보내는 복사본에서 이름만 보고 빼는 키·인증 파일 — cloudagent 도 이 목록을 쓴다.
-SECRET_NAMES = re.compile(r"(?i)^(\.env(\..*)?|id_rsa.*|id_ed25519.*|auth\.json|credentials.*|secrets?\..*|\.netrc|\.npmrc|\.pypirc)$")
-SECRET_SUFFIXES = {".pem", ".key", ".pfx", ".p12", ".keystore", ".jks"}
-
-
-SCAN_MAX_BYTES = 8_000_000
-# 파일 내용에는 실제 키 모양만 본다 — 대화 검사(core.SENSITIVE_HINTS)의 'api_key=·password:' 같은 말은 평범한 코드
-# (`password: str`)에도 걸려 ALEX 의 core·web·app 까지 빠졌다(2026-10-26 실측). 개인 키는 본문(base64)까지 있어야 한다.
-CONTENT_GENERIC = ("API key/token 형태", "password 형태", "private key 블록")
-PRIVATE_KEY_BODY = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----\s*[A-Za-z0-9+/=\s]{40,}")
-
-
-def secret_file(name: str) -> bool:
-    return name == "jarvis.local.json" or Path(name).suffix.lower() in SECRET_SUFFIXES or SECRET_NAMES.match(name) is not None
-
-
-def withhold(path: Path) -> bool:
-    """밖으로 보내지 않을 파일 — 키·인증 파일 이름이거나, 글 파일 안에 실제 키 모양(sk-·ghp_·AKIA·JWT·개인 키 본문 …)이
-    보이면. 너무 커서 다 읽을 수 없는 글 파일·못 읽는 파일도 보내지 않는다."""
-    if secret_file(path.name):
-        return True
-    try:
-        with path.open("rb") as stream:
-            head = stream.read(4096)
-            if b"\0" in head:
-                return False  # 바이너리 — 키 파일 형식은 위의 이름·확장자로 거른다
-            if path.stat().st_size > SCAN_MAX_BYTES:
-                return True
-            data = head + stream.read()
-    except OSError:
-        return True
-    from .core import SENSITIVE_HINTS  # 부를 때 — core 가 이 모듈을 가져오므로
-    text = data.decode("utf-8", errors="ignore")
-    return PRIVATE_KEY_BODY.search(text) is not None or any(
-        pattern.search(text) for label, pattern in SENSITIVE_HINTS if label not in CONTENT_GENERIC)
 PERMISSION = {
     "edit": "allow",
     "webfetch": "deny",
@@ -97,9 +64,13 @@ class WorkerRun:
 
 def _hashes(root: Path) -> dict[str, str]:
     result = {}
-    for path in root.rglob("*"):
-        if path.is_file() and not SKIP_PARTS.intersection(path.relative_to(root).parts) and path.suffix != ".pyc":
-            result[path.relative_to(root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+    for directory, dirs, files in os.walk(root, followlinks=False):
+        here = Path(directory)
+        dirs[:] = [d for d in dirs if d not in SKIP_PARTS and not is_link(here / d)]
+        for name in files:
+            path = here / name
+            if not is_link(path) and path.is_file() and path.suffix != ".pyc":
+                result[path.relative_to(root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
     return result
 
 
@@ -171,7 +142,16 @@ class OpenCodeWorker:
         }
 
     def environment(self, config: Path, data: Path) -> dict:
-        env = dict(os.environ, OPENCODE_CONFIG=str(config), OPENCODE_DISABLE_AUTOUPDATE="1",
+        inherited = dict(os.environ)
+        if self.free:
+            # External-model children need platform/proxy/CA setup, not ambient
+            # provider keys, Python import overrides or injected OpenCode config.
+            allowed = {"PATH", "HOME", "USERPROFILE", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT",
+                       "TEMP", "TMP", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
+                       "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "SSL_CERT_FILE", "SSL_CERT_DIR",
+                       "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "NODE_EXTRA_CA_CERTS"}
+            inherited = {name: value for name, value in inherited.items() if name.upper() in allowed}
+        env = dict(inherited, OPENCODE_CONFIG=str(config), OPENCODE_DISABLE_AUTOUPDATE="1",
                    OPENCODE_DISABLE_LSP_DOWNLOAD="1", OPENCODE_DISABLE_SHARE="1",
                    XDG_CONFIG_HOME=str(self.home / "xdg-config"), XDG_CACHE_HOME=str(self.home / "xdg-cache"),
                    XDG_DATA_HOME=str(data), XDG_STATE_HOME=str(data),
@@ -218,13 +198,11 @@ class OpenCodeWorker:
         project = Path(project)
         with tempfile.TemporaryDirectory(prefix="alex-opencode-") as tmp:
             work = Path(tmp) / "project"
-            _copy_project(project, work)
-            withheld: set[str] = set()
-            if self.free:  # opencode.ai 로 가는 복사본 — 개인 설정·비밀 파일은 빼고(비교 기준 전에 지워서 '삭제'로 잡히지 않게)
-                for path in list(work.rglob("*")):
-                    if path.is_file() and withhold(path):
-                        withheld.add(path.relative_to(work).as_posix())
-                        path.unlink()
+            if self.free:
+                withheld = set(copy_for_free(project, work))
+            else:
+                _copy_project(project, work)
+                withheld = set()
             before = _hashes(work)
             config = Path(tmp) / "opencode.json"
             config.write_text(json.dumps(self.config(), ensure_ascii=False, indent=2), encoding="utf-8")
@@ -267,7 +245,8 @@ class OpenCodeWorker:
                     result.tools[str(part["tool"])] = result.tools.get(str(part["tool"]), 0) + 1
             after = _hashes(work)
             for path in sorted(set(before) | set(after)):
-                if before.get(path) == after.get(path) or path in withheld:  # 보내지 않은 파일을 새로 써도 원본을 덮지 않는다
+                if (before.get(path) == after.get(path) or ((work / path).exists() and is_link(work / path))
+                        or (self.free and free_path_blocked(path, withheld))):
                     continue
                 if path not in after:
                     result.deleted.append(path)

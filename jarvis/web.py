@@ -585,7 +585,8 @@ class WebAppState:
                                  mcp=hub, timeout=getattr(self.settings, 'opencode_timeout', 900), logger=logger,
                                  lessons=getattr(self.core, "coding_insight_text", None),  # 절차 교훈(ADR-070, 켤 때만)
                                  outcome=self._record_code_outcome,
-                                 opencode_home=Path(self.settings.opencode_dir) if getattr(self.settings, "opencode_dir", "") else None)
+                                 opencode_home=Path(self.settings.opencode_dir) if getattr(self.settings, "opencode_dir", "") else None,
+                                 library_skills=getattr(getattr(self.core, "growth_store", None), "skills", None))
         if self.settings is not None:  # 실제 앱에서만(시험의 상태 객체는 빼고) — 쉬는 중 자동 학습
             threading.Thread(target=self._auto_learn_loop, daemon=True, name="alex-auto-learn").start()
 
@@ -600,10 +601,52 @@ class WebAppState:
     def _auto_learn_loop(self) -> None:
         while not self.shutting_down:
             time.sleep(AUTO_LEARN_EVERY)
-            try:
-                self.maybe_auto_learn()
-            except Exception:  # noqa: BLE001 — 다음 차례에 다시
-                self.core.logger.exception("auto learn failed")
+            for check in (self.maybe_growth_review, self.maybe_auto_learn):
+                try:
+                    check()
+                except Exception:  # noqa: BLE001 — 다음 차례에 다시
+                    self.core.logger.exception("background review failed")
+
+    def maybe_growth_review(self) -> str:
+        """Opt-in owner-only review: idle queue, fresh turns, temperature guard, proposals only."""
+        if self.shutting_down or self.core.storage.get_state("growth.auto.owner") != "1":
+            return ""
+        with self.queue_cv:
+            if self.queue or self.running is not None or self.active_id is not None:
+                return ""
+        if sum(r["status"] == "pending" for r in self.core.growth_store.proposals(OWNER)) >= 18:
+            return ""
+        chosen = None
+        for session in self.core.storage.list_sessions(limit=10, owner=OWNER):
+            rows = self.core.storage.message_page(session.session_id, limit=20)["messages"]
+            previous = int(self.core.storage.get_state(f"growth.review.{session.session_id}") or "0")
+            fresh = [m["id"] for m in rows if m["role"] == "user" and m["id"] > previous and not m["content"].startswith("/")]
+            if len(fresh) >= 3:
+                chosen = session.session_id, max(fresh)
+                break
+        if chosen is None:
+            return ""
+        ticket = Ticket(OWNER, session_id=chosen[0], background=True)
+        with self.queue_cv:
+            self.queue.append(ticket)
+            self.queue_cv.notify_all()
+        try:
+            if not self.wait_turn(ticket):
+                return ""
+            with self.ticket_running(ticket, "growth-review", lambda _chunk: None):
+                from .selfcheck import gpu_cool
+                from .growth import review
+                if self.core.hardware.gpu and not gpu_cool():
+                    return ""
+                reply = review(self.core, chosen[0])
+                self.core.storage.set_state(f"growth.review.{chosen[0]}", str(chosen[1]))
+                self.core.storage.add_message(chosen[0], "assistant", reply)
+                return reply
+        finally:
+            with self.queue_cv:
+                if ticket in self.queue:
+                    self.queue.remove(ticket)
+                self.queue_cv.notify_all()
 
     def maybe_auto_learn(self) -> str:
         """설정(coding_auto_learn_enabled)이 켜져 있고, 기다리는 요청이 없고, 아직 안 배운 기록이 AUTO_LEARN_MIN 건 이상이면

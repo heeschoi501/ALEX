@@ -161,8 +161,11 @@ class ReasoningSettingsTests(unittest.TestCase):
         request = urllib.request.Request(self.base + path, data=json.dumps(body).encode(),
                                          headers={"Content-Type": "application/json",
                                                   "X-Jarvis-Token": "test-token", "Cookie": cookie})
+        # This fixture clears environment variables. A cached global proxy opener
+        # can then lose NO_PROXY and send its loopback requests to an HTTP proxy.
+        local = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         try:
-            with urllib.request.urlopen(request, timeout=5) as response:
+            with local.open(request, timeout=5) as response:
                 return response.status, json.load(response), response.headers.get_all("Set-Cookie") or []
         except urllib.error.HTTPError as error:
             with error:

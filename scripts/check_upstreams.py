@@ -8,8 +8,10 @@ ALEX 는 OpenCode·Hermes Agent 같은 바깥 프로젝트의 능력을 흡수�
     python -X utf8 scripts/check_upstreams.py --offline       # 덩치 + 실험만
     python -X utf8 scripts/check_upstreams.py --out 보고.md --json 보고.json
 
-원본은 기록한 버전(ref)과 최신(기본 가지)을 얕게(--depth 1) 받아 **흡수한 파일만** 비교한다. 받은 원본은 읽기만 하고 실행하지 않는다.
-반영할지는 사람이 정하고, 반영(또는 안 하기로)한 뒤 docs/upstreams.json 의 ref·commit·checked 를 고친다.
+원본은 기록한 버전(ref)과 추적 대상(기본 가지 또는 tag:접두)을 얕게(--depth 1) 받아 **등록한 파일만** 비교한다.
+기준 ref 의 SHA 가 목록의 commit 과 일치해야 한다. 태그 추적은 다른 주요 버전의 정식 태그도 알린다.
+받은 원본은 읽기만 하고 실행하지 않는다. 반영할지는 사람이 정해 ref·commit·checked 를 고친다.
+조회·검증 실패는 보고서를 남기고 종료 코드 1 로 알린다. 보안 공지와 미등록 파일은 별도로 검토해야 한다.
 """
 from __future__ import annotations
 
@@ -21,7 +23,6 @@ from pathlib import Path
 import re
 import subprocess
 import sys
-import tempfile
 
 ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = ROOT / "docs" / "upstreams.json"
@@ -40,11 +41,16 @@ def _version(tag: str) -> tuple:
     return tuple(int(n) if n.isdigit() else n for n in re.split(r"[.-]", tag.lstrip("v")))
 
 
-def latest_tag(folder: Path, prefix: str) -> str:
-    """prefix 로 시작하는 꼬리표 중 가장 높은 판(정식 판만 — 1.2.3 처럼 숫자로만 된 것)."""
+def release_tags(folder: Path) -> list[str]:
+    """Numeric stable-version tags; this is not a GitHub security-advisory check."""
     tags = [line.rsplit("refs/tags/", 1)[1] for line in _git(folder, "ls-remote", "--tags", "origin").splitlines()
             if "refs/tags/" in line and not line.endswith("^{}")]
-    tags = [t for t in tags if t.startswith(prefix) and re.fullmatch(r"v?\d+(\.\d+)*", t)]
+    return [t for t in tags if re.fullmatch(r"v?\d+(\.\d+)*", t)]
+
+
+def latest_tag(folder: Path, prefix: str) -> str:
+    """prefix 로 시작하는 꼬리표 중 가장 높은 판(정식 판만 — 1.2.3 처럼 숫자로만 된 것)."""
+    tags = [t for t in release_tags(folder) if t.startswith(prefix)]
     if not tags:
         raise RuntimeError(f"'{prefix}' 로 시작하는 정식 판 꼬리표가 없습니다")
     return max(tags, key=_version)
@@ -98,18 +104,31 @@ def upstream_report(manifest: dict, cache: Path, fetcher=fetch) -> list[dict]:
             continue
         files = sorted({f for part in source["parts"] for f in part.get("upstream", [])})
         try:
+            expected = source.get("commit", "")
+            if not re.fullmatch(r"[0-9a-f]{40}", expected):
+                raise RuntimeError("기준 commit 에 고정된 40자리 SHA 가 필요합니다")
             folder, old, new = fetcher(source["repo"], source["ref"], cache, source.get("track", ""))
+            if old != expected:
+                raise RuntimeError(f"기준 ref 의 SHA 불일치: 기록 {expected}, 조회 {old} — 기준을 자동으로 옮기지 않습니다")
             rows = compare(folder, old, new, files)
-            latest = _git(folder, "describe", "--tags", "--exact-match", new).strip() if source.get("track") else ""
+            latest, latest_release = "", ""
+            if source.get("track", "").startswith("tag:"):
+                prefix = source["track"][4:]
+                pointed = [t for t in _git(folder, "tag", "--points-at", new).splitlines()
+                           if t.startswith(prefix) and re.fullmatch(r"v?\d+(\.\d+)*", t)]
+                latest = max(pointed, key=_version)
+                latest_release = max(release_tags(folder), key=_version)
         except Exception as exc:  # noqa: BLE001 — 한 원본을 못 받아도 나머지는 보고한다
-            out.append({"name": source["name"], "kind": "git", "error": str(exc)[:300]})
+            out.append({"name": source["name"], "kind": "git", "checked": source.get("checked", ""), "error": str(exc)[:300]})
             continue
         by_file = {r["file"]: r for r in rows}
         parts = [{"id": p["id"], "status": p["status"], "alex": p.get("alex", []),
                   "changes": [by_file[f] for f in p.get("upstream", []) if by_file[f]["state"] != "same"]}
                  for p in source["parts"]]
         out.append({"name": source["name"], "kind": "git", "ref": source["ref"], "old": old, "new": new,
-                    "latest": latest, "moved": old != new, "parts": parts})
+                    "latest": latest, "latest_release": latest_release,
+                    "release_outside_track": bool(latest_release and _version(latest_release) > _version(latest)),
+                    "checked": source.get("checked", ""), "moved": old != new, "parts": parts})
     return out
 
 
@@ -134,7 +153,8 @@ def pending(manifest: dict, today: date) -> dict:
     def mark(item: dict) -> dict:
         due = item.get("decide_by", "")
         return {**item, "overdue": bool(due) and date.fromisoformat(due) < today}
-    return {"experiments": [mark(e) for e in manifest.get("experiments", [])],
+    return {"evaluation_policy": manifest.get("evaluation_policy", {}),
+            "experiments": [mark(e) for e in manifest.get("experiments", [])],
             "duplicate_paths": [mark(d) for d in manifest.get("duplicate_paths", [])]}
 
 
@@ -144,7 +164,7 @@ def markdown(upstreams: list[dict] | None, size: dict, todo: dict, today: date) 
         lines.append("## 원본 변경")
         for source in upstreams:
             if "error" in source:
-                lines.append(f"- **{source['name']}**: 받지 못함 — {source['error']}")
+                lines.append(f"- **{source['name']}**: 받지 못함·검증 실패 — {source['error']} (마지막 검토: {source.get('checked') or '미기록'})")
                 continue
             if source.get("kind") != "git":
                 lines.append(f"- {source['name']}({source.get('kind')}): {source['note']}")
@@ -153,6 +173,9 @@ def markdown(upstreams: list[dict] | None, size: dict, todo: dict, today: date) 
             head = (f"- **{source['name']}** {source['ref']} → 최신 {source.get('latest') or source['new'][:10]}: "
                     + ("원본이 그대로" if not source["moved"] else f"흡수한 부분 {len(changed)}/{len(source['parts'])}곳 바뀜"))
             lines.append(head)
+            lines.append(f"  - 마지막 판정 기록: {source.get('checked') or '미기록'} · 조회 성공은 반영 판정을 뜻하지 않음")
+            if source.get("release_outside_track"):
+                lines.append(f"  - **추적 범위 밖 새 정식 태그 {source['latest_release']}** — 릴리스·보안 공지와 파일 위치를 검토해야 함")
             for part in changed:
                 detail = ", ".join(f"{c['file'].rsplit('/', 1)[-1]} " + (f"+{c['added']}/−{c['removed']}" if c["state"] == "changed"
                                                                           else "사라짐(옮겨졌을 수 있음)") for c in part["changes"])
@@ -161,8 +184,15 @@ def markdown(upstreams: list[dict] | None, size: dict, todo: dict, today: date) 
     lines += ["## 덩치", f"- 파이썬 {size['python_lines']:,}줄 · 화면 {size['screen_lines']:,}줄 · 시험 {size['test_lines']:,}줄",
               f"- 슬래시 명령 {size['commands']}개 · 설정 {size['settings']}개(기본 꺼짐 켜고 끄기 {size['default_off_flags']}개)", ""]
     lines.append("## 결론 안 난 실험(정한 날까지 측정 → 기본으로 만들고 옛 길 지우기, 또는 이 기능 지우기)")
+    policy = todo.get("evaluation_policy", {})
+    if policy:
+        lines.append(f"- 측정 조건: {policy['controls']}")
+        lines.append(f"- 안전·품질: {policy['quality_gate']}")
+        lines.append(f"- 결론 불충분: {policy['inconclusive']}")
     for item in todo["experiments"]:
         lines.append(f"- {'**지남** ' if item['overdue'] else ''}`{item['setting']}` ({item['adr']}, {item['decide_by']}까지): {item['measure']}")
+        if item.get("accept"):
+            lines.append(f"  - 채택 기준(제안): {item['accept']}")
     lines.append("")
     lines.append("## 같은 일을 하는 여러 길")
     for item in todo["duplicate_paths"]:
@@ -190,7 +220,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.json:
         Path(args.json).write_text(json.dumps({"date": today.isoformat(), "upstreams": upstreams, "size": size, **todo},
                                               ensure_ascii=False, indent=1), encoding="utf-8")
-    return 0
+    return int(any("error" in source for source in upstreams or []))
 
 
 if __name__ == "__main__":

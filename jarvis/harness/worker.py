@@ -43,12 +43,14 @@ class HarnessWorker:
         return str(getattr(self.provider_getter(), "model", "?"))
 
     def __init__(self, provider_getter: Callable[[], object], *, timeout: float = 900.0, max_steps: int = 60,
-                 context_chars: int = 300_000, lessons: Callable[[], str] | None = None) -> None:
+                 context_chars: int = 300_000, lessons: Callable[[], str] | None = None,
+                 skills: Callable[[], dict] | None = None) -> None:
         self.provider_getter = provider_getter   # 그때의 코딩 모델(엔진을 바꿔도 따라가게)
         self.timeout = float(timeout)
         self.max_steps = max_steps
         self.context_chars = context_chars
         self.lessons = lessons
+        self.skills = skills
         self.before_run: Callable[[], None] | None = None
         self.progress: Callable[[str], None] | None = None
         self.last = None                          # 마지막 AgentResult(기록·평가용)
@@ -82,6 +84,8 @@ class HarnessWorker:
                      *(Rule("edit", path, DENY) for path in index.originals)]
             workspace = Workspace(work, shell=ShellPolicy(), output_dir=Path(tmp) / "tool-output", cancel_event=cancel_event,
                                   rules=rules, read_max_lines=400)
+            if self.skills is not None:
+                workspace.skills = {**self.skills(), **workspace.skills}
             agent = CodingAgent(provider, workspace, max_steps=self.max_steps, context_chars=self.context_chars,
                                 rules=RULES, lessons=self.lessons() if self.lessons else "",
                                 progress=self.progress, cancel_event=cancel_event,

@@ -357,8 +357,12 @@ class WebHTTPTests(unittest.TestCase):
             self.assertEqual(status, 409)
             self.assertIn("코딩 세션", body["error"])
             spawn.assert_not_called()
-            del self.state.code.sessions["ses_busy"]
+            # The response can arrive before the handler's finally releases its
+            # lock. Synchronize before the next request instead of racing it.
+            with self.state.lock:
+                del self.state.code.sessions["ses_busy"]
             status, body = post("/api/restart")
+        self.assertEqual(status, 200, body)
         self.assertEqual((status, body["stopped"], body["restarting"]), (200, True, True))
         spawn.assert_called_once()
         self.assertTrue(self.state.shutting_down)

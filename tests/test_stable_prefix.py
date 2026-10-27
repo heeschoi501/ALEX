@@ -2,6 +2,9 @@
 
 켜면 차례마다 바뀌는 것(시각·메모·교훈·자료)이 질문 바로 앞에 가고, 앞부분(지시·대화 기록)은 다음 차례에도 그대로다."""
 from pathlib import Path
+from contextlib import redirect_stdout
+from io import StringIO
+import json
 from tempfile import TemporaryDirectory
 import unittest
 from unittest import mock
@@ -100,6 +103,45 @@ class MeasureScriptTests(unittest.TestCase):
         self.assertLess(off["reused_share_after_first"], 0.2)
         self.assertGreater(on["reused_share_after_first"], 0.7)
         self.assertGreater(on["turns"][-1]["reused"], 0.85 * on["turns"][-1]["chars"])
+
+    def test_live_measurement_streams_balanced_replays_and_excludes_warmups(self):
+        from jarvis.config import Settings
+        from scripts.measure_prompt_cache import live, QUESTIONS
+        models = []
+
+        class TimedModel(Recorder):
+            def generate(inner, messages, **kwargs):
+                self.assertTrue(callable(kwargs.get("on_chunk")))
+                inner.last_metrics = {"first_token_seconds": 0.25, "total_seconds": 1.0, "prompt_tokens": 50}
+                super().generate(messages, **kwargs)
+                return f"generated model {models.index(inner)} answer {len(inner.calls)}"
+
+        def build(settings, **_kwargs):
+            self.assertTrue(settings.local_only)
+            self.assertFalse(settings.summary_enabled)
+            model = TimedModel()
+            models.append(model)
+            core = JarvisCore(storage=Storage(settings.data_dir / "t.db"), local_general=model, local_coder=model,
+                              cloud_coder=MockLLMProvider("cc", "X"), cloud_reasoning=MockLLMProvider("cr", "Y"),
+                              stable_prompt_prefix=settings.stable_prompt_prefix, summary_enabled=False,
+                              hardware=HardwareInfo(os_name="Windows", cpu="x86", ram_gb=93.6, gpu="RTX 5080", vram_gb=15.9,
+                                                    profile=PerformanceProfile.DESKTOP))
+            return core, []
+
+        with TemporaryDirectory() as temp, mock.patch("jarvis.app.build_core", side_effect=build), \
+                mock.patch("jarvis.config.load_settings", return_value=Settings()), redirect_stdout(StringIO()):
+            out = Path(temp) / "result.json"
+            result = live(out, pairs=2)
+            self.assertEqual(json.loads(out.read_text(encoding="utf-8")), result)
+        self.assertEqual([r["stable_prompt_prefix"] for r in result["runs"]], [False, True, True, False])
+        self.assertFalse(result["cache_reset"])
+        for run, model in zip(result["runs"], models):
+            self.assertEqual(len(model.calls), len(QUESTIONS) + 1)
+            self.assertEqual(len(run["turns"]), len(QUESTIONS))
+            self.assertEqual(run["turns"][0]["first_token_seconds"], 0.25)
+            replay = [[(m.role, m.content) for m in call if m.role != "system"] for call in model.calls[1:]]
+            reference = [[(m.role, m.content) for m in call if m.role != "system"] for call in models[0].calls[1:]]
+            self.assertEqual(replay, reference)
 
 
 if __name__ == "__main__":

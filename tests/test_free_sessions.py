@@ -121,3 +121,22 @@ class FreeSessionTests(Fixture):
         self.assertEqual((config['model'], config['permission']['edit'], config['permission']['bash']),
                          ('opencode/big-pickle', 'deny', 'deny'))
         self.assertIn('a - b', (self.root / 'calc.py').read_text())
+
+    def test_linked_directory_replacements_are_not_imported(self):
+        fake = self.prepare()
+        outside = Path(self.temp.name) / 'private'
+        outside.mkdir()
+        (outside / 'note.txt').write_text('private', encoding='utf-8')
+        try:
+            (self.root / 'linked').symlink_to(outside, target_is_directory=True)
+        except OSError as exc:
+            self.skipTest(f'symlinks unavailable: {exc}')
+        script = Path(fake[1])
+        script.write_text(FAKE + "Path('linked').mkdir(exist_ok=True)\n"
+                          "Path('linked/new.txt').write_text('replacement')\n", encoding='utf-8')
+        sessions = CodeSessions(lambda: None, opencode_command=fake)
+        session = sessions.create('owner', self.root, 'auto', model='opencode/big-pickle')
+        sessions.prompt(session.id, 'calc.py 고쳐')
+        self.wait(sessions, session.id)
+        self.assertFalse((outside / 'new.txt').exists())
+        self.assertEqual((outside / 'note.txt').read_text(), 'private')

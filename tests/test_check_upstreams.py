@@ -5,6 +5,9 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
+from unittest.mock import patch
 
 from scripts import check_upstreams as check
 
@@ -42,7 +45,8 @@ class UpstreamTests(unittest.TestCase):
             git(self.origin, "tag", tag)
 
     def manifest(self, ref: str, track: str = "") -> dict:
-        return {"upstreams": [{"name": "tool", "kind": "git", "repo": self.url, "ref": ref, "track": track, "parts": [
+        return {"upstreams": [{"name": "tool", "kind": "git", "repo": self.url, "ref": ref, "commit": self.first,
+                              "checked": "2026-10-27", "track": track, "parts": [
             {"id": "edit", "status": "core", "alex": ["jarvis/harness/edit.py"], "upstream": ["src/edit.ts"]},
             {"id": "read", "status": "core", "alex": ["jarvis/harness/tools.py"], "upstream": ["src/read.ts", "src/gone.ts"]}]},
             {"name": "paper", "kind": "paper", "parts": []}]}
@@ -72,6 +76,46 @@ class UpstreamTests(unittest.TestCase):
         report = check.upstream_report(manifest, self.root / "cache")
         self.assertIn("error", report[0])
         self.assertEqual(report[1]["kind"], "paper")
+
+    def test_a_moved_baseline_tag_is_rejected_in_a_fresh_cache(self):
+        git(self.origin, "tag", "-f", "v1.0.0")
+        report = check.upstream_report(self.manifest("v1.0.0", "tag:v1."), self.root / "cache")
+        self.assertIn("error", report[0])
+        self.assertIn(self.first, report[0]["error"])
+        self.assertEqual(report[1]["kind"], "paper")
+
+    def test_a_git_source_without_a_pinned_commit_is_rejected(self):
+        manifest = self.manifest("v1.0.0", "tag:v1.")
+        del manifest["upstreams"][0]["commit"]
+        self.assertIn("error", check.upstream_report(manifest, self.root / "cache")[0])
+
+    def test_a_new_major_release_is_reported_without_changing_the_tracked_line(self):
+        self.commit({"src/edit.ts": "새 구조\n"}, tag="v2.0.0")
+        tool = check.upstream_report(self.manifest("v1.0.0", "tag:v1."), self.root / "cache")[0]
+        self.assertEqual(tool["latest"], "v1.1.0")
+        self.assertEqual(tool["latest_release"], "v2.0.0")
+        self.assertTrue(tool["release_outside_track"])
+        self.assertEqual(tool["checked"], "2026-10-27")
+
+    def test_failed_checks_still_write_reports_and_return_a_failure_exit_status(self):
+        manifest = self.manifest("v1.0.0", "tag:v1.")
+        manifest["upstreams"][0]["repo"] = (self.root / "nowhere").as_uri()
+        source = self.root / "manifest.json"
+        source.write_text(json.dumps(manifest), encoding="utf-8")
+        output, raw = self.root / "report.md", self.root / "report.json"
+        with redirect_stdout(StringIO()):
+            code = check.main(["--manifest", str(source), "--cache", str(self.root / "cache"),
+                               "--out", str(output), "--json", str(raw)])
+        self.assertEqual(code, 1)
+        self.assertIn("받지 못함", output.read_text(encoding="utf-8"))
+        self.assertIn("error", json.loads(raw.read_text(encoding="utf-8"))["upstreams"][0])
+
+    def test_offline_reports_succeed_without_fetching(self):
+        source = self.root / "manifest.json"
+        source.write_text(json.dumps(self.manifest("v1.0.0", "tag:v1.")), encoding="utf-8")
+        with redirect_stdout(StringIO()), patch.object(check, "upstream_report") as report:
+            self.assertEqual(check.main(["--offline", "--manifest", str(source)]), 0)
+        report.assert_not_called()
 
 
 class PendingAndSizeTests(unittest.TestCase):

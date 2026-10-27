@@ -30,13 +30,13 @@ from typing import Callable, ContextManager
 
 from ..http_control import RequestControl
 from ..freemodels import is_free_model
-from ..opencode_worker import secret_file, withhold
+from ..egress import FREE_SKIP, copy_for_free as _copy_for_free, free_path_blocked
 from ..providers import GenerationCancelled, GenerationTimeout, Message
 from . import commands as cmds
 from . import permission as perm
 from .agent import AgentResult, CodingAgent
 from .tools import ShellPolicy, Workspace
-from .verification import VERIFY_SKIP, TestIndex, python_snapshot, source_changes, verify_copy
+from .verification import TestIndex, python_snapshot, source_changes, verify_copy
 
 PERMISSION_WAIT = 600.0
 KEEP_EVENTS = 2000
@@ -89,41 +89,6 @@ class CodeSession:
                                                    "verification": last.verification}}
 
 
-FREE_COPY_LIMIT = 300 * 1024 * 1024
-FREE_SKIP = VERIFY_SKIP | {"__pycache__", ".git", ".opencode", "node_modules", ".pytest_cache"}
-
-
-def _copy_for_free(source: Path, target: Path) -> list[str]:
-    """무료 모델 세션 복사본 — 독립 검사 복사본처럼 기록·데이터·실행 환경·도구·개인 설정(.env·jarvis.local.json)은 뺀다(opencode.ai
-    로 보내지 않게). 키·인증 파일과 내용에 비밀값 모양이 보이는 파일도 빼고 그 상대 경로를 돌려준다(그 경로의 변경은 들이지
-    않는다). 300MB 가 넘으면 거절 — 더 좁은 폴더로 세션을 열게."""
-    source = Path(source)
-    withheld: list[str] = []
-    skipped: set[Path] = set()
-    total = 0
-    for directory, dirs, files in os.walk(source):
-        here = Path(directory)
-        dirs[:] = [d for d in dirs if d not in FREE_SKIP and not secret_file(d) and not (here / d).is_symlink()]
-        for name in files:
-            path = here / name
-            if name in FREE_SKIP or name.endswith(".pyc") or path.is_symlink():
-                skipped.add(path)
-            elif withhold(path):
-                skipped.add(path)
-                withheld.append(path.relative_to(source).as_posix())
-            else:
-                total += path.stat().st_size
-                if total > FREE_COPY_LIMIT:
-                    raise ValueError("세션 폴더가 너무 큽니다(복사할 파일 300MB 초과) — 무료 모델 세션은 더 좁은 프로젝트 폴더로 열어 주세요.")
-
-    def ignore(directory, names):
-        here = Path(directory)
-        return {n for n in names if here / n in skipped or ((here / n).is_dir()
-                and (n in FREE_SKIP or secret_file(n) or (here / n).is_symlink()))}
-    shutil.copytree(source, target, ignore=ignore)
-    return sorted(withheld)
-
-
 class _Gated:
     """모델 부르기 한 번마다 차례를 잡는 대리인 — 그 밖의 속성(think·last_metrics …)은 지금의 모델 것을 그대로 쓴다."""
 
@@ -165,12 +130,13 @@ class CodeSessions:
                  shell: ShellPolicy | None = None, fetch=None, search=None, mcp=None,
                  lessons: Callable[[], str] | None = None, max_steps: int = 80, timeout: float = 900, logger=None,
                  outcome: Callable[[dict], None] | None = None, opencode_home: Path | None = None,
-                 opencode_command: list[str] | None = None) -> None:
+                 opencode_command: list[str] | None = None, library_skills: Callable[[str], dict] | None = None) -> None:
         self.provider_getter = provider_getter
         self.outcome = outcome   # 배울 기록 남기기(dev-outcomes 'code' — /dev-learn 이 읽음, 2026-10-23)
         # OpenCode 무료 모델 세션용 opencode.exe 폴더(무료 단계는 OpenCode 안에서만 된다 — jarvis/freemodels.py)
         self.opencode_home = Path(opencode_home) if opencode_home else Path(__file__).resolve().parents[3] / "tools" / "opencode"
         self.opencode_command = opencode_command   # 시험용 가짜 오픈코드
+        self.library_skills = library_skills
         self.model_turn = model_turn or (lambda _session: nullcontext())
         self.store = Path(store).resolve() if store else None   # 절대 경로 — OpenCode 는 다른 폴더(복사본)에서 돈다
         self.shell = shell or ShellPolicy()
@@ -205,10 +171,13 @@ class CodeSessions:
 
     # ── 세션
     def _workspace(self, session: CodeSession) -> Workspace:
-        return Workspace(session.root, shell=self.shell, rules=perm.tier_rules(session.tier, self.shell.allow),
+        workspace = Workspace(session.root, shell=self.shell, rules=perm.tier_rules(session.tier, self.shell.allow),
                          ask=lambda p, pattern, detail: self._ask(session, p, pattern, detail),
                          fetch=self.fetch, search=self.search, mcp=self.mcp,
                          cancel_event=RequestControl(session.cancel, deadline=session.deadline))
+        if self.library_skills is not None:
+            workspace.skills = {**self.library_skills(session.owner), **workspace.skills}
+        return workspace
 
     def create(self, owner: str, root: Path, tier: str = "ask", title: str = "", model: str = "") -> CodeSession:
         root = Path(root).resolve()
@@ -465,7 +434,7 @@ class CodeSessions:
         session.transcript.append({"role": "user", "content": text})
         say(f"[OpenCode 무료 모델 {session.model.split('/', 1)[1]} — 코드가 opencode.ai 로 전송됩니다]\n")
         if withheld:
-            say(f"[비밀값이 보여 보내지 않은 파일 {len(withheld)}개: " + ", ".join(sorted(withheld)[:5])
+            say(f"[비밀값·링크 등으로 보내지 않은 경로 {len(withheld)}개: " + ", ".join(sorted(withheld)[:5])
                 + (" …" if len(withheld) > 5 else "") + "]\n")
         flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
         with worker.request_command(text, session=session.oc_session, agent="plan" if mode == "plan" else "") as (command, stdin):
@@ -525,7 +494,7 @@ class CodeSessions:
                     for rel in sorted(set(before) | set(after)):
                         if before.get(rel) == after.get(rel) or FREE_SKIP.intersection(Path(rel).parts):
                             continue  # 복사에서 뺀 곳(기록·데이터·개인 설정)은 들이지도 않는다
-                        if rel in withheld or any(secret_file(part) for part in Path(rel).parts):
+                        if free_path_blocked(rel, withheld):
                             notes.append(f"{rel}: 보내지 않은 비밀 파일 자리라 들이지 않았습니다")
                             continue
                         if rel in after and Path(rel).suffix.lower() not in TEXT_SUFFIXES:

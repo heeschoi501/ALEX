@@ -1,5 +1,13 @@
 {
   "about": "ALEX 가 흡수한 바깥 프로젝트·논문과 결론을 기다리는 실험(2026-10-27). scripts/check_upstreams.py 가 읽는다. status: core(뼈대 — 원본 변경을 따라간다) · experiment(설정으로 켜고 끔 — decide_by 까지 측정해 기본으로 만들고 옛 길을 지우거나, 이 기능을 지운다) · retired(지웠다 — git 기록과 ADR 에 남음). ref 는 마지막으로 원본과 맞춰 본 버전이다. 원본의 새 변경을 반영(또는 반영하지 않기로)한 뒤에 ref·commit·checked 를 사람이 고친다.",
+  "evaluation_policy": {
+    "status": "제안 — PC 측정 전에 기준을 확정하고, 측정 뒤 유리한 기준으로 바꾸지 않는다",
+    "protocol": "docs/GROWTH_ABSORPTION_REPORT_20261027.md#8-검토-반영과-측정-판정-기준",
+    "paired_repeats": 4,
+    "controls": "소스 SHA·모델/양자화·서버 버전·문맥/출력 상한·추론 옵션·검사 명령을 고정. 끔/켬과 켬/끔 순서를 번갈아 같은 과제를 4쌍 비교한다.",
+    "quality_gate": "개인정보·소유권·승인·기존 정답·긴 문맥 보호의 새 실패는 채택 불가. skip·모델 오류·불완전한 검사는 성공으로 세지 않는다.",
+    "inconclusive": "동률·표본 부족·측정 불가이면 현재 기본값을 유지하고 결정 이유·다음 과제/기한을 history 또는 ADR 에 남긴다. 안전 검사는 동등한 대체 검증 없이 삭제하지 않는다."
+  },
   "upstreams": [
     {
       "name": "opencode",
@@ -12,6 +20,8 @@
       "ported_from": "v1.18.34 (aec0b9a6d8898f68f923aaf08b7306d931fd9d76) — 하네스를 옮긴 판",
       "license": "MIT — jarvis/harness/OPENCODE_LICENSE.txt",
       "checked": "2026-10-27",
+      "releases_url": "https://github.com/anomalyco/opencode/releases",
+      "security_url": "https://github.com/anomalyco/opencode/security/advisories",
       "history": [
         {"date": "2026-10-27", "from": "v1.18.34", "to": "v1.19.4",
          "changed": ["provider/provider.ts +6/−3", "cli/cmd/run.ts +4/−14"],
@@ -75,18 +85,31 @@
       "commit": "085f562af53a6fedadac3681e2c498fc71316132",
       "license": "MIT — jarvis/HERMES_LICENSE.txt",
       "checked": "2026-10-27",
+      "releases_url": "https://github.com/NousResearch/hermes-agent/releases",
+      "security_url": "https://github.com/NousResearch/hermes-agent/security/advisories",
       "parts": [
         {"id": "hermes-threat-patterns", "status": "core", "adr": "ADR-120", "what": "프롬프트 주입·유출 패턴(+ ALEX 한국어 패턴)",
          "alex": ["jarvis/threats.py"], "upstream": ["tools/threat_patterns.py"]},
         {"id": "hermes-do-not-capture", "status": "core", "adr": "ADR-120", "what": "배우지 말 것(환경 실패·부정 주장·못 푼 시도)",
          "alex": ["jarvis/insights.py"], "upstream": ["agent/background_review.py"]},
-        {"id": "hermes-curator-archive", "status": "core", "adr": "ADR-120", "what": "지우지 않고 보관",
-         "alex": ["jarvis/insights.py"], "upstream": ["agent/curator.py"]},
+        {"id": "hermes-curator-archive", "status": "core", "adr": "ADR-120", "what": "교훈·스킬 이전 판을 지우지 않고 보관(자동 stale·통합은 후속)",
+         "alex": ["jarvis/insights.py", "jarvis/growth.py"], "upstream": ["agent/curator.py"]},
         {"id": "hermes-session-search", "status": "core", "adr": "", "what": "지난 대화 본문 찾기(ALEX 는 색인 없이)",
          "alex": ["jarvis/storage.py"], "upstream": ["tools/session_search_tool.py"]},
         {"id": "hermes-frozen-prompt", "status": "experiment", "setting": "stable_prompt_prefix", "adr": "ADR-119",
          "what": "바뀌지 않는 앞부분 + 차례별 내용은 질문 앞(프롬프트 캐시)",
-         "alex": ["jarvis/core.py"], "upstream": ["tools/memory_tool.py", "agent/prompt_builder.py"]}
+         "alex": ["jarvis/core.py"], "upstream": ["tools/memory_tool.py", "agent/prompt_builder.py"]},
+        {"id": "hermes-background-review", "status": "core", "adr": "ADR-122",
+         "what": "대화에서 스킬·프로필·메모 변경을 제안. 쉬는 중 뒤 작업·온도 확인·명시 승인(기본 자동 검토 꺼짐)",
+         "alex": ["jarvis/growth.py", "jarvis/web.py"], "upstream": ["agent/background_review.py"]},
+        {"id": "hermes-profile-memory", "status": "core", "adr": "ADR-122",
+         "what": "승인된 USER.md·MEMORY.md를 사용자별로 보관하고 대화 시작 시 고정. 클라우드와 외부 복사본 제외",
+         "alex": ["jarvis/growth.py", "jarvis/core.py", "jarvis/providers.py"],
+         "upstream": ["tools/memory_tool.py", "tools/memory_tool_store.py"]},
+        {"id": "hermes-skills-library", "status": "core", "adr": "ADR-122",
+         "what": "Agent Skills SKILL.md 묶음 가져오기·생성/변경 제안·승인·이전 판 보관·하네스 연결",
+         "alex": ["jarvis/growth.py", "jarvis/harness/sessions.py", "jarvis/harness/worker.py"],
+         "upstream": ["tools/skills_tool.py", "tools/skill_manager_tool.py"]}
       ]
     },
     {
@@ -110,25 +133,35 @@
   ],
   "experiments": [
     {"setting": "stable_prompt_prefix", "adr": "ADR-119", "decide_by": "2026-11-30",
-     "measure": "python -X utf8 scripts/measure_prompt_cache.py --live — 첫 글자 시간·답 비교"},
+     "measure": "python -X utf8 scripts/measure_prompt_cache.py --live --pairs 4 — 고정 기록·순서 균형·준비 요청 제외·스트리밍 첫 글자 시간·답 비교",
+     "accept": "둘째~여섯째 질문의 실행별 첫 글자 시간 중앙값이 4쌍 중 3쌍 이상 개선되고 전체 중앙값 10% 이상 단축. 사실·교정·긴 문맥·정보 제외 보호의 새 실패 0건.",
+     "caveat": "문자 앞부분 일치율은 캐시 적중률이 아니다. 서버 캐시를 초기화하지 않으며 cold-cache 성능을 주장하지 않는다."},
     {"setting": "coding_insights_enabled", "adr": "ADR-070", "decide_by": "2026-11-30",
-     "measure": "scripts/run_pc_benchmarks.py --only devauto 를 켜고/끄고(coding_agent_eval.py --insights)"},
+     "measure": "scripts/run_pc_benchmarks.py --only devauto 를 켜고/끄고(coding_agent_eval.py --insights). 학습 기록은 사전 고정하고 평가 과제에서 새로 배우지 않는다.",
+     "accept": "v4 11과제×4회: 엄격 성공 4/44건 이상 증가, 또는 성공 수가 같고 중앙 시간 10% 이상 단축. 새 회귀·보안 실패 0건. 별도 보류 과제로 재확인."},
     {"setting": "coding_auto_learn_enabled", "adr": "ADR-113", "decide_by": "2026-11-30",
-     "measure": "coding_insights_enabled 결정에 따른다(교훈을 안 쓰면 자동으로 뽑을 까닭도 없다)"},
+     "measure": "coding_insights_enabled 채택 후 별도 작업 기록 20건 이상으로 추출 품질·시간·저장량을 확인",
+     "depends_on": "coding_insights_enabled",
+     "accept": "샘플에서 근거 있는 유효 교훈 80% 이상, 환경 실패·미해결·주입 문장의 교훈 유입 0건. 기존 승인 경계를 유지하며 자동 추출 비용을 별도 보고."},
     {"setting": "fact_reminder_enabled", "adr": "ADR-071", "decide_by": "2026-11-30",
-     "measure": "오답 바로잡기 replay(scripts/desktop_screen.sh … screen) 를 켜고/끄고"},
+     "measure": "주제와 표현이 다른 오답 바로잡기 replay 20개를 켜고/끄고 4쌍 반복",
+     "accept": "바로잡기 성공 비율 20%p 이상 증가, 새 사실 오류 0건, 첫 글자 시간 중앙값 악화 10% 이하. 고정 FIFO 과제만으로 판정하지 않는다."},
     {"setting": "coding_api_map_enabled", "adr": "ADR-072", "decide_by": "2026-11-30",
-     "measure": "coding_agent_eval.py --api-map 켜고/끄고"},
+     "measure": "coding_agent_eval.py --api-map 켜고/끄고",
+     "accept": "v4 11과제×4회: 엄격 성공 4/44건 이상 증가, 또는 성공 수가 같고 중앙 시간 10% 이상 단축. 새 회귀·보안 실패 0건. 보류 과제로 재확인."},
     {"setting": "coding_regression_check", "adr": "ADR-078", "decide_by": "2026-11-30",
-     "measure": "coding_agent_eval.py --regression-check 켜고/끄고 — 새 회귀 수·시간"},
+     "measure": "별도로 심은 회귀 10건 이상 탐지 + 정상 v4 과제×4회 오탐·실행 비용 확인",
+     "accept": "심은 회귀 전부 탐지·정상 변경 오탐 0건. 비용은 보고하되 속도만으로 탈락시키지 않는다. 삭제에는 동등한 보호를 제공하는 대체 검사 증거가 필요."},
     {"setting": "coding_diagnostic_context", "adr": "ADR-080", "decide_by": "2026-11-30",
-     "measure": "coding_agent_eval.py --diagnostics 켜고/끄고"}
+     "measure": "coding_agent_eval.py --diagnostics 켜고/끄고",
+     "accept": "v4 11과제×4회: 엄격 성공 4/44건 이상 증가, 또는 성공 수가 같고 중앙 시간 10% 이상 단축. 새 회귀·보안 실패 0건. 보류 과제로 재확인."}
   ],
   "duplicate_paths": [
     {"job": "코드 고치기(/dev-auto·/build 일꾼)",
      "paths": ["예전 모델 수정안(coding_worker=alex)", "OpenCode 일꾼(coding_worker=opencode)", "ALEX 하네스(coding_worker=harness)",
                "클라우드 넘기기(/cloud — 사람이 고를 때만)"],
      "decide_by": "2026-11-30",
-     "measure": "같은 v4 과제로 coding_worker 별 run_pc_benchmarks.py --only devauto — 진 일꾼은 내보낸다. 클라우드 넘기기는 성격이 달라 유지 후보"}
+     "measure": "동일 로컬 모델·조건에서 같은 v4 과제를 일꾼별 4회 비교. 같은 요구조건을 충족하는 구현만 통합 후보. 무료 외부 모델·/cloud 는 전송 동의·비용·가용성 조건을 별도로 검토.",
+     "accept": "엄격 성공·회귀·승인/개인정보 보호가 뒤처지지 않는 구현 중 유지보수 비용이 작은 것을 남긴다. 오프라인·비공개 실행·사용자 선택 전송 능력을 삭제하지 않는다."}
   ]
 }

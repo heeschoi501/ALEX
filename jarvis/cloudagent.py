@@ -55,7 +55,7 @@ LIMIT_WORDS = re.compile(r"(?i)usage limit|limit reached|rate.?limit|hit your (?
 
 TOP_SKIP = {"data", "logs", "runtime", "backups", "models", "tools", "node_modules", ".venv", "venv", "env"}
 ANY_SKIP = {"__pycache__", ".git", ".hg", ".svn", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", ".idea",
-            ".vscode", ".opencode", ".claude", ".codex", "node_modules", ".venv", "venv", "edge-profile"}
+            ".vscode", ".opencode", ".claude", ".codex", "node_modules", ".venv", "venv", "edge-profile", "growth"}
 SKIP_SUFFIXES = {".db", ".sqlite", ".sqlite3", ".db-wal", ".db-shm", ".gguf", ".safetensors", ".bin", ".pt", ".pth",
                  ".ckpt", ".onnx", ".zip", ".7z", ".rar", ".tar", ".gz", ".xz", ".mp4", ".mov", ".avi", ".mkv", ".webm",
                  ".wav", ".mp3", ".flac", ".exe", ".dll", ".so", ".dylib", ".pyc",
