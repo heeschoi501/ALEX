@@ -1009,6 +1009,50 @@ class Storage:
         except sqlite3.DatabaseError as exc:
             raise StorageError(self._db_help(exc)) from exc
 
+    def search_messages(self, query: str, owner: str = OWNER, limit: int = 20, per_session: int = 3) -> list[dict]:
+        """지난 대화 내용 찾기(2026-10-26, Hermes Agent 의 지난 대화 검색 참고) — 이 주인의 대화만, 제목이 아니라 메시지 본문에서.
+
+        따로 색인을 두지 않는다: 대화를 지우면(대화방·프로젝트 삭제의 FK cascade) 바로 찾을 수 없게 된다. 한글은 학습 자료 검색과 같은
+        두 글자 조각이라 조사가 달라도 맞는다('회의록은' ↔ '회의록을'). 조각의 3분의 1 이상이 들어 있는 메시지를 많이 맞은 순·최근 순으로."""
+        from .knowledge import search_terms
+        terms = sorted(search_terms(query or ""), key=lambda t: (-len(t), t))[:12]
+        if not terms:
+            return []
+        need = max(1, -(-len(terms) // 3))
+        clause = " OR ".join("lower(m.content) LIKE ? ESCAPE '\\'" for _ in terms)
+        like = ["%" + t.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%" for t in terms]
+        try:
+            with self._connection() as conn:
+                rows = conn.execute(
+                    "SELECT m.id, m.session_id, m.role, m.content, m.created_at, s.title, COALESCE(p.name, '') AS project "
+                    "FROM messages m JOIN sessions s ON s.id = m.session_id LEFT JOIN projects p ON p.id = s.project_id "
+                    f"WHERE s.owner = ? AND ({clause}) ORDER BY m.id DESC LIMIT 2000", (owner, *like)).fetchall()
+        except sqlite3.DatabaseError as exc:
+            raise StorageError(self._db_help(exc)) from exc
+        scored = []
+        for row in rows:
+            text = str(row["content"])
+            lowered = text.lower()
+            hits = [t for t in terms if t in lowered]
+            if len(hits) < need:
+                continue
+            at = min(lowered.find(t) for t in hits)
+            start = max(0, at - 40)
+            snippet = " ".join(text[start:start + 160].split())
+            scored.append((len(hits), int(row["id"]), {
+                "message_id": int(row["id"]), "session_id": str(row["session_id"]), "title": str(row["title"] or ""),
+                "project": str(row["project"]), "role": str(row["role"]), "created_at": str(row["created_at"]),
+                "snippet": ("…" if start else "") + snippet + ("…" if start + 160 < len(text) else "")}))
+        found, per = [], {}
+        for _hits, _id, item in sorted(scored, key=lambda x: (-x[0], -x[1])):
+            if per.get(item["session_id"], 0) >= per_session:
+                continue
+            per[item["session_id"]] = per.get(item["session_id"], 0) + 1
+            found.append(item)
+            if len(found) >= limit:
+                break
+        return found
+
     def messages_after(self, last_id: int, limit: int = 5000) -> list[dict]:
         """월별 대화 기록(archive.py)용 — last_id 다음 메시지들을 대화방 정보(주인·제목·프로젝트 이름)와 함께, 오래된 순으로."""
         try:

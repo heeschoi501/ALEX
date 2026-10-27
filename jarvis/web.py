@@ -82,7 +82,7 @@ ARTIFACT_RE = re.compile(r"\]\(alex-(?:image|video|document|download):([A-Za-z0-
 MAX_CHAT_DOCUMENTS = 5  # 한 번에 첨부하는 문서 수(ADR-096)
 # 관리자가 아닌 사용자가 쓸 수 있는 명령. 이 PC 의 파일·설정·학습·개발 도구에 손대는 명령은 뺀다.
 MEMBER_COMMANDS = frozenset({
-    "/help", "/new", "/use", "/rename", "/delete-session", "/sessions", "/summary", "/export", "/document",
+    "/help", "/new", "/use", "/rename", "/delete-session", "/sessions", "/chat-search", "/summary", "/export", "/document",
     "/image", "/image-prompt", "/video-prompt", "/characters", "/memories", "/remember", "/recall", "/forget",
     "/task-add", "/tasks", "/task-done", "/task-open", "/task-delete", "/knowledge", "/knowledge-search",
     "/ask-knowledge", "/search", "/web", "/good", "/bad",
@@ -1808,6 +1808,10 @@ def _handler_factory(state: WebAppState):
                     self._json(HTTPStatus.OK, state.core.storage.message_page(sid, int(query["before"][0])))
                 except (KeyError, ValueError):
                     self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid history cursor"})
+                return
+            if route == "/api/chat-search":   # 옆 목록 '대화 검색' 이 메시지 본문까지(2026-10-26) — 내 대화만
+                text = (query.get("q", [""])[0] or "").strip()[:200]
+                self._json(HTTPStatus.OK, {"results": state.core.storage.search_messages(text, owner=viewer.id) if text else []})
                 return
             if route == "/api/state":
                 self._json(HTTPStatus.OK, state.snapshot(viewer, query.get("session_id", [None])[0]))

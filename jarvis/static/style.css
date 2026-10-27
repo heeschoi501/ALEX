@@ -84,6 +84,9 @@ body:not(.member) .member-only{display:none!important}
 .project-item span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .project-item:hover,.project-item.active{background:var(--hover);color:var(--text)}
 .side-empty{font-size:12px;color:var(--muted);padding:4px 10px}
+.hit-item{display:block;width:100%;text-align:left;padding:6px 10px;border-radius:9px;color:var(--text-2);font-size:13px}
+.hit-item:hover{background:var(--hover)}
+.hit-item small{display:block;color:var(--muted);font-size:11.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .account{position:relative;border-top:1px solid var(--line);padding-top:8px;margin-top:6px}
 .account-button{display:flex;align-items:center;gap:10px;width:100%;padding:8px;text-align:left}
 .account-button:hover{background:var(--hover)}

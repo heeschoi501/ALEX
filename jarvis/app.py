@@ -80,6 +80,7 @@ HELP_TEXT = """사용 가능한 명령
   /new                     새 세션 시작
   /sessions                최근 세션 목록
   /use 세션ID               저장된 세션으로 전환
+  /chat-search 검색어       지난 대화 내용에서 찾기(제목이 아니라 메시지 본문, 내 대화만 — /use 세션ID 로 열기)
   /rename 제목              현재 세션에 사람이 읽기 쉬운 제목 지정
   /delete-session ID --yes  세션/대화/route 기록을 로컬 DB에서 삭제
   /export                  현재 세션을 Markdown 으로 로컬 export
@@ -1402,6 +1403,19 @@ def handle_command(core: JarvisCore, session_id: str, text: str) -> tuple[str, b
             f"summary={'Y' if s.has_summary else 'N'}  updated={s.updated_at}"
             for s in sessions
         ]
+        return "\n".join(lines), True, session_id
+
+    if text == "/chat-search" or text.startswith("/chat-search "):  # 지난 대화 찾기(2026-10-26, Hermes Agent session search 참고)
+        query = text.removeprefix("/chat-search").strip()
+        if not query:
+            return "사용법: /chat-search 검색어 — 지난 대화의 메시지 본문에서 찾습니다(내 대화만).", True, session_id
+        found = core.storage.search_messages(query, owner=core.storage.session_owner(session_id) or OWNER)
+        if not found:
+            return f"'{query}' 가 들어간 지난 대화를 찾지 못했습니다.", True, session_id
+        speaker = {"user": "나", "assistant": "ALEX"}
+        lines = [f"'{query}' 가 들어간 지난 대화 {len(found)}곳(많이 맞은 순 — 열기: /use 세션ID):"]
+        lines += [f"- {item['session_id']} {item['title'] or '새 대화'}{' · ' + item['project'] if item['project'] else ''} "
+                  f"({item['created_at'][:10]}, {speaker.get(item['role'], item['role'])}): {item['snippet']}" for item in found]
         return "\n".join(lines), True, session_id
 
     if text == "/memories":

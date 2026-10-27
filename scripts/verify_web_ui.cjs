@@ -75,6 +75,12 @@ async function main() {
     page.once('dialog', dialog => dialog.accept('수동 검증 제목'));
     await page.locator('#title').click();
     await page.waitForFunction(() => document.getElementById('title').textContent === '수동 검증 제목');
+    // 옆 목록 '대화 검색' 은 제목에 없는 메시지 본문도 찾는다(2026-10-26)
+    await page.locator('#session-search').fill('안녕하세요');
+    await page.locator('#session-hits .hit-item').filter({hasText: '수동 검증 제목'}).waitFor();
+    await page.locator('#session-search').fill('');
+    assert(await page.locator('#session-hits').isHidden());
+    log('conversation search finds message text');
     await page.locator('#project-new').click();
     await page.locator('#project-form-name').fill('RTL 검증 프로젝트');
     await page.locator('#project-form-instructions').fill('검증 지침 ALPHA_INSTRUCTION');

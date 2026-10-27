@@ -1550,11 +1550,31 @@ document.addEventListener('keydown', e => {
   if (document.querySelector('.context-panel.open')) setContextPanel(false);
   closeMenu(); closePermissionMenu(); setSidebar(false);
 });
+let chatSearchTimer = 0, chatSearchSeq = 0;
 function filterSessions() {
   const query = $('session-search').value.trim().toLowerCase();
   const rows = [...$('sessions').querySelectorAll('.session-row')];
   for (const row of rows) row.hidden = !!query && !row.textContent.toLowerCase().includes(query);
   for (const label of $('sessions').querySelectorAll('.session-group')) label.hidden = !rows.some(row => row.dataset.group === label.dataset.group && !row.hidden);
+  // 제목뿐 아니라 메시지 본문에서도 찾는다(2026-10-26) — 잠깐 멈춘 뒤 한 번만, 늦게 온 옛 결과는 버린다
+  clearTimeout(chatSearchTimer);
+  const seq = ++chatSearchSeq;
+  if (query.length < 2) { $('session-hits').hidden = true; $('session-hits').replaceChildren(); return; }
+  chatSearchTimer = setTimeout(async () => {
+    let results = [];
+    try { results = (await api('/api/chat-search?q=' + encodeURIComponent(query))).results || []; } catch { return; }
+    if (seq !== chatSearchSeq) return;
+    const hits = $('session-hits');
+    hits.replaceChildren(node('div', 'session-group', results.length ? '내용에서 찾음' : '내용에서 찾은 대화 없음'));
+    for (const item of results) {
+      const b = node('button', 'hit-item', item.title || '새 대화');
+      b.type = 'button';
+      b.append(node('small', '', `${item.created_at.slice(0, 10)} · ${item.snippet}`));
+      b.addEventListener('click', () => openSession(item.session_id));
+      hits.append(b);
+    }
+    hits.hidden = false;
+  }, 250);
 }
 $('session-search').addEventListener('input', filterSessions);
 $('workspace-change').addEventListener('click', () => { if (anyWork()) { notice('모든 대화의 요청이 끝난 뒤 프로젝트 폴더를 바꾸세요.'); return; } $('workspace-path').value = state.project_root; $('workspace-error').textContent = ''; $('workspace-dialog').showModal(); });
