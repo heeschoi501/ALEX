@@ -21,6 +21,8 @@ import sqlite3
 import subprocess
 import tempfile
 from xml.etree import ElementTree
+
+from .threats import clean, scan, warning
 import zipfile
 
 from .knowledge_terms import TERM_GROUPS
@@ -713,7 +715,8 @@ def knowledge_context(passages: list[Passage], budget: int) -> tuple[str, list[P
 
 def passage_block(passage: Passage) -> str:
     """문맥에 넣는 한 조각 — 번호·출처 머리와 본문 전체. 출처 확인(K05)도 이 문자열이 통째로 남았는지로 본다."""
-    return f"\n[{passage.label}] {passage.source()}\n{passage.text}\n"
+    # 저장한 문서 속 숨긴 지시(2026-10-26, jarvis/threats.py) — 자료는 사용자 것이라 빼지 않고 그 조각 앞에 경고를 붙인다.
+    return f"\n[{passage.label}] {passage.source()}\n{warning(scan(passage.text))}{clean(passage.text)}\n"
 
 
 def supplied_passages(passages: list[Passage], supplied: str) -> list[Passage]:

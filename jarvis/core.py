@@ -73,6 +73,7 @@ from .build_loop import BuildResult, BuildWorkspace, answer_text, is_build_follo
 from .code_check import MAX_REPAIRS, check_code, extract_python, footer, repair_request
 from .diagnostics import collect_diagnostic_context
 from .insights import InsightStore, prompt_block
+from .threats import scan
 from .webread import Page, WebError, WebReader
 from .research import (REASON as RESEARCH_REASON, AUTO_REASON as AUTO_RESEARCH_REASON, USAGE as RESEARCH_USAGE,
                        Researcher, ResearchRequested, automatic_allowed, automatic_request, web_disabled, deep_disabled,
@@ -3529,7 +3530,11 @@ class JarvisCore:
         except StorageError as exc:
             self.logger.warning("승인 경험을 읽지 못했습니다: %s", exc)
             return []
-        lessons = select_lessons(query, pool, self.lesson_context_limit)
+        # 교훈은 '따를 방식' 으로 붙는다 — 지시 모양이 섞인 것(웹에서 찾은 것 등)은 아예 빼고 기록한다(2026-10-26, jarvis/threats.py).
+        unsafe = {e.id for e in pool if scan(" ".join((e.situation, e.judgment, e.correction or "", e.outcome or "")))}
+        if unsafe:
+            self.logger.warning("lessons skipped (injection-like text): %s", ",".join(sorted(i[:8] for i in unsafe)))
+        lessons = select_lessons(query, [e for e in pool if e.id not in unsafe], self.lesson_context_limit)
         self.last_lessons = [lesson.id for lesson in lessons]
         if lessons:
             self.logger.info("lessons used: %s", ",".join(i[:8] for i in self.last_lessons))

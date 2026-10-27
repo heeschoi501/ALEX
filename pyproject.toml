@@ -18,5 +18,5 @@ jarvis-desktop = "jarvis.launcher:main"
 include = ["jarvis*"]
 
 [tool.setuptools.package-data]
-jarvis = ["static/*.html", "static/*.css", "static/*.js", "static/*.webmanifest", "static/*.png"]
+jarvis = ["static/*.html", "static/*.css", "static/*.js", "static/*.webmanifest", "static/*.png", "HERMES_LICENSE.txt"]
 "jarvis.harness" = ["OPENCODE_LICENSE.txt"]
