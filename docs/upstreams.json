@@ -15,7 +15,7 @@
       "repo": "https://github.com/anomalyco/opencode",
       "ref": "v1.19.4",
       "track": "tag:v1.",
-      "track_note": "기본 가지(dev)는 다음 판을 개발 중이라 파일 자리가 바뀌었다(packages/core/…, 2026-10-27). 배포판인 v1.x 꼬리표를 따라간다. 다음 큰 판이 배포되면 이 목록의 원본 파일 자리를 새로 맞춘다.",
+      "track_note": "OpenCode 는 두 줄기를 함께 낸다 — v1.x(유지보수, v1.19.4 2026-10-22)와 v2.x(v2.0.0 2026-09-11 ~ v2.2.0 2026-10-27, 기본 가지 dev). 하네스는 v1.18.34 에서 옮겼으므로 v1.x 꼬리표를 따라간다. v2 에서는 흡수한 원본 파일 45개의 자리가 모두 바뀌었다(도구는 packages/core/src/tool/plugin/*.ts, 대화 반복은 packages/core/src/session/prompt.ts 등). v1 유지보수가 멈추거나 v2 에만 필요한 고침이 나오면 이 목록의 원본 파일 자리를 v2 로 새로 맞춘다 — 그 시점은 사람이 정한다(2026-10-27 기준 보류).",
       "commit": "148842ef7cb1bc34192b3fff57d0f9721ab9c801",
       "ported_from": "v1.18.34 (aec0b9a6d8898f68f923aaf08b7306d931fd9d76) — 하네스를 옮긴 판",
       "license": "MIT — jarvis/harness/OPENCODE_LICENSE.txt",
@@ -81,12 +81,17 @@
       "name": "hermes-agent",
       "kind": "git",
       "repo": "https://github.com/NousResearch/hermes-agent",
-      "ref": "085f562af53a6fedadac3681e2c498fc71316132",
-      "commit": "085f562af53a6fedadac3681e2c498fc71316132",
+      "ref": "69f73ec5f11f5a945cc864f29c4e2ad2307eaec3",
+      "commit": "69f73ec5f11f5a945cc864f29c4e2ad2307eaec3",
+      "ported_from": "085f562af53a6fedadac3681e2c498fc71316132 — 처음 옮긴 판(ADR-119·120·122)",
       "license": "MIT — jarvis/HERMES_LICENSE.txt",
       "checked": "2026-10-27",
       "releases_url": "https://github.com/NousResearch/hermes-agent/releases",
       "security_url": "https://github.com/NousResearch/hermes-agent/security/advisories",
+      "history": [
+        {"date": "2026-10-27", "from": "085f562a", "to": "69f73ec5", "changed": [],
+         "decision": "흡수한 8곳(ADR-122 의 background-review·profile-memory·skills-library 포함)의 원본 파일이 모두 그대로라 기준만 옮겼다."}
+      ],
       "parts": [
         {"id": "hermes-threat-patterns", "status": "core", "adr": "ADR-120", "what": "프롬프트 주입·유출 패턴(+ ALEX 한국어 패턴)",
          "alex": ["jarvis/threats.py"], "upstream": ["tools/threat_patterns.py"]},
