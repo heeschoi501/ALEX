@@ -75,6 +75,12 @@ async function main() {
     page.once('dialog', dialog => dialog.accept('수동 검증 제목'));
     await page.locator('#title').click();
     await page.waitForFunction(() => document.getElementById('title').textContent === '수동 검증 제목');
+    // 옆 목록 '대화 검색' 은 제목에 없는 메시지 본문도 찾는다(2026-10-26)
+    await page.locator('#session-search').fill('안녕하세요');
+    await page.locator('#session-hits .hit-item').filter({hasText: '수동 검증 제목'}).waitFor();
+    await page.locator('#session-search').fill('');
+    assert(await page.locator('#session-hits').isHidden());
+    log('conversation search finds message text');
     await page.locator('#project-new').click();
     await page.locator('#project-form-name').fill('RTL 검증 프로젝트');
     await page.locator('#project-form-instructions').fill('검증 지침 ALPHA_INSTRUCTION');
@@ -99,8 +105,30 @@ async function main() {
     log('project create, upload, instructions and retrieval');
     // 새 요청이 실제로 모델에 갈 때까지 기다린다 — 전에는 앞 요청의 기록을 읽어 보내지도 않은 글을 검사할 수 있었다.
     const previousRecord = fs.readFileSync(record, 'utf8');
+    // 새 대화가 만들어진 뒤 그 대화를 불러오는 동안 친 글도 새 대화에 남는다 — 전에는 새 대화의 빈 초안이 덮어
+    // 가끔(이 구간에 칠 때만) 글이 사라졌다. 그 구간을 늦춰 매번 그때 친다.
+    let opened;
+    const opening = new Promise(resolve => { opened = resolve; });
+    const isNewChat = url => url.pathname === '/api/session/new';
+    let newSession = '';
+    const isOpening = url => url.pathname === '/api/state' && newSession && url.searchParams.get('session_id') === newSession;
+    await page.route(isNewChat, async route => {
+      const response = await route.fetch();
+      newSession = (await response.json()).session_id;
+      await route.fulfill({response});
+    });
+    await page.route(isOpening, async route => {
+      opened();
+      await new Promise(resolve => setTimeout(resolve, 300));
+      await route.continue();
+    });
     await page.locator('#new-chat').click();
-    await page.locator('#input').fill('FSM testbench 설명해줘');  // 새 대화가 만들어지는 동안 친 글도 새 대화에 남는다
+    await opening;
+    await page.locator('#input').fill('FSM testbench 설명해줘');
+    await page.waitForFunction(() => document.getElementById('send').disabled === false);
+    await page.unroute(isNewChat);
+    await page.unroute(isOpening);
+    assert.equal(await page.locator('#input').inputValue(), 'FSM testbench 설명해줘', 'text typed while the new chat opens must stay');
     await page.locator('#send').click();
     await page.waitForFunction(() => document.getElementById('send').disabled === false);
     for (let i = 0; i < 100 && fs.readFileSync(record, 'utf8') === previousRecord; i++) await new Promise(r => setTimeout(r, 100));

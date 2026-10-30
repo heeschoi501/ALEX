@@ -358,6 +358,8 @@ class FreeModelWorkerTests(unittest.TestCase):
             (project / "jarvis" / "a.py").write_text("a = 0\n", encoding="utf-8")
             (project / "jarvis.local.json").write_text('{"secret": 1}', encoding="utf-8")
             (project / ".env").write_text("TOKEN=x", encoding="utf-8")
+            (project / "id_rsa").write_text("KEY", encoding="utf-8")
+            (project / "credentials.json").write_text("{}", encoding="utf-8")
             script = root / "fake.py"
             script.write_text("import json, sys\nfrom pathlib import Path\n"
                               "Path('seen.json').write_text(json.dumps({'args': sys.argv[1:], "
@@ -375,8 +377,93 @@ class FreeModelWorkerTests(unittest.TestCase):
             self.assertEqual(seen["args"][:3], ["run", "--model", "opencode/big-pickle"])
             self.assertNotIn("jarvis.local.json", " ".join(seen["files"]))
             self.assertNotIn(".env", " ".join(seen["files"]))
+            self.assertNotIn("id_rsa", " ".join(seen["files"]))   # 2026-10-26: 키·인증 파일도 빼고 보낸다
+            self.assertNotIn("credentials.json", " ".join(seen["files"]))
             self.assertEqual(run.deleted, [])  # 빼고 보낸 개인 파일이 '삭제'로 돌아오지 않는다
             self.assertTrue((project / "jarvis.local.json").exists())
+
+    def test_free_model_withholds_secret_contents_and_ignores_writes_to_those_paths(self):
+        # 2026-10-26: 내용에 비밀값 모양이 보이는 파일도 보내지 않고, 그 자리에 쓴 파일은 수정안에 넣지 않는다.
+        import tempfile as _tempfile
+        with _tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            project = root / "project"
+            (project / "jarvis").mkdir(parents=True)
+            (project / "jarvis" / "a.py").write_text("a = 0\n", encoding="utf-8")
+            (project / "jarvis" / "keys.py").write_text('TOKEN = "ghp_abcdefghijklmnopqrstuvwx"\n', encoding="utf-8")
+            script = root / "fake.py"
+            script.write_text("from pathlib import Path\n"
+                              "seen = Path('jarvis/keys.py').exists()\n"
+                              "Path('jarvis/keys.py').write_text('TOKEN = None\\n', encoding='utf-8')\n"
+                              "Path('jarvis/a.py').write_text('a = 1\\n', encoding='utf-8')\n"
+                              "Path('seen.txt').write_text(str(seen), encoding='utf-8')\n", encoding="utf-8")
+            run = OpenCodeWorker(root, "opencode/big-pickle", command=[sys.executable, str(script)]).run(project, "고쳐")
+            self.assertEqual(run.created.get("seen.txt"), "False")
+            self.assertEqual(run.withheld, ["jarvis/keys.py"])
+            self.assertEqual(run.changed, {"jarvis/a.py": "a = 1\n"})
+            self.assertNotIn("jarvis/keys.py", run.created)
+
+    def test_free_worker_excludes_links_and_private_folders_and_rejects_their_replacements(self):
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            project = root / "project"
+            project.mkdir()
+            (root / "outside").mkdir()
+            (root / "outside" / "note.txt").write_text("private", encoding="utf-8")
+            for rel in ("data/alex.db", "logs/run.log", "credentials.d/key.txt"):
+                path = project / rel
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("private", encoding="utf-8")
+            try:
+                (project / "linked.txt").symlink_to(root / "outside" / "note.txt")
+                (project / "linked-dir").symlink_to(root / "outside", target_is_directory=True)
+            except OSError as exc:
+                self.skipTest(f"symlinks unavailable: {exc}")
+            script = root / "fake.py"
+            script.write_text("import json\nfrom pathlib import Path\n"
+                              "Path('seen.json').write_text(json.dumps(sorted(p.as_posix() for p in Path('.').rglob('*'))))\n"
+                              "Path('linked.txt').write_text('replacement')\n"
+                              "Path('linked-dir').mkdir(exist_ok=True)\n"
+                              "Path('linked-dir/new.txt').write_text('replacement')\n"
+                              "Path('.env').write_text('replacement')\n"
+                              "Path('normal.py').write_text('ok = True\\n')\n", encoding="utf-8")
+            run = OpenCodeWorker(root, "opencode/big-pickle", command=[sys.executable, str(script)]).run(project, "고쳐")
+            seen = json.loads(run.created["seen.json"])
+            self.assertFalse(set(seen) & {"linked.txt", "linked-dir", "data", "logs", "credentials.d"})
+            self.assertEqual(set(run.created), {"normal.py", "seen.json"})
+            self.assertEqual((root / "outside" / "note.txt").read_text(), "private")
+
+    def test_a_link_created_by_the_worker_is_not_read_back(self):
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            project = root / "project"
+            project.mkdir()
+            outside = root / "outside.txt"
+            outside.write_text("private", encoding="utf-8")
+            try:
+                (project / "probe").symlink_to(outside)
+                (project / "probe").unlink()
+            except OSError as exc:
+                self.skipTest(f"symlinks unavailable: {exc}")
+            script = root / "fake.py"
+            script.write_text("from pathlib import Path\n"
+                              f"Path('leak.txt').symlink_to({str(outside)!r})\n", encoding="utf-8")
+            run = OpenCodeWorker(root, "opencode/big-pickle", command=[sys.executable, str(script)]).run(project, "고쳐")
+            self.assertNotIn("leak.txt", run.created)
+
+    def test_free_worker_environment_keeps_network_setup_but_drops_ambient_secrets(self):
+        worker = OpenCodeWorker(Path("tools"), "opencode/big-pickle")
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-secret", "AWS_SECRET_ACCESS_KEY": "test-secret",
+                                     "PYTHONPATH": "/private/imports", "OPENCODE_CONFIG_CONTENT": "private",
+                                     "HTTPS_PROXY": "http://proxy:8080", "NODE_EXTRA_CA_CERTS": "/trust/ca.pem"}):
+            env = worker.environment(Path("config.json"), Path("data"))
+            local = OpenCodeWorker(Path("tools"), "local").environment(Path("config.json"), Path("data"))
+        for name in ("OPENAI_API_KEY", "AWS_SECRET_ACCESS_KEY", "PYTHONPATH", "OPENCODE_CONFIG_CONTENT"):
+            self.assertFalse(name in env, name)  # never dump inherited environment values on failure
+        self.assertEqual(env["HTTPS_PROXY"], "http://proxy:8080")
+        self.assertEqual(env["NODE_EXTRA_CA_CERTS"], "/trust/ca.pem")
+        self.assertEqual(local["OPENAI_API_KEY"], "test-secret")
+
 
 if __name__ == "__main__":
     unittest.main()

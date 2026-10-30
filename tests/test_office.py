@@ -114,6 +114,7 @@ class OfficeWorkflowTests(unittest.TestCase):
 
     def test_other_session_attachment_member_pc_and_path_escape_are_denied(self):
         path = self.pc()
+        original = path.read_bytes()
         other = self.core.storage.create_session('other')
         self.attach('비밀.docx', other)
         self.core.member_mode = True
@@ -124,7 +125,7 @@ class OfficeWorkflowTests(unittest.TestCase):
         outside = self.base / 'outside.docx'
         outside.write_bytes(self.package())
         self.assertIn('승인된 프로젝트', self.say('../outside.docx 고쳐줘', 'auto'))
-        self.assertEqual(path.read_bytes(), self.package())
+        self.assertEqual(path.read_bytes(), original)
 
     def test_persisted_proposal_still_checks_scope_and_read_permission(self):
         record = self.attach()

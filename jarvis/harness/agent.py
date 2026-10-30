@@ -231,6 +231,15 @@ class CodingAgent:
                           f"<{tag}>", text, f"</{tag}>", "</task>"])
 
     # ── 시작·이어 가기
+    def update_skills(self, skills: dict) -> None:
+        """Refresh the catalog between user requests, including resumed child agents."""
+        self.workspace.skills = skills
+        if self.messages:
+            self.messages[0] = Message("system", prompts.system_prompt(
+                self.workspace.root, rules=self.rules, lessons=self.lessons, mode=self.mode, skills=skills))
+        for child in self.subagents.values():
+            child.update_skills(skills)
+
     def start(self) -> None:
         """대화 시작(지시문만) — run() 이 부르고, 첫 요청이 하위 에이전트 명령일 때도 부른다."""
         ws = self.workspace

@@ -38,7 +38,7 @@ import threading
 import time
 from typing import Callable, Iterable
 
-from .opencode_worker import _kill_tree
+from .opencode_worker import SECRET_NAMES, SECRET_SUFFIXES, _kill_tree
 from .providers import GenerationCancelled
 
 AGENTS = ("claude", "codex")
@@ -55,13 +55,11 @@ LIMIT_WORDS = re.compile(r"(?i)usage limit|limit reached|rate.?limit|hit your (?
 
 TOP_SKIP = {"data", "logs", "runtime", "backups", "models", "tools", "node_modules", ".venv", "venv", "env"}
 ANY_SKIP = {"__pycache__", ".git", ".hg", ".svn", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", ".idea",
-            ".vscode", ".opencode", ".claude", ".codex", "node_modules", ".venv", "venv", "edge-profile"}
+            ".vscode", ".opencode", ".claude", ".codex", "node_modules", ".venv", "venv", "edge-profile", "growth"}
 SKIP_SUFFIXES = {".db", ".sqlite", ".sqlite3", ".db-wal", ".db-shm", ".gguf", ".safetensors", ".bin", ".pt", ".pth",
                  ".ckpt", ".onnx", ".zip", ".7z", ".rar", ".tar", ".gz", ".xz", ".mp4", ".mov", ".avi", ".mkv", ".webm",
                  ".wav", ".mp3", ".flac", ".exe", ".dll", ".so", ".dylib", ".pyc",
                  ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".pdf", ".docx", ".xlsx", ".pptx", ".vcd", ".fst"}
-SECRET_NAMES = re.compile(r"(?i)^(\.env(\..*)?|id_rsa.*|id_ed25519.*|auth\.json|credentials.*|secrets?\..*|\.netrc|\.npmrc|\.pypirc)$")
-SECRET_SUFFIXES = {".pem", ".key", ".pfx", ".p12", ".keystore", ".jks"}
 MAX_FILE_BYTES = 2_000_000
 MAX_FILES = 4000
 MAX_TOTAL_BYTES = 80_000_000

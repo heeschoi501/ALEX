@@ -591,18 +591,24 @@ async function newChat(projectId = '') {
   saveComposer();
   const before = $('input').value;
   const version = ++navigationVersion;
+  // '새 대화'를 누른 뒤 열릴 때까지 친 글은 새 대화의 것이다 — 전에는 옛 대화의 초안으로 저장되고 새 입력창은
+  // 비었다(2026-10-26 브라우저 검사). 새 대화를 불러오는 동안 친 글도 새 대화의 빈 초안이 덮었다(2026-10-27).
+  // 옛 대화 초안은 누를 때의 글 그대로 둔다. 초안 되살리기는 input 사건을 내지 않으므로 사람이 친 것만 잡힌다.
+  let typed = null;
+  const keep = () => { typed = $('input').value; };
+  $('input').addEventListener('input', keep);
   navigating = true; updateControls();
   try {
     const r = await api('/api/session/new', projectId ? {project_id: projectId} : {});
     if (version !== navigationVersion) return null;
-    // '새 대화'를 누른 뒤 만들어지는 동안 친 글은 새 대화의 것이다 — 전에는 옛 대화의 초안으로 저장되고 새 입력창은
-    // 비었다(2026-10-26 브라우저 검사). 옛 대화 초안은 누를 때의 글 그대로 둔다.
-    const typed = $('input').value !== before ? $('input').value : null;
     if (typed !== null) $('input').value = before;
     await openSession(r.session_id);
     if (typed !== null && state?.session_id === r.session_id) { $('input').value = typed; fitInput(); }
     return r.session_id;
-  } finally { if (version === navigationVersion) { navigating = false; updateControls(); } }
+  } finally {
+    $('input').removeEventListener('input', keep);
+    if (version === navigationVersion) { navigating = false; updateControls(); }
+  }
 }
 // 대화 목록의 [×] (2026-09-26 사용자: "대화목록 제거 기능도 필요할거 같은데"). /delete-session 명령을 치지 않아도
 // 되게 하고, 확인 창 없이는 보내지 않는다. 보던 대화를 지우면 서버가 새 대화를 만들어 그 ID 를 돌려준다.
@@ -1550,11 +1556,31 @@ document.addEventListener('keydown', e => {
   if (document.querySelector('.context-panel.open')) setContextPanel(false);
   closeMenu(); closePermissionMenu(); setSidebar(false);
 });
+let chatSearchTimer = 0, chatSearchSeq = 0;
 function filterSessions() {
   const query = $('session-search').value.trim().toLowerCase();
   const rows = [...$('sessions').querySelectorAll('.session-row')];
   for (const row of rows) row.hidden = !!query && !row.textContent.toLowerCase().includes(query);
   for (const label of $('sessions').querySelectorAll('.session-group')) label.hidden = !rows.some(row => row.dataset.group === label.dataset.group && !row.hidden);
+  // 제목뿐 아니라 메시지 본문에서도 찾는다(2026-10-26) — 잠깐 멈춘 뒤 한 번만, 늦게 온 옛 결과는 버린다
+  clearTimeout(chatSearchTimer);
+  const seq = ++chatSearchSeq;
+  if (query.length < 2) { $('session-hits').hidden = true; $('session-hits').replaceChildren(); return; }
+  chatSearchTimer = setTimeout(async () => {
+    let results = [];
+    try { results = (await api('/api/chat-search?q=' + encodeURIComponent(query))).results || []; } catch { return; }
+    if (seq !== chatSearchSeq) return;
+    const hits = $('session-hits');
+    hits.replaceChildren(node('div', 'session-group', results.length ? '내용에서 찾음' : '내용에서 찾은 대화 없음'));
+    for (const item of results) {
+      const b = node('button', 'hit-item', item.title || '새 대화');
+      b.type = 'button';
+      b.append(node('small', '', `${item.created_at.slice(0, 10)} · ${item.snippet}`));
+      b.addEventListener('click', () => openSession(item.session_id));
+      hits.append(b);
+    }
+    hits.hidden = false;
+  }, 250);
 }
 $('session-search').addEventListener('input', filterSessions);
 $('workspace-change').addEventListener('click', () => { if (anyWork()) { notice('모든 대화의 요청이 끝난 뒤 프로젝트 폴더를 바꾸세요.'); return; } $('workspace-path').value = state.project_root; $('workspace-error').textContent = ''; $('workspace-dialog').showModal(); });

@@ -80,6 +80,7 @@ HELP_TEXT = """사용 가능한 명령
   /new                     새 세션 시작
   /sessions                최근 세션 목록
   /use 세션ID               저장된 세션으로 전환
+  /chat-search 검색어       지난 대화 내용에서 찾기(제목이 아니라 메시지 본문, 내 대화만 — /use 세션ID 로 열기)
   /rename 제목              현재 세션에 사람이 읽기 쉬운 제목 지정
   /delete-session ID --yes  세션/대화/route 기록을 로컬 DB에서 삭제
   /export                  현재 세션을 Markdown 으로 로컬 export
@@ -107,6 +108,8 @@ HELP_TEXT = """사용 가능한 명령
   /bad [이유]              직전 답변을 나쁜 예로 기록 (학습 후보)
   /experiences             경험 저장소 현황 (단계/분할별 건수)
   /growth                  성장 루프 현황 (경험 → 사람 검토 → 교훈·학습 후보)
+                           review·pending·show/approve/reject 번호: 스킬·프로필 배움 제안과 승인
+                           skills·profile·import 상대경로/SKILL.md·archive/restore 이름: 라이브러리, auto on/off: 쉬는 중 검토
   /review [ID [승인|거절]]   경험을 읽고 승인/거절 (승인한 train 경험은 비슷한 질문에서 교훈으로 쓰임)
   /undo-learning ID         자동으로 배운 항목을 취소 (화면 버튼도 사용)
   /gpu                     모델이 GPU/RAM 에 어떻게 나뉘어 있는지 실측 조회
@@ -156,7 +159,7 @@ HELP_TEXT = """사용 가능한 명령
   /dev-outcomes            최근 개발 작업의 결과 기록(시험·수정안·적용·전체 검사) 요약
   /dev-learn               결과 기록에서 코딩 절차 교훈을 뽑는다(로컬 모델, ADR-070)
   /self-check [개수]       스스로 점검: 자기 기능 질문을 스스로 풀고 틀린 것을 교훈으로(기본 5·최대 20, 그래픽카드 80℃ 넘으면 멈춤)
-  /dev-insights [remove N|skill N [이름]] 코딩 절차 교훈 목록 / 지우기 / 골라서 스킬로 (붙이기: coding_insights_enabled)
+  /dev-insights [remove N|archived|restore N|skill N [이름]] 코딩 절차 교훈 목록 / 빼기(보관) / 보관함 / 되살리기 / 골라서 스킬로
   /dev-list                현재 프로젝트의 저장된 개발 작업 목록
   /dev-resume ID           저장된 작업 선택 (자동 실행 없음)
   /dev-status              저장된 개발 작업 상태·검증 이력
@@ -566,7 +569,7 @@ def apply_coding_worker(core, settings: Settings, notes: list[str] | None = None
     elif settings.coding_worker == "harness":  # ALEX 코딩 하네스(ADR-112) — OpenCode 방식을 ALEX 코드로, 모델은 지금 코딩 모델
         from .harness.worker import HarnessWorker
         worker = HarnessWorker(lambda: core.providers.get(_Destination.LOCAL_CODER), timeout=settings.opencode_timeout,
-                               lessons=core.coding_insight_text)  # 절차 교훈(ADR-070, 설정으로 켤 때만)
+                               lessons=core.coding_insight_text, skills=lambda: core.growth_store.skills(OWNER))
         worker.progress = core._progress
         worker.logger = core.logger
         notes.append("Coding worker: ALEX harness (ADR-112)")
@@ -655,6 +658,7 @@ def build_core(
         coding_insights=settings.coding_insights_enabled,
         coding_auto_learn=settings.coding_auto_learn_enabled,
         fact_reminder=settings.fact_reminder_enabled,
+        stable_prompt_prefix=settings.stable_prompt_prefix,
         coding_api_map=settings.coding_api_map_enabled,
         coding_num_ctx=settings.coding_num_ctx,
         coding_num_gpu=settings.coding_num_gpu_layers,
@@ -1403,6 +1407,19 @@ def handle_command(core: JarvisCore, session_id: str, text: str) -> tuple[str, b
         ]
         return "\n".join(lines), True, session_id
 
+    if text == "/chat-search" or text.startswith("/chat-search "):  # 지난 대화 찾기(2026-10-26, Hermes Agent session search 참고)
+        query = text.removeprefix("/chat-search").strip()
+        if not query:
+            return "사용법: /chat-search 검색어 — 지난 대화의 메시지 본문에서 찾습니다(내 대화만).", True, session_id
+        found = core.storage.search_messages(query, owner=core.storage.session_owner(session_id) or OWNER)
+        if not found:
+            return f"'{query}' 가 들어간 지난 대화를 찾지 못했습니다.", True, session_id
+        speaker = {"user": "나", "assistant": "ALEX"}
+        lines = [f"'{query}' 가 들어간 지난 대화 {len(found)}곳(많이 맞은 순 — 열기: /use 세션ID):"]
+        lines += [f"- {item['session_id']} {item['title'] or '새 대화'}{' · ' + item['project'] if item['project'] else ''} "
+                  f"({item['created_at'][:10]}, {speaker.get(item['role'], item['role'])}): {item['snippet']}" for item in found]
+        return "\n".join(lines), True, session_id
+
     if text == "/memories":
         memories = core.storage.list_memories(owner=core.storage.session_owner(session_id) or OWNER)
         if not memories:
@@ -1709,6 +1726,12 @@ def handle_command(core: JarvisCore, session_id: str, text: str) -> tuple[str, b
 
     if text == "/growth":
         return growth_report(core), True, session_id
+    if text.startswith("/growth "):
+        from .growth import command, GrowthError
+        try:
+            return command(core, session_id, text.removeprefix("/growth ")), True, session_id
+        except (GrowthError, OSError, ValueError) as exc:
+            return f"배움 제안 처리 실패: {exc}", True, session_id
 
     if text == "/review" or text.startswith("/review "):
         return review_command(core, text.removeprefix("/review").strip()), True, session_id

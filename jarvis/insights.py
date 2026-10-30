@@ -86,18 +86,31 @@ class InsightStore:
             return "insights 가 목록이 아님"
         if "learned" in data and not (isinstance(data["learned"], list) and all(isinstance(k, str) for k in data["learned"])):
             return "learned 가 문자열 목록이 아님"
+        if "archived" in data and not isinstance(data["archived"], list):
+            return "archived 가 목록이 아님"
         self.load()
         return f"형식이 틀린 교훈 {self.skipped}개" if self.skipped else ""
 
-    def save(self, insights: list[Insight], learned: list[str] | None = None) -> None:
+    def archived(self) -> list[dict]:
+        """목록에서 빠진 교훈(점수 0·사람이 지움) — 지우지 않고 남겨 되살릴 수 있다(2026-10-26, Hermes Agent curator: 지우지 말고 보관)."""
+        items = self._read()[0].get("archived")
+        return [i for i in items if isinstance(i, dict) and _valid_insight(i)] if isinstance(items, list) else []
+
+    def save(self, insights: list[Insight], learned: list[str] | None = None, reason: str = "점수 0",
+             archive: list[dict] | None = None) -> None:
         keys = self.learned() if learned is None else learned
+        kept_ids = {i.id for i in insights}
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        archive = (self.archived() if archive is None else archive) + [{**asdict(i), "archived_at": now, "reason": reason}
+                                     for i in self.load() if i.id not in kept_ids]
         if self.path.exists() and self.problem():  # 항목을 잃는 저장 전에 원본 바이트를 옆에 남긴다 — 사람이 확인할 수 있게
             stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
             shutil.copy2(self.path, self.path.with_name(f"{self.path.name}.damaged-{stamp}"))
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix(".tmp")
-        temporary.write_text(json.dumps({"insights": [asdict(i) for i in insights], "learned": keys[-500:]},
-                                        ensure_ascii=False, indent=1), encoding="utf-8")
+        # 보관함은 자르지 않는다 — Hermes curator 의 "지우지 않고 보관만" 과 같게(전에는 200개를 넘으면 오래된 것부터 버렸다).
+        temporary.write_text(json.dumps({"insights": [asdict(i) for i in insights], "learned": keys[-500:],
+                                         "archived": archive}, ensure_ascii=False, indent=1), encoding="utf-8")
         temporary.replace(self.path)
 
     def remove(self, insight_id: int) -> bool:
@@ -105,8 +118,22 @@ class InsightStore:
         kept = [i for i in insights if i.id != insight_id]
         if len(kept) == len(insights):
             return False
-        self.save(kept)
+        self.save(kept, reason="사람이 지움")
         return True
+
+    def restore(self, insight_id: int) -> Insight | None:
+        """보관한 교훈을 목록으로 되살린다(점수 1, 번호가 겹치면 새 번호). 목록이 찼으면 None."""
+        insights, archive = self.load(), self.archived()
+        found = next((a for a in reversed(archive) if a.get("id") == insight_id), None)
+        if found is None or len(insights) >= MAX_INSIGHTS:
+            return None
+        used = {i.id for i in insights}
+        item = _valid_insight({**found, "count": 1})
+        if item.id in used:
+            item.id = max(used) + 1
+        archive.remove(found)
+        self.save(insights + [item], archive=archive)
+        return item
 
 
 def _valid_insight(item: object) -> Insight | None:
@@ -134,11 +161,33 @@ def apply_operations(insights: list[Insight], text: str, source: str) -> tuple[l
 def learning_consumed(applied: list[str], skipped: list[str]) -> bool:
     """이 출력으로 기록을 '썼다' 고 표시해도 되나(Codex 2차 R2-04). 하나라도 적용됐거나, 건너뛴 것이 모두 '이미 있는 교훈' 이면
     의도된 무변경이다. 내용 없는 ADD, 없는 번호, 목록이 찬 경우만 있으면 해석 실패로 보고 다음에 다시 쓴다."""
-    return bool(applied) or (bool(skipped) and all(reason == "duplicate" for reason in skipped))
+    # 'environment'·'negative_claim'(교훈이 아닌 것)도 모델이 낸 연산을 읽고 거른 것이라 다시 쓰지 않는다 — 다시 써도 같은 결과다.
+    return bool(applied) or (bool(skipped) and all(reason in ("duplicate", "environment", "negative_claim") for reason in skipped))
+
+
+# 교훈이 아닌 것(2026-10-26, Hermes Agent background_review 의 'Do NOT capture' 를 옮김 — MIT): 환경 탓 실패와 '이 도구는 안 된다'
+# 같은 부정 주장은 환경이 고쳐진 뒤에도 남아 스스로를 막는 규칙이 된다(ALEX 의 '인터넷이 막혀 있다' 오답, PERFORMANCE 29·ADR-071).
+# 지시문(EXTRACTION_RULES)에도 적지만 모델이 어겨도 들이지 않게 코드로 한 번 더 거른다.
+_ENVIRONMENT = re.compile(
+    r"설치(?:되지|가 안| 안 )|미설치|not installed|command not found|no module named|modulenotfounderror|"
+    r"permission denied|권한이 없|인증(?:이)? ?실패|로그인(?:이)? 필요|api ?키(?:가)? 없|path 에 없", re.I)
+_NEGATIVE_CLAIM = re.compile(
+    r"(?:도구|툴|tool|명령|인터넷|웹|검색|브라우저|네트워크|bash|셸|shell|unittest|ruff|yosys|opencode)[^.\n]{0,30}"
+    r"(?:안 ?된다|안 ?됨|작동하지 않|동작하지 않|쓸 수 없|사용할 수 없|못 쓴|막혀|고장|does not work|doesn't work|not work|"
+    r"broken|unavailable|cannot be used)", re.I)
+
+
+def not_a_lesson(text: str) -> str:
+    """교훈으로 들이지 않을 이유(environment·negative_claim), 괜찮으면 빈 문자열."""
+    if _ENVIRONMENT.search(text):
+        return "environment"
+    if _NEGATIVE_CLAIM.search(text):
+        return "negative_claim"
+    return ""
 
 
 def apply_operations_detailed(insights: list[Insight], text: str, source: str) -> tuple[list[Insight], list[str], list[str]]:
-    """apply_operations 와 같고, 건너뛴 연산의 이유(duplicate·empty·unknown_id·full)도 돌려준다."""
+    """apply_operations 와 같고, 건너뛴 연산의 이유(duplicate·empty·unknown_id·full·environment·negative_claim)도 돌려준다."""
     skipped: list[str] = []
     by_id = {i.id: i for i in insights}
     next_id = max(by_id, default=0) + 1
@@ -150,6 +199,9 @@ def apply_operations_detailed(insights: list[Insight], text: str, source: str) -
             continue
         operation, number, body = match.group(1).upper(), match.group(2), " ".join(match.group(3).split())
         body = body[:MAX_INSIGHT_CHARS]
+        if operation in ("ADD", "EDIT") and body and (reason := not_a_lesson(body)):
+            skipped.append(reason)
+            continue
         if operation == "ADD":
             if not body:
                 skipped.append("empty")
@@ -238,6 +290,11 @@ EXTRACTION_RULES = (
     "ADD: 새 교훈\nEDIT 번호: 고친 교훈\nUPVOTE 번호\nDOWNVOTE 번호\n"
     f"기존 교훈이 기록과 맞으면 UPVOTE, 틀리거나 해로우면 DOWNVOTE, 겹치면 새로 ADD 하지 말고 EDIT 한다. 목록은 최대 {MAX_INSIGHTS}개다.\n"
     "'사후 확인' 이 전체 검사 FAIL 이면 그 수정을 성공으로 배우지 않는다. 원인이 그 수정인지 환경·간헐 실패인지는 기록만으로 단정하지 않는다.\n"
+    "교훈으로 쓰지 않는 것(환경이 바뀐 뒤에도 남아 스스로를 막는다):\n"
+    "- 환경 탓 실패: 설치 안 된 프로그램·모듈, 'command not found', 권한·인증·경로 문제. 사람이 고칠 수 있는 것이지 규칙이 아니다.\n"
+    "- '이 도구·명령은 안 된다' 같은 부정 주장. 고쳐진 뒤에도 거절의 근거로 남는다.\n"
+    "- 끝내 통과하지 못한 시도를 '권장 방법' 으로 적는 것. 통과한 방법이 없으면 ADD 하지 않는다.\n"
+    "- 한 번 다시 시도해서 풀린 일시 오류. 배울 것은 원래 실패가 아니라 다시 시도한 방법이다.\n"
 )
 
 

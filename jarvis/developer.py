@@ -28,7 +28,7 @@ from typing import Callable
 from .storage import Storage
 from .tools import ToolError
 from .excerpt import excerpt
-from .insights import (EXTRACTION_RULES, REVISIT_NOTE, InsightStore, after_evidence, apply_operations_detailed,
+from .insights import (EXTRACTION_RULES, MAX_INSIGHTS, REVISIT_NOTE, InsightStore, after_evidence, apply_operations_detailed,
                        extraction_prompt, learning_consumed, learning_key, trajectory_text, unlearned)
 from .providers import GenerationCancelled, Message
 from .workspace import MAX_BUNDLE_FILES, SafeWorkspaceEditor
@@ -1565,9 +1565,21 @@ class DeveloperMode:
             parts = argument.split()
             if len(parts) >= 2 and parts[0] == "skill" and parts[1].isdigit() and len(parts) <= 3:
                 return self._insight_skill(store, int(parts[1]), parts[2] if len(parts) == 3 else "")
-            if len(parts) != 2 or parts[0] != "remove" or not parts[1].isdigit():
-                raise ToolError("사용법: /dev-insights  ·  /dev-insights remove 번호  ·  /dev-insights skill 번호 [이름]")
-            return "지웠습니다." if store.remove(int(parts[1])) else "그 번호의 교훈이 없습니다."
+            if parts == ["archived"]:
+                archived = store.archived()
+                if not archived:
+                    return "보관한 교훈이 없습니다(점수가 0 이 되거나 지운 교훈이 여기 남습니다)."
+                return (f"보관한 교훈 {len(archived)}개(되살리기: /dev-insights restore 번호):\n"
+                        + "\n".join(f"{a['id']}. [{a.get('reason', '')} {str(a.get('archived_at', ''))[:10]}] {a['text']}"
+                                     for a in archived[-20:]))
+            if len(parts) != 2 or parts[0] not in ("remove", "restore") or not parts[1].isdigit():
+                raise ToolError("사용법: /dev-insights  ·  remove 번호  ·  archived  ·  restore 번호  ·  skill 번호 [이름]")
+            if parts[0] == "restore":
+                item = store.restore(int(parts[1]))
+                return (f"되살렸습니다: {item.id}. {item.text}" if item else
+                        f"보관한 교훈에 그 번호가 없거나 목록이 찼습니다(최대 {MAX_INSIGHTS}개).")
+            return ("목록에서 뺐습니다(보관함에 남음 — /dev-insights archived)." if store.remove(int(parts[1]))
+                    else "그 번호의 교훈이 없습니다.")
         items = store.load()
         enabled = bool(getattr(self.core, "coding_insights", False))
         if not items:

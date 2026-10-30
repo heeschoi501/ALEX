@@ -69,6 +69,7 @@ class Message:
     tool_calls: list | None = None
     tool_name: str = ""
     images: tuple[str, ...] = ()  # Local-only data URLs; binary data is never stored in chat history.
+    local_only: bool = False  # Approved private context; retain through trimming and exclude before cloud fallback.
 
 
 class BaseLLMProvider(ABC):

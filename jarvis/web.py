@@ -82,7 +82,7 @@ ARTIFACT_RE = re.compile(r"\]\(alex-(?:image|video|document|download):([A-Za-z0-
 MAX_CHAT_DOCUMENTS = 5  # 한 번에 첨부하는 문서 수(ADR-096)
 # 관리자가 아닌 사용자가 쓸 수 있는 명령. 이 PC 의 파일·설정·학습·개발 도구에 손대는 명령은 뺀다.
 MEMBER_COMMANDS = frozenset({
-    "/help", "/new", "/use", "/rename", "/delete-session", "/sessions", "/summary", "/export", "/document",
+    "/help", "/new", "/use", "/rename", "/delete-session", "/sessions", "/chat-search", "/summary", "/export", "/document",
     "/image", "/image-prompt", "/video-prompt", "/characters", "/memories", "/remember", "/recall", "/forget",
     "/task-add", "/tasks", "/task-done", "/task-open", "/task-delete", "/knowledge", "/knowledge-search",
     "/ask-knowledge", "/search", "/web", "/good", "/bad",
@@ -585,7 +585,8 @@ class WebAppState:
                                  mcp=hub, timeout=getattr(self.settings, 'opencode_timeout', 900), logger=logger,
                                  lessons=getattr(self.core, "coding_insight_text", None),  # 절차 교훈(ADR-070, 켤 때만)
                                  outcome=self._record_code_outcome,
-                                 opencode_home=Path(self.settings.opencode_dir) if getattr(self.settings, "opencode_dir", "") else None)
+                                 opencode_home=Path(self.settings.opencode_dir) if getattr(self.settings, "opencode_dir", "") else None,
+                                 library_skills=getattr(getattr(self.core, "growth_store", None), "skills", None))
         if self.settings is not None:  # 실제 앱에서만(시험의 상태 객체는 빼고) — 쉬는 중 자동 학습
             threading.Thread(target=self._auto_learn_loop, daemon=True, name="alex-auto-learn").start()
 
@@ -600,10 +601,62 @@ class WebAppState:
     def _auto_learn_loop(self) -> None:
         while not self.shutting_down:
             time.sleep(AUTO_LEARN_EVERY)
-            try:
-                self.maybe_auto_learn()
-            except Exception:  # noqa: BLE001 — 다음 차례에 다시
-                self.core.logger.exception("auto learn failed")
+            for check in (self.maybe_growth_review, self.maybe_auto_learn):
+                try:
+                    check()
+                except Exception:  # noqa: BLE001 — 다음 차례에 다시
+                    self.core.logger.exception("background review failed")
+
+    def maybe_growth_review(self) -> str:
+        """Opt-in owner-only review: idle queue, fresh turns, temperature guard, proposals only."""
+        if self.shutting_down or self.core.storage.get_state("growth.auto.owner") != "1":
+            return ""
+        with self.queue_cv:
+            if self.queue or self.running is not None or self.active_id is not None:
+                return ""
+        if sum(r["status"] == "pending" for r in self.core.growth_store.proposals(OWNER)) >= 18:
+            return ""
+        chosen = None
+        for session in self.core.storage.list_sessions(limit=10, owner=OWNER):
+            previous = int(self.core.storage.get_state(f"growth.review.{session.session_id}") or "0")
+            page = self.core.storage.message_page(session.session_id, after=previous, limit=20)
+            rows = page["messages"]
+            fresh = [m for m in rows if m["role"] == "user" and not m["content"].startswith("/")]
+            continuing = self.core.storage.get_state(f"growth.review.backlog.{session.session_id}") == "1"
+            # Drain a long backlog in bounded batches, including command-only pages.
+            if rows and (len(fresh) >= 3 or page["has_more"] or continuing):
+                chosen = session.session_id, rows, page["has_more"]
+                break
+        if chosen is None:
+            return ""
+        ticket = Ticket(OWNER, session_id=chosen[0], background=True)
+        with self.queue_cv:
+            self.queue.append(ticket)
+            self.queue_cv.notify_all()
+        try:
+            if not self.wait_turn(ticket):
+                return ""
+            with self.ticket_running(ticket, "growth-review", lambda _chunk: None):
+                from .selfcheck import gpu_cool
+                from .growth import GrowthError, review
+                if self.core.hardware.gpu and not gpu_cool():
+                    return ""
+                before = len(self.core.growth_store.proposals(OWNER))
+                try:
+                    reply = review(self.core, chosen[0], rows=chosen[1])
+                except GrowthError as exc:  # 형식이 틀린 답 — 같은 발언을 10분마다 다시 검토하지 않게 표시는 옮긴다
+                    self.core.logger.warning("growth review skipped: %s", exc)
+                    reply = ""
+                self.core.storage.set_state(f"growth.review.{chosen[0]}", str(chosen[1][-1]["id"]))
+                self.core.storage.set_state(f"growth.review.backlog.{chosen[0]}", "1" if chosen[2] else "0")
+                if len(self.core.growth_store.proposals(OWNER)) > before:  # 승인할 것이 생겼을 때만 대화에 알린다
+                    self.core.storage.add_message(chosen[0], "assistant", reply)
+                return reply
+        finally:
+            with self.queue_cv:
+                if ticket in self.queue:
+                    self.queue.remove(ticket)
+                self.queue_cv.notify_all()
 
     def maybe_auto_learn(self) -> str:
         """설정(coding_auto_learn_enabled)이 켜져 있고, 기다리는 요청이 없고, 아직 안 배운 기록이 AUTO_LEARN_MIN 건 이상이면
@@ -1808,6 +1861,10 @@ def _handler_factory(state: WebAppState):
                     self._json(HTTPStatus.OK, state.core.storage.message_page(sid, int(query["before"][0])))
                 except (KeyError, ValueError):
                     self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid history cursor"})
+                return
+            if route == "/api/chat-search":   # 옆 목록 '대화 검색' 이 메시지 본문까지(2026-10-26) — 내 대화만
+                text = (query.get("q", [""])[0] or "").strip()[:200]
+                self._json(HTTPStatus.OK, {"results": state.core.storage.search_messages(text, owner=viewer.id) if text else []})
                 return
             if route == "/api/state":
                 self._json(HTTPStatus.OK, state.snapshot(viewer, query.get("session_id", [None])[0]))

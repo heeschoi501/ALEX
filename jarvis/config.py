@@ -111,6 +111,10 @@ class Settings:
     coding_auto_learn_enabled: bool = False
     # 앞선 답이 있는 대화에서 마지막 질문 바로 앞에 핵심 사실을 한 번 더 준다(ADR-071, Lost in the Middle). 기본 꺼짐 — 실측 뒤 켠다.
     fact_reminder_enabled: bool = False
+    # 프롬프트 캐시를 살리는 순서(2026-10-26, Hermes Agent 의 고정 시스템 프롬프트 참고): 바뀌지 않는 지시 → 대화 기록 → 이번 차례에만
+    # 바뀌는 것(시각·메모·교훈·자료)은 마지막 질문 바로 앞. 모델 서버가 앞서 읽은 대화를 다시 읽지 않게 한다. 기본 꺼짐 — PC 에서
+    # scripts/measure_prompt_cache.py 로 속도·답을 비교한 뒤 켠다.
+    stable_prompt_prefix: bool = False
     # 코딩 수정안 요청에 '이 파일이 쓰는 객체의 API'(시그니처만)를 붙인다(ADR-072, Aider repo map 을 좁힌 것). 기본 꺼짐 — 실측 뒤 켠다.
     coding_api_map_enabled: bool = False
     # 코딩 묶음 수정안(찾기→바꾸기)만 더 긴 문맥으로(ADR-076, docs/CODING_AGENT_SONNET_PLAN_20261003.md 1번). 0 이면 대화와 같다(기본).
@@ -429,7 +433,7 @@ LOCAL_FIELDS = {
     "context_char_budget": int, "force_profile": str, "web_enabled": bool,
     "remote_host": str, "remote_user": str, "remote_local_port": int, "remote_alex_port": int,
     "remote_web_host": str, "remote_web_users": str,
-    "lesson_context_limit": int, "web_tool_enabled": bool, "auto_lessons_enabled": bool, "coding_insights_enabled": bool, "coding_auto_learn_enabled": bool, "fact_reminder_enabled": bool, "coding_api_map_enabled": bool,
+    "lesson_context_limit": int, "web_tool_enabled": bool, "auto_lessons_enabled": bool, "coding_insights_enabled": bool, "coding_auto_learn_enabled": bool, "fact_reminder_enabled": bool, "stable_prompt_prefix": bool, "coding_api_map_enabled": bool,
     "coding_num_ctx": int, "coding_num_gpu_layers": int, "coding_context_char_budget": int, "coding_auto_attempts": int, "coding_regression_check": bool, "coding_diagnostic_context": bool, "coding_build_loop_enabled": bool, "coding_code_check_enabled": bool, "coding_worker": str, "opencode_dir": str, "opencode_model": str, "opencode_context": int, "opencode_timeout": int, "coding_free_model": str,
     "local_backend": str, "strata_host": str, "strata_model": str, "strata_num_ctx": int, "strata_reasoning_effort": str,
     "strata_max_output_tokens": int, "strata_context_char_budget": int, "strata_history_limit": int,
@@ -486,6 +490,7 @@ def load_settings() -> Settings:
         coding_insights_enabled=_env_flag("JARVIS_CODING_INSIGHTS_ENABLED", False),
         coding_auto_learn_enabled=_env_flag("JARVIS_CODING_AUTO_LEARN_ENABLED", False),
         fact_reminder_enabled=_env_flag("JARVIS_FACT_REMINDER_ENABLED", False),
+        stable_prompt_prefix=_env_flag("JARVIS_STABLE_PROMPT_PREFIX", False),
         coding_api_map_enabled=_env_flag("JARVIS_CODING_API_MAP_ENABLED", False),
         coding_num_ctx=_env_int("JARVIS_CODING_NUM_CTX", 0),
         coding_num_gpu_layers=_env_int("JARVIS_CODING_NUM_GPU_LAYERS", 0),

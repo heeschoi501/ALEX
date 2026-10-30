@@ -115,6 +115,7 @@ class SpeechRecognizer:
         self._next_id = 0
         self._last_used = 0.0
         self._watch: threading.Thread | None = None
+        self._reader: threading.Thread | None = None
 
     @property
     def python(self) -> Path:
@@ -131,17 +132,22 @@ class SpeechRecognizer:
     def available(self) -> bool:
         return self.python.is_file() and (self.model / "model.int8.onnx").is_file()
 
-    def _read(self, process: subprocess.Popen) -> None:
-        for line in process.stdout:  # 일꾼이 끝나면 멈춘다
-            self._replies.put(line)
-        self._replies.put(None)
+    @staticmethod
+    def _read(process: subprocess.Popen, replies: queue.Queue) -> None:
+        # 이 일꾼의 큐에만 넣는다 — 다시 띄운 뒤 옛 일꾼의 끝(None)이 새 큐에 들어가 멀쩡한 새 일꾼을 '멈춤'으로 보지 않게.
+        with process.stdout:  # 끝나면 파이프를 닫는다(안 닫으면 ResourceWarning)
+            for line in process.stdout:  # 일꾼이 끝나면 멈춘다
+                replies.put(line)
+        replies.put(None)
 
     def _start(self) -> None:
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         self._replies = queue.Queue()
         self._process = subprocess.Popen(self.command(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                          stderr=subprocess.DEVNULL, text=True, encoding="utf-8", creationflags=flags)
-        threading.Thread(target=self._read, args=(self._process,), daemon=True, name="alex-stt-read").start()
+        self._reader = threading.Thread(target=self._read, args=(self._process, self._replies), daemon=True,
+                                        name="alex-stt-read")
+        self._reader.start()
         ready = self._reply(60)
         if not ready.get("ready"):
             self._stop()
@@ -163,9 +169,21 @@ class SpeechRecognizer:
 
     def _stop(self) -> None:
         process, self._process = self._process, None
-        if process is not None and process.poll() is None:
+        reader, self._reader = self._reader, None
+        if process is None:
+            return
+        try:
+            process.stdin.close()
+        except OSError:  # 이미 끝난 일꾼이면 남은 쓰기가 실패할 수 있다
+            pass
+        if process.poll() is None:
             process.kill()
+        try:
             process.wait(5)
+        except subprocess.TimeoutExpired:
+            pass
+        if reader is not None and reader is not threading.current_thread():
+            reader.join(2)  # 읽는 쪽이 stdout 을 닫는다
 
     def _idle_watch(self) -> None:
         while True:
@@ -191,8 +209,12 @@ class SpeechRecognizer:
             if self._process is None or self._process.poll() is not None:
                 self._start()
             self._next_id += 1
-            self._process.stdin.write(json.dumps({"id": self._next_id, "wav": base64.b64encode(wav).decode()}) + "\n")
-            self._process.stdin.flush()
+            try:
+                self._process.stdin.write(json.dumps({"id": self._next_id, "wav": base64.b64encode(wav).decode()}) + "\n")
+                self._process.stdin.flush()
+            except OSError as exc:  # 보내는 사이에 일꾼이 끝남 — 다음 요청에서 다시 띄운다
+                self._stop()
+                raise LiveError("받아쓰기 도구가 멈췄습니다. 다시 시도해 주세요.") from exc
             reply = self._reply(30)
             self._last_used = time.monotonic()
         if reply.get("error"):

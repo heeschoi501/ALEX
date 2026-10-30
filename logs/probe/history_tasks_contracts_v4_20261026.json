@@ -1,0 +1,362 @@
+[
+ {
+  "id": "hist_claude-backup-20260926-devbundle_app_test_developer",
+  "file": "jarvis/app.py",
+  "test": "tests/test_developer.py",
+  "edits": [
+   [
+    "        if bundle is not None:\n            core.record_edit_experience(_bundle_as_proposal(bundle), \"good\", note=\"사용자가 묶음을 적용함\")\n            DeveloperMode(core).approved(proposal_id)\n            return (f\"묶음 적용 완료 — 파일 {len(targets)}개:\\n\" + \"\\n\".join(f\"  {t}\" for t in targets)\n                    + f\"\\n원본 백업: {backup}\\n통째로 되돌리기: /undo-bundle {proposal_id} --yes\"), True, session_id\n",
+    "        if bundle is not None:\n            core.record_edit_experience(_bundle_as_proposal(bundle), \"good\", note=\"사용자가 묶음을 적용함\")\n            return (f\"묶음 적용 완료 — 파일 {len(targets)}개:\\n\" + \"\\n\".join(f\"  {t}\" for t in targets)\n                    + f\"\\n원본 백업: {backup}\\n통째로 되돌리기: /undo-bundle {proposal_id} --yes\"), True, session_id\n"
+   ]
+  ],
+  "split": "history",
+  "dataset": "history-contracts-v3-20261004",
+  "backup": "claude-backup-20260926-devbundle",
+  "hunks": 1,
+  "changed_lines": 1,
+  "failing": [
+   "AutoLoopTests.test_a_newly_applied_fix_does_not_inherit_the_old_pass",
+   "AutoLoopTests.test_changes_the_tests_do_not_need_are_trimmed_but_notes_stay",
+   "AutoLoopTests.test_every_round_and_the_user_decision_are_recorded_as_one_outcome",
+   "AutoLoopTests.test_the_loop_fixes_a_copy_and_offers_one_final_bundle",
+   "MultiFileDeveloperTests.test_every_acceptance_test_must_pass",
+   "MultiFileDeveloperTests.test_two_files_are_fixed_by_one_approved_bundle"
+  ],
+  "other_failures": []
+ },
+ {
+  "id": "hist_codex-backup-20260925-learning-awareness_app_test_lessons",
+  "file": "jarvis/app.py",
+  "test": "tests/test_lessons.py",
+  "edits": [
+   [
+    "        f\"5. 학습(LoRA) 후보    {len(core.storage.training_pool())}건 · 실행 기록 {core.storage.training_run_count()}건\"\n        f\"(그중 실제 LoRA 학습 {core.storage.lora_trained_run_count()}건)\",\n        \"LoRA 학습은 사람이 scripts/lora.py 로 실행합니다(이 PC 는 작은 4B 모델만 — 본 모델 27B 는 16GB 로 불가). \"\n        \"학습 모델은 ALEX 설정에 자동으로 들어가지 않습니다. 내보내기 기록은 학습 완료 증거가 아닙니다.\",\n",
+    "        f\"5. 학습(LoRA) 후보    {len(core.storage.training_pool())}건 · 학습 실행 {core.storage.training_run_count()}회\",\n"
+   ]
+  ],
+  "split": "history",
+  "dataset": "history-contracts-v3-20261004",
+  "backup": "codex-backup-20260925-learning-awareness",
+  "hunks": 1,
+  "changed_lines": 3,
+  "failing": [
+   "CommandTests.test_export_record_is_not_reported_as_completed_training"
+  ],
+  "other_failures": [],
+  "refreshed": "manual"
+ },
+ {
+  "id": "hist_codex-backup-20260925-summary-perf_web_test_runtime_settings",
+  "file": "jarvis/web.py",
+  "test": "tests/test_runtime_settings.py",
+  "edits": [
+   [
+    "from .app import (auto_apply_proposals, build_core, build_providers, build_summary_provider, engine_context_limits, handle_command,\n",
+    "from .app import (auto_apply_proposals, build_core, build_providers, engine_context_limits, handle_command,\n"
+   ],
+   [
+    "        self.core.providers[Destination.LOCAL_CODER] = coder\n        self.core.local_summarizer = build_summary_provider(general, candidate)\n",
+    "        self.core.providers[Destination.LOCAL_CODER] = coder\n"
+   ]
+  ],
+  "split": "history",
+  "dataset": "history-contracts-v3-20261004",
+  "backup": "codex-backup-20260925-summary-perf",
+  "hunks": 2,
+  "changed_lines": 3,
+  "failing": [
+   "RuntimeSettingsTests.test_model_change_updates_summary_provider_too"
+  ],
+  "other_failures": [],
+  "refreshed": "manual"
+ },
+ {
+  "id": "hist_claude-backup-20260930-gpumodel_config_test_ram_offload",
+  "file": "jarvis/config.py",
+  "test": "tests/test_ram_offload.py,tests/test_config.py",
+  "edits": [
+   [
+    "    # 모델·컨텍스트마다 최적값이 다르므로 **반드시 그 조합에서 재고 넣어라.**\n    num_gpu_layers: int = 0\n    # num_gpu_layers 를 이 모델에만 적용한다(비우면 모든 모델) — 2026-09-30. 층 수 최적값은 모델마다 다르다:\n    # qwen3.8:27b 는 54(PERFORMANCE 29, 자동 41층보다 1.6배), gpt-oss:120b(37층·MoE)에 같은 값을 주면 안 된다.\n    num_gpu_layers_model: str = \"\"\n    ollama_keep_alive: str = \"10m\"\n    single_model_on_laptop: bool = True\n",
+    "    # 모델·컨텍스트마다 최적값이 다르므로 **반드시 그 조합에서 재고 넣어라.**\n    num_gpu_layers: int = 0\n    ollama_keep_alive: str = \"10m\"\n    single_model_on_laptop: bool = True\n"
+   ],
+   [
+    "        ram_offload_budget_gb=_env_float(\"JARVIS_RAM_OFFLOAD_BUDGET_GB\", 0.0),\n        num_gpu_layers=_env_int(\"JARVIS_NUM_GPU_LAYERS\", 0),\n        num_gpu_layers_model=os.getenv(\"JARVIS_NUM_GPU_LAYERS_MODEL\", \"\").strip(),\n        ollama_keep_alive=os.getenv(\"JARVIS_OLLAMA_KEEP_ALIVE\", \"10m\").strip(),\n        single_model_on_laptop=_env_flag(\"JARVIS_SINGLE_MODEL_ON_LAPTOP\", True),\n",
+    "        ram_offload_budget_gb=_env_float(\"JARVIS_RAM_OFFLOAD_BUDGET_GB\", 0.0),\n        num_gpu_layers=_env_int(\"JARVIS_NUM_GPU_LAYERS\", 0),\n        ollama_keep_alive=os.getenv(\"JARVIS_OLLAMA_KEEP_ALIVE\", \"10m\").strip(),\n        single_model_on_laptop=_env_flag(\"JARVIS_SINGLE_MODEL_ON_LAPTOP\", True),\n"
+   ]
+  ],
+  "split": "history",
+  "dataset": "history-contracts-v3-20261004",
+  "backup": "claude-backup-20260930-gpumodel",
+  "hunks": 2,
+  "changed_lines": 4,
+  "failing": [
+   "NumGpuPerModelTests.test_with_a_model_name_only_that_model_gets_them",
+   "NumGpuPerModelTests.test_without_a_model_name_every_model_gets_the_layers"
+  ],
+  "other_failures": [],
+  "contract_note": "Include environment override and local configuration contracts."
+ },
+ {
+  "id": "hist_claude-backup-20260930-outcomes_app_test_developer",
+  "file": "jarvis/app.py",
+  "test": "tests/test_developer.py,tests/test_insights.py",
+  "edits": [
+   [
+    "  /dev-outcomes            최근 개발 작업의 결과 기록(시험·수정안·적용·전체 검사) 요약\n  /dev-learn               결과 기록에서 코딩 절차 교훈을 뽑는다(로컬 모델, ADR-070)\n",
+    ""
+   ],
+   [
+    "  /dev-insights [remove N|skill N [이름]] 코딩 절차 교훈 목록 / 지우기 / 골라서 스킬로 (붙이기: coding_insights_enabled)\n",
+    ""
+   ],
+   [
+    "    if text == \"/dev-outcomes\":\n        return DeveloperMode(core).outcomes(), True, session_id\n\n",
+    ""
+   ],
+   [
+    "    if text == \"/dev-insights\" or text.startswith(\"/dev-insights \") or text == \"/dev-learn\":\n        try:\n            mode = DeveloperMode(core)\n            if text == \"/dev-learn\":\n                return mode.learn(), True, session_id\n            return mode.insights(text.removeprefix(\"/dev-insights\").strip()), True, session_id\n        except ToolError as exc:\n            return str(exc), True, session_id\n\n",
+    ""
+   ]
+  ],
+  "split": "history",
+  "dataset": "history-contracts-v3-20261004",
+  "backup": "claude-backup-20260930-outcomes",
+  "hunks": 2,
+  "changed_lines": 15,
+  "failing": [
+   "AutoLoopTests.test_every_round_and_the_user_decision_are_recorded_as_one_outcome"
+  ],
+  "other_failures": [],
+  "contract_note": "Restore /dev-outcomes, /dev-learn and /dev-insights together; all acceptance modules must pass.",
+  "refreshed": "manual"
+ },
+ {
+  "id": "hist_claude-backup-20261003-wan14b_core_test_imagegen",
+  "file": "jarvis/core.py",
+  "test": "tests/test_imagegen.py",
+  "edits": [
+   [
+    "        \"\"\"자연어 영상 부탁(ADR-075): 영어 프롬프트 → Ollama 모델 내림 → ComfyUI Wan 2.2(14B — 그림에서 시작하면 14B I2V, 없으면 5B,\n        5초, 'FHD' 면 SeedVR2).\n",
+    "        \"\"\"자연어 영상 부탁(ADR-075): 영어 프롬프트 → Ollama 모델 내림 → ComfyUI Wan 2.2(720p 5초, 'FHD' 면 SeedVR2).\n"
+   ],
+   [
+    "        self._progress(f\"[영상 만드는 중: {prompt}]\\n({plan.model}, 5초 영상에 약 {plan.minutes}분\"\n                       f\"{'(FHD 로 키우기 포함)' if plan.fhd else ''} 걸립니다. \"\n",
+    "        self._progress(f\"[영상 만드는 중: {prompt}]\\n(5초 영상에 약 4분{', FHD 로 키우기까지 약 8분' if plan.fhd else ''} 걸립니다. \"\n"
+   ],
+   [
+    "        lines = [f\"영상을 만들었습니다 — {result.model}{' + SeedVR2(FHD)' if result.fhd else ''}, ",
+    "        lines = [f\"영상을 만들었습니다 — Wan 2.2 5B{' + SeedVR2(FHD)' if result.fhd else ''}, "
+   ],
+   [
+    "            big = generator.video_plan(start or False, True)\n            lines.append(f\"더 큰 화면({big.size[0]}×{big.size[1]})이 필요하면 'FHD로 ○○ 영상 만들어줘'처럼 말해 주세요(약 {big.minutes}분).\")\n",
+    "            lines.append(\"더 큰 화면(1920×1056)이 필요하면 'FHD로 ○○ 영상 만들어줘'처럼 말해 주세요(약 8분).\")\n"
+   ],
+   [
+    "            clip, big = self.image_generator.video_plan(), self.image_generator.video_plan(fhd=True)\n",
+    ""
+   ],
+   [
+    "                         f\" 영상도 만든다({clip.model}): '○○ 영상 만들어줘' 하면 5초 영상({clip.width}×{clip.height}, 약 {clip.minutes}분), \"\n                         f\"'FHD로' 를 붙이면 {big.size[0]}×{big.size[1]}(약 {big.minutes}분), \"\n",
+    "                         \" 영상도 만든다(Wan 2.2): '○○ 영상 만들어줘' 하면 5초 영상(720p, 약 4분), 'FHD로' 를 붙이면 1920×1056(약 8분), \"\n"
+   ]
+  ],
+  "split": "history",
+  "dataset": "history-contracts-v3-20261004",
+  "backup": "claude-backup-20261003-wan14b",
+  "hunks": 6,
+  "changed_lines": 16,
+  "failing": [
+   "Wan14VideoTests.test_a_text_request_uses_14b_with_the_4_step_lora",
+   "Wan14VideoTests.test_direct_prompt_goes_to_14b_unchanged",
+   "Wan14VideoTests.test_the_chat_model_hears_the_14b_numbers"
+  ],
+  "other_failures": [],
+  "refreshed": "manual"
+ },
+ {
+  "id": "hist_codex-backup-20260926-stage4-state_developer_test_developer",
+  "file": "jarvis/developer.py",
+  "test": "tests/test_developer.py",
+  "edits": [
+   [
+    "import threading\nimport time\nimport uuid\nfrom typing import Callable\n\n",
+    "import threading\nimport time\nfrom typing import Callable\n\n"
+   ],
+   [
+    "        try:\n            data = json.loads(raw)\n            run = cls(**data)\n            if \"run_id\" not in data:\n                run.save(storage)\n            return run\n        except (TypeError, ValueError):\n            return None\n",
+    "        try:\n            data = json.loads(raw)\n            return cls(**data)\n        except (TypeError, ValueError):\n            return None\n"
+   ],
+   [
+    "        if run.workspace != str(self._workspace()):\n            raise ToolError(\"개발 작업의 프로젝트 폴더가 바뀌었습니다. 원래 폴더로 돌아가세요.\")\n        if run.phase in (\"testing\", \"proposing\", \"verifying\"):\n            run.phase = \"needs_test\"\n            run.suite_result = \"INCOMPLETE\"\n            run.events.append(\"중단된 실행을 발견함; 자동 실행 없이 재검증 대기\")\n            run.save(self.core.storage)\n        return run\n\n",
+    "        if run.workspace != str(self._workspace()):\n            raise ToolError(\"개발 작업의 프로젝트 폴더가 바뀌었습니다. 원래 폴더로 돌아가세요.\")\n        return run\n\n"
+   ],
+   [
+    "\n    def _refresh_passed_result(self, run: DeveloperRun) -> None:\n        if run.phase == \"passed\" and self._source_changed(run):\n            run.phase = \"needs_test\"\n            run.suite_result = \"not_run\"\n",
+    "\n    def _refresh_passed_result(self, run: DeveloperRun) -> None:\n        if run.phase == \"passed\" and run.source_sha256 != self._source_digest(run.source):\n            run.phase = \"needs_test\"\n            run.suite_result = \"not_run\"\n"
+   ],
+   [
+    "            raise ToolError(\"프로젝트 tests 폴더가 없습니다.\")\n        cancel_event = getattr(self.core, \"command_cancel_event\", None)\n        run.phase = \"verifying\"\n        run.save(self.core.storage)\n        if self.suite_runner is _default_suite_runner:\n            code, output = self.suite_runner(root, cancel_event)\n",
+    "            raise ToolError(\"프로젝트 tests 폴더가 없습니다.\")\n        cancel_event = getattr(self.core, \"command_cancel_event\", None)\n        if self.suite_runner is _default_suite_runner:\n            code, output = self.suite_runner(root, cancel_event)\n"
+   ],
+   [
+    "        else:\n            run.suite_result = \"FAIL\"\n        run.phase = \"passed\"\n        run.events.append(f\"전체 테스트: {run.suite_result} (종료 코드 {code})\")\n        run.save(self.core.storage)\n",
+    "        else:\n            run.suite_result = \"FAIL\"\n        run.events.append(f\"전체 테스트: {run.suite_result} (종료 코드 {code})\")\n        run.save(self.core.storage)\n"
+   ]
+  ],
+  "split": "history",
+  "dataset": "history-contracts-v3-20261004",
+  "backup": "codex-backup-20260926-stage4-state",
+  "hunks": 6,
+  "changed_lines": 16,
+  "failing": [
+   "AutoLoopTests.test_a_file_made_by_a_failed_attempt_is_not_carried_over",
+   "AutoLoopTests.test_a_newly_applied_fix_does_not_inherit_the_old_pass",
+   "AutoLoopTests.test_a_pass_while_the_source_changed_is_not_counted",
+   "AutoLoopTests.test_a_real_file_changed_during_the_loop_is_not_overwritten",
+   "AutoLoopTests.test_a_second_independent_attempt_starts_from_the_original",
+   "AutoLoopTests.test_an_out_of_scope_round_is_refused_and_the_model_is_told",
+   "AutoLoopTests.test_changed_acceptance_test_in_copy_stops_before_model_call",
+   "AutoLoopTests.test_changed_real_acceptance_test_prevents_final_proposal",
+   "AutoLoopTests.test_changes_the_tests_do_not_need_are_trimmed_but_notes_stay",
+   "AutoLoopTests.test_every_round_and_the_user_decision_are_recorded_as_one_outcome"
+  ],
+  "other_failures": [
+   "DeveloperModeTests.test_attempt_limit_stops_repeated_edits",
+   "DeveloperModeTests.test_failure_proposal_user_approval_and_retest",
+   "DeveloperModeTests.test_full_suite_does_not_claim_success_if_test_changes_source",
+   "DeveloperModeTests.test_full_suite_reports_unrelated_failure_then_pass_without_editing",
+   "DeveloperModeTests.test_passed_status_expires_if_source_changes",
+   "DeveloperModeTests.test_passing_baseline_can_request_feature_proposal_then_retest",
+   "DeveloperModeTests.test_pending_proposal_must_be_resolved_before_new_run",
+   "DeveloperModeTests.test_test_run_does_not_claim_success_if_test_changes_source"
+  ]
+ },
+ {
+  "id": "hist_claude-backup-20260930-applyfixes_providers_test_unload",
+  "file": "jarvis/providers.py",
+  "test": "tests/test_unload.py",
+  "edits": [
+   [
+    "\n    try:\n        names = _loaded_names(call(\"/api/ps\", None))\n        for name in names:\n            call(\"/api/generate\", {\"model\": name, \"keep_alive\": 0})\n",
+    "\n    try:\n        loaded = call(\"/api/ps\", None).get(\"models\", [])\n        names = [str(m.get(\"name\") or m.get(\"model\")) for m in loaded if isinstance(m, dict) and (m.get(\"name\") or m.get(\"model\"))]\n        for name in names:\n            call(\"/api/generate\", {\"model\": name, \"keep_alive\": 0})\n"
+   ],
+   [
+    "        raise ProviderError(f\"모델을 내리지 못했습니다: {exc}\") from exc\n    return names\n\n\ndef _loaded_names(ps: dict) -> list[str]:\n    # 비정상 응답을 빈 모델 목록으로 해석하면 GPU를 반환하지 못해도 다음 엔진을 켜게 된다.\n    if not isinstance(ps, dict) or ps.get(\"error\") or not isinstance(ps.get(\"models\"), list):\n        raise ProviderError(\"Ollama 모델 상태 응답이 올바르지 않아 GPU 반환을 확인할 수 없습니다.\")\n    names = []\n    for item in ps[\"models\"]:\n        name = (item.get(\"name\") or item.get(\"model\")) if isinstance(item, dict) else None\n        if not isinstance(name, str) or not name.strip():\n            raise ProviderError(\"Ollama 모델 상태에 이름이 없는 항목이 있습니다.\")\n        names.append(name)\n    return names\n\n\ndef loaded_ollama_models(host: str, timeout: float = 10) -> list[str]:\n    \"\"\"지금 Ollama 에 올라가 있는 모델 이름(/api/ps). 내린 뒤 확인용 — 답을 만드는 중이면 끝난 뒤에야 내려간다.\"\"\"\n    try:\n        with urllib.request.urlopen(f\"{host}/api/ps\", timeout=timeout) as response:\n            body = response.read()\n        return _loaded_names(json.loads(body.decode(\"utf-8\")) if body.strip() else {})\n    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:\n        raise ProviderError(f\"Ollama 상태를 확인하지 못했습니다: {exc}\") from exc\n\n\n",
+    "        raise ProviderError(f\"모델을 내리지 못했습니다: {exc}\") from exc\n    return names\n\n\n"
+   ]
+  ],
+  "split": "history",
+  "dataset": "history-contracts-v3-20261004",
+  "backup": "claude-backup-20260930-applyfixes",
+  "hunks": 2,
+  "changed_lines": 17,
+  "failing": [
+   "UnloadTests.test_a_model_still_loaded_after_the_request_is_reported_not_hidden",
+   "UnloadTests.test_a_model_that_appears_after_the_first_look_is_reported",
+   "UnloadTests.test_the_chat_command_unloads_through_the_apps_ollama"
+  ],
+  "other_failures": [],
+  "refreshed": "auto",
+  "refreshed_edits": 1
+ },
+ {
+  "id": "hist_codex-backup-20261003-shutdown_imagegen_test_imagegen",
+  "file": "jarvis/imagegen.py",
+  "test": "tests/test_imagegen.py",
+  "edits": [
+   [
+    "        raise ImageGenError(f\"ComfyUI 가 {self.start_timeout:.0f}초 안에 준비되지 않았습니다. 기록: {log_path}\")\n\n    def close(self) -> bool:\n        \"\"\"Stop and reap only the ComfyUI child started by this generator.\"\"\"\n        if not self._lock.acquire(blocking=False):\n            raise ImageGenError(\"그림·영상 생성 중이어서 엔진을 종료하지 않았습니다.\")\n        try:\n            process = self._process\n            if process is None:\n                return False  # A pre-existing ComfyUI server belongs to its caller.\n            try:\n                if process.poll() is None:\n                    process.terminate()\n                try:\n                    process.wait(timeout=5)\n                except subprocess.TimeoutExpired:\n                    process.kill()\n                    process.wait(timeout=5)\n            except (OSError, subprocess.TimeoutExpired) as exc:\n                raise ImageGenError(f\"ALEX가 시작한 그림·영상 엔진을 종료하지 못했습니다: {exc}\") from exc\n            self._process = None\n            return True\n        finally:\n            self._lock.release()\n\n    # ------------------------------------------------------------------ drawing\n    def workflow(self, prompt: str, seed: int, width: int, height: int) -> dict:\n",
+    "        raise ImageGenError(f\"ComfyUI 가 {self.start_timeout:.0f}초 안에 준비되지 않았습니다. 기록: {log_path}\")\n\n    # ------------------------------------------------------------------ drawing\n    def workflow(self, prompt: str, seed: int, width: int, height: int) -> dict:\n"
+   ]
+  ],
+  "split": "history",
+  "dataset": "history-contracts-v3-20261004",
+  "backup": "codex-backup-20261003-shutdown",
+  "hunks": 1,
+  "changed_lines": 23,
+  "failing": [
+   "OwnedEngineCloseTests.test_busy_generation_preserves_the_process",
+   "OwnedEngineCloseTests.test_failed_cleanup_keeps_handle_for_retry",
+   "OwnedEngineCloseTests.test_termination_timeout_kills_and_waits_for_owned_child"
+  ],
+  "other_failures": []
+ },
+ {
+  "id": "hist_claude-backup-20261003-video_router_test_imagegen",
+  "file": "jarvis/router.py",
+  "test": "tests/test_imagegen.py",
+  "edits": [
+   [
+    "    TOOL_WEB_READ = \"tool/web_read\"\n    TOOL_IMAGE_GEN = \"tool/image_gen\"\n    TOOL_VIDEO_GEN = \"tool/video_gen\"\n    SESSION_RESUME = \"session/resume\"\n    LOCAL_GENERAL = \"local_general\"\n",
+    "    TOOL_WEB_READ = \"tool/web_read\"\n    TOOL_IMAGE_GEN = \"tool/image_gen\"\n    SESSION_RESUME = \"session/resume\"\n    LOCAL_GENERAL = \"local_general\"\n"
+   ],
+   [
+    "\n\n# ── 영상 만들기 (ADR-075, 2026-10-03 사용자 \"영상 못 만든다고 그러는데?\") ─────────────────\nVIDEO_WORDS = (\"영상\", \"동영상\", \"비디오\", \"애니메이션\", \"움짤\", \"클립\", \"video\", \"animation\", \"clip\")\nVIDEO_NOT = (\"편집\", \"자막\", \"요약\", \"다운로드\", \"유튜브\", \"youtube\", \"찾아\", \"검색\", \"녹화\", \"재생\", \"변환\", \"압축\")\n_VIDEO_MAKE = re.compile(r\"(?:만들어|생성\\s*해|뽑아|제작해)\\s*\" + _IMAGE_ENDINGS)\n_ANIMATE = re.compile(r\"움직이게\\s*(?:해|만들어)\\s*\" + _IMAGE_ENDINGS)\n_EN_VIDEO = re.compile(r\"\\b(?:make|generate|create|render)\\s+(?:me\\s+)?(?:an?\\s+)?(?:short\\s+)?(?:video|animation|clip)\\b\")\n_VIDEO_AUDIO_END = re.compile(r\"(?:넣어|포함\\s*해|추가\\s*해|더해)\\s*\" + _IMAGE_ENDINGS + r\"[.!?…\\s]*$\")\n\n\ndef _video_tail_ok(tail: str) -> bool:\n    tail = tail.strip()\n    if len(tail) <= IMAGE_TAIL_MAX_CHARS:\n        return True\n    # A second audio instruction still describes this video. Keep unrelated\n    # follow-up questions out of the generation route (live LTX test, 2026-10-11).\n    return (len(tail) <= 120 and _contains_any(tail, (\"소리\", \"음악\", \"음성\", \"대사\", \"효과음\"))\n            and _VIDEO_AUDIO_END.search(tail) is not None)\n\n\ndef video_request(normalized: str) -> str | None:\n    \"\"\"영상을 만들어 달라는 부탁이면 일치한 말. \"○○ 영상 만들어줘\", \"방금 그림 움직이게 해줘\", \"make a video of …\".\"\"\"\n    if len(normalized) > IMAGE_MAX_CHARS or \"```\" in normalized:\n        return None\n    if _contains_any(normalized, IMAGE_CODE_WORDS + VIDEO_NOT):\n        return None\n    match = _ANIMATE.search(normalized)\n    if match:\n        return match.group(0)\n    matches = list(_VIDEO_MAKE.finditer(normalized))\n    if matches:\n        match = matches[-1]\n        if (_contains_any(normalized[:match.start()], VIDEO_WORDS)\n                and _video_tail_ok(normalized[match.end():])):\n            return match.group(0)\n    match = _EN_VIDEO.search(normalized)\n    return match.group(0) if match and match.start() <= 40 else None\n\n\ndef image_request(normalized: str) -> str | None:\n    \"\"\"그림을 그려 달라는 부탁이면 일치한 말을 돌려준다. normalized 는 소문자·공백 정리된 글.\"\"\"\n",
+    "\n\ndef image_request(normalized: str) -> str | None:\n    \"\"\"그림을 그려 달라는 부탁이면 일치한 말을 돌려준다. normalized 는 소문자·공백 정리된 글.\"\"\"\n"
+   ],
+   [
+    "        return RouteDecision(Destination.TOOL_FILE_SEARCH, \"file name search keywords detected\", hit)\n\n    hit = video_request(normalized)\n    if hit:\n        return RouteDecision(Destination.TOOL_VIDEO_GEN, \"video generation request\", hit)\n\n    hit = image_request(normalized)\n    if hit:\n",
+    "        return RouteDecision(Destination.TOOL_FILE_SEARCH, \"file name search keywords detected\", hit)\n\n    hit = image_request(normalized)\n    if hit:\n"
+   ]
+  ],
+  "split": "history",
+  "dataset": "history-contracts-v3-20261004",
+  "backup": "claude-backup-20261003-video",
+  "hunks": 3,
+  "changed_lines": 32,
+  "failing": [
+   "CoreImageTests.test_direct_image_prompt_reaches_comfy_without_chat_rewrite",
+   "CoreImageTests.test_direct_image_prompt_still_checks_minor_safety",
+   "VideoTests.test_a_natural_request_makes_a_720p_clip_and_shows_it",
+   "VideoTests.test_animate_the_picture_just_drawn",
+   "VideoTests.test_direct_video_prompt_reaches_comfy_without_chat_rewrite",
+   "VideoTests.test_fhd_adds_the_upscaler",
+   "VideoTests.test_routing",
+   "Wan14VideoTests.test_a_text_request_uses_14b_with_the_4_step_lora",
+   "Wan14VideoTests.test_animating_a_picture_still_uses_5b",
+   "Wan14VideoTests.test_direct_prompt_goes_to_14b_unchanged"
+  ],
+  "other_failures": [
+   "BoundaryTests.test_a_refusing_writer_is_reported_not_drawn",
+   "BoundaryTests.test_a_writer_prompt_that_sexualizes_a_minor_is_not_drawn",
+   "BoundaryTests.test_fantasy_and_adult_pictures_are_not_blocked_by_the_app",
+   "BoundaryTests.test_minors_with_anything_sexual_are_refused_before_the_model_or_comfy",
+   "CharacterTests.test_a_saved_name_draws_with_the_reference_on_the_edit_model",
+   "CharacterTests.test_bad_names_are_refused",
+   "CharacterTests.test_changing_a_character_picture_keeps_the_same_reference",
+   "CharacterTests.test_character_commands",
+   "CharacterTests.test_nothing_to_save_explains_what_to_do",
+   "CharacterTests.test_save_copies_the_picture_and_its_prompt"
+  ],
+  "refreshed": "auto",
+  "refreshed_edits": 1
+ },
+ {
+  "id": "hist_claude-backup-20261003-characters_core_test_imagegen",
+  "file": "jarvis/core.py",
+  "test": "tests/test_imagegen.py",
+  "edits": [
+   [
+    "import re\nimport secrets\nimport shutil\nimport subprocess\nimport tempfile\nimport time\nimport urllib.parse\nfrom typing import Callable\n\n",
+    "import re\nimport secrets\nimport shutil\nimport subprocess\nimport tempfile\nimport time\nfrom typing import Callable\n\n"
+   ],
+   [
+    "                return path, (found.group(1).strip() if found else \"\")\n        return None, \"\"\n\n    def add_reference_picture(self, session_id: str, data: bytes, filename: str = \"\") -> str:\n        \"\"\"사용자가 올린 그림을 이 대화의 '방금 그림' 으로 둔다(ADR-074 보충) — 이어서 캐릭터로 저장하거나 기준으로 쓸 수 있다.\n\n        2026-10-03 사용자 실측: \"창세기전2 흑태자 그려줘\" 에 ALEX 가 \"인터넷 그림을 보고 그릴 수 없다\" 고 답했다. 글로만 받는\n        Z-Image 는 그 캐릭터를 모른다 — 참고 그림을 넣는 입구가 없었다.\n        \"\"\"\n        if self.image_generator is None:\n            raise ValueError(\"그림 그리기가 꺼져 있습니다.\")\n        path = self.image_generator.store_picture(data)\n        label = re.sub(r\"[\\[\\]\\n]\", \" \", filename).strip()[:80] or \"올린 그림\"\n        self.storage.add_message(session_id, \"user\", f\"[그림 올림] {label}\")\n        reply = (f\"올린 그림을 받았습니다({path.name}).\\n{marker_line(label, path)}\\n\"\n                 \"이 그림의 캐릭터를 계속 쓰려면 '이 캐릭터를 흑태자로 저장해줘'처럼 이름을 붙이고, 바로 쓰려면 \"\n                 \"'방금 그림의 캐릭터로 성 위에 서 있는 장면 그려줘'처럼 말해 주세요.\")\n        self.storage.add_message(session_id, \"assistant\", reply)\n        self._last_image[session_id] = {\"prompt\": \"\", \"width\": 1024, \"height\": 1024, \"path\": path, \"references\": []}\n        self.last_exchange = {\"question\": f\"[그림 올림] {label}\", \"answer\": reply,\n                              \"destination\": Destination.TOOL_IMAGE_GEN.value, \"session_id\": session_id,\n                              \"route_event_id\": \"\"}\n        return reply\n\n    def add_character(self, session_id: str, name: str, source: str) -> str:\n        \"\"\"그림 주소(URL)나 이 PC 의 파일 경로로 캐릭터를 바로 저장한다 — `/character add 이름 주소`.\"\"\"\n        if self.image_generator is None:\n            return \"그림 그리기가 꺼져 있습니다.\"\n        try:\n            if re.match(r\"https?://\", source, re.I):\n                data = fetch_image_url(source)\n            else:\n                file = Path(source.strip().strip('\"'))\n                if not file.is_file():\n                    return f\"파일을 찾지 못했습니다: {file}\"\n                data = file.read_bytes()\n            self.add_reference_picture(session_id, data, Path(urllib.parse.urlsplit(source).path).name or name)\n        except ValueError as exc:\n            return str(exc)\n        except OSError as exc:\n            return f\"그림을 읽지 못했습니다: {exc}\"\n        return self.save_character(session_id, name)\n\n    def save_character(self, session_id: str, name: str) -> str:\n",
+    "                return path, (found.group(1).strip() if found else \"\")\n        return None, \"\"\n\n    def save_character(self, session_id: str, name: str) -> str:\n"
+   ]
+  ],
+  "split": "history",
+  "dataset": "history-contracts-v3-20261004",
+  "backup": "claude-backup-20261003-characters",
+  "hunks": 2,
+  "changed_lines": 41,
+  "failing": [
+   "WebImageTests.test_an_uploaded_picture_becomes_the_last_picture_and_can_be_saved_as_a_character",
+   "WebImageTests.test_character_add_from_a_local_file",
+   "WebImageTests.test_uploads_need_the_token_a_real_picture_and_a_small_size"
+  ],
+  "other_failures": [],
+  "refreshed": "auto",
+  "refreshed_edits": 1
+ }
+]

@@ -30,6 +30,9 @@ class IntentTests(unittest.TestCase):
             self.assertFalse(is_coding_request("/read alex_counter.sv", root))
         self.assertEqual([permission_reply(t) for t in ("응", "네 진행해", "항상 허락", "아니 하지마", "오늘 날씨 어때?")],
                          ["once", "once", "always", "reject", ""])
+        # 짧은 '노·no' 는 낱말일 때만 거절(2026-10-26: '노트에 …'·'no-op …' 이 거절로 읽혔다)
+        self.assertEqual([permission_reply(t) for t in ("노", "노노", "no", "No thanks", "nope", "아니요")], ["reject"] * 6)
+        self.assertEqual([permission_reply(t) for t in ("노트에 적어둔 거 말고", "no-op 함수는?", "nothing")], ["", "", ""])
 
 
 class CodeChatTests(unittest.TestCase):

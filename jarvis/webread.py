@@ -38,6 +38,7 @@ import urllib.request
 import zlib
 
 from .http_control import interrupt_on_cancel
+from .threats import clean, scan, warning
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ALEX-local-assistant"
 ALLOWED_SCHEMES = ("http", "https")
@@ -368,7 +369,8 @@ def parse_search_results(markup: str, limit: int) -> list[SearchResult]:
         if parts.hostname.endswith("duckduckgo.com") or url in seen:
             continue
         seen.add(url)
-        results.append(SearchResult(item["title"] or url, url, item["snippet"]))
+        snippet = clean(item["snippet"])
+        results.append(SearchResult(clean(item["title"]) or url, url, warning(scan(snippet)) + snippet))
         if len(results) >= limit:
             break
     return results
@@ -451,11 +453,13 @@ class WebReader:
     def fetch(self, url: str, *, control=None) -> Page:
         final_url, content_type, text, truncated = self._get(url, control=control)
         if content_type == "text/plain":
-            return Page(final_url, "", text.strip(), truncated)
-        title, body = extract_text(text)
+            title, body = "", text.strip()
+        else:
+            title, body = extract_text(text)
         if not body:
             raise WebError("페이지에서 읽을 글을 찾지 못했습니다(스크립트로만 그리는 페이지일 수 있습니다).")
-        return Page(final_url, title, body, truncated)
+        # 남의 페이지에 숨긴 지시(2026-10-26, jarvis/threats.py): 보이지 않는 글자는 빼고, 지시 모양이 보이면 앞에 경고를 붙인다.
+        return Page(final_url, clean(title), warning(scan(body)) + clean(body), truncated)
 
     def search(self, query: str, *, control=None) -> list[SearchResult]:
         if control is not None and control.is_set():
