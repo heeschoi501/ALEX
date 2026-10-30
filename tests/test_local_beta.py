@@ -242,8 +242,8 @@ class BrowserWorkflowTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, 400)
         caught.exception.close()
         with self.request("/api/workspace", {"path": str(self.root), "confirmed": True}) as r:
-            self.assertEqual(Path(json.load(r)["project_root"]), self.root)
-        self.assertEqual(self.state.core.storage.get_state("web.workspace_root"), str(self.root))
+            self.assertEqual(Path(json.load(r)["project_root"]), self.root.resolve())   # 화면에는 풀어 쓴 경로
+        self.assertEqual(self.state.core.storage.get_state("web.workspace_root"), str(self.root.resolve()))
 
     def test_settings_atomic_save_and_reload(self):
         self.state.settings = Settings(file_search_root=self.root)

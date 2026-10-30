@@ -1,0 +1,59 @@
+# 누가(사람·Claude·Codex …) 어느 가지에 올리든 같은 검사를 깨끗한 가상 컴퓨터에서 다시 돌린다.
+# 모델·그래픽카드는 없으므로 가짜 모델로 도는 검사만 한다 — 실제 모델 품질·속도는 PC 에서 잰다.
+# 글(Markdown)만 바뀐 커밋은 건너뛴다. 비밀값 검사는 secrets.yml 이 늘 한다.
+name: verify
+
+on:
+  push:
+    paths-ignore: ["**/*.md"]
+  pull_request:
+    branches: [main]
+    paths-ignore: ["**/*.md"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release:
+    name: release checks (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-latest, python: "3.10"}    # pyproject 의 최소 판 — 문법 검사만 하던 것을 실제로 돌린다
+          - {os: ubuntu-latest, python: "3.11"}    # 개발 PC 와 같은 판
+          - {os: ubuntu-latest, python: "3.13"}
+          - {os: windows-latest, python: "3.11"}   # 경로·인코딩 등 Windows 쪽(모델·GPU 는 빼고)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: scripts/verify_release.py
+        run: python scripts/verify_release.py
+
+  browser:
+    name: web UI in Chromium (fake model)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Playwright + Chromium
+        run: |
+          npm install --no-save --no-package-lock playwright@1.63.0
+          npx playwright install --with-deps chromium
+      - name: scripts/verify_web_ui.cjs
+        run: node scripts/verify_web_ui.cjs python

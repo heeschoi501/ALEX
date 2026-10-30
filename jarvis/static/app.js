@@ -589,12 +589,18 @@ async function renameSession(sid, current) {
 $('title').addEventListener('click', () => { if (!openProject && state) renameSession(state.session_id, state.title); });
 async function newChat(projectId = '') {
   saveComposer();
+  const before = $('input').value;
   const version = ++navigationVersion;
   navigating = true; updateControls();
   try {
     const r = await api('/api/session/new', projectId ? {project_id: projectId} : {});
     if (version !== navigationVersion) return null;
+    // '새 대화'를 누른 뒤 만들어지는 동안 친 글은 새 대화의 것이다 — 전에는 옛 대화의 초안으로 저장되고 새 입력창은
+    // 비었다(2026-10-26 브라우저 검사). 옛 대화 초안은 누를 때의 글 그대로 둔다.
+    const typed = $('input').value !== before ? $('input').value : null;
+    if (typed !== null) $('input').value = before;
     await openSession(r.session_id);
+    if (typed !== null && state?.session_id === r.session_id) { $('input').value = typed; fitInput(); }
     return r.session_id;
   } finally { if (version === navigationVersion) { navigating = false; updateControls(); } }
 }

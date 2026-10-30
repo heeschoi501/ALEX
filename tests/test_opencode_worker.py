@@ -331,7 +331,7 @@ class BuildWithOpenCodeTests(FakeOpenCode, unittest.TestCase):
         with patch("jarvis.opencode_worker.subprocess.Popen") as process:
             answer, _ = self.core.handle_build(self.session, "덧셈 프로그램 만들어줘")
         self.assertIn("만들기 작업을 진행하지 못했습니다: GPU not released", answer)
-        self.assertIn(self.core._build_state(self.session)["workspace"], answer)
+        self.assertIn(str(Path(self.core._build_state(self.session)["workspace"]).resolve()), answer)
         self.assertTrue(self.core._answer_failed)
         process.assert_not_called()
 
@@ -341,7 +341,7 @@ class BuildWithOpenCodeTests(FakeOpenCode, unittest.TestCase):
         with patch("jarvis.opencode_worker.subprocess.Popen") as process:
             answer, _ = self.core.handle_build(self.session, "덧셈 프로그램 만들어줘")
         self.assertIn("중단했습니다", answer)
-        self.assertIn(self.core._build_state(self.session)["workspace"], answer)
+        self.assertIn(str(Path(self.core._build_state(self.session)["workspace"]).resolve()), answer)
         process.assert_not_called()
 
 
