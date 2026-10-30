@@ -96,6 +96,17 @@ def offline(stable: bool) -> dict:
             "reused_share_after_first": round(sum(r["reused"] for r in later) / max(1, sum(r["chars"] for r in later)), 3)}
 
 
+def source_revision() -> tuple[str, bool | None]:
+    """git 커밋과 수정 여부. 개발 PC 원본(C:\\ALEX\\jarvis)은 git 저장소가 아니라 코드 지문으로 대신한다(2026-10-30 PC 확인)."""
+    try:
+        revision = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+        dirty = subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain"], capture_output=True, text=True, check=True).stdout.strip()
+        return revision, bool(dirty)
+    except (OSError, subprocess.CalledProcessError):
+        from jarvis.launcher import code_fingerprint
+        return "code:" + code_fingerprint(), None
+
+
 def live(out: Path, pairs: int = 4) -> dict:
     from jarvis.app import build_core
     from jarvis.config import load_settings
@@ -103,9 +114,8 @@ def live(out: Path, pairs: int = 4) -> dict:
         raise ValueError("--pairs 는 2 이상의 짝수여야 합니다(끔/켬·켬/끔 균형)")
     base = load_settings()
     runs = []
-    revision = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
-    dirty = subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain"], capture_output=True, text=True, check=True).stdout.strip()
-    result = {"at": datetime.now().isoformat(timespec="seconds"), "source_commit": revision, "source_dirty": bool(dirty),
+    revision, dirty = source_revision()
+    result = {"at": datetime.now().isoformat(timespec="seconds"), "source_commit": revision, "source_dirty": dirty,
               "pairs": pairs, "cache_reset": False, "history": "fixed replay", "runs": runs}
     out.parent.mkdir(parents=True, exist_ok=True)
     schedule = [(pair + 1, stable) for pair in range(pairs)

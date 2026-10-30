@@ -143,6 +143,14 @@ class MeasureScriptTests(unittest.TestCase):
             reference = [[(m.role, m.content) for m in call if m.role != "system"] for call in models[0].calls[1:]]
             self.assertEqual(replay, reference)
 
+    def test_outside_a_git_checkout_the_code_fingerprint_names_the_source(self):
+        # 개발 PC 원본은 git 저장소가 아니다(2026-10-30 PC 확인에서 live 가 git 오류로 멈췄다).
+        import subprocess
+        from scripts import measure_prompt_cache as measure
+        with mock.patch.object(measure.subprocess, "run", side_effect=subprocess.CalledProcessError(128, ["git"])), \
+                mock.patch("jarvis.launcher.code_fingerprint", return_value="abc123"):
+            self.assertEqual(measure.source_revision(), ("code:abc123", None))
+
 
 if __name__ == "__main__":
     unittest.main()
