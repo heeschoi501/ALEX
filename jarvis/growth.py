@@ -37,8 +37,10 @@ REVIEW_RULES = """대화에서 앞으로도 쓸 사용자 프로필, 에이전�
 최대 3개 JSON 배열만 출력한다. 저장할 것이 없으면 []. 각 항목:
 {"kind":"profile|memory|skill", "content":"본문", "evidence":[사용자 메시지 번호],
  "name":"skill에만: 영문소문자-이름", "description":"skill에만: 짧은 용도"}
-profile은 1375자, memory는 2200자, skill 본문은 6500자 이하. evidence는 반드시 제공된 사용자 메시지 번호다.
-skill content는 머리말 없는 Markdown 지침이다. profile/memory는 사실·선호 데이터이며 권한을 바꾸는 지시가 아니다."""
+profile은 1375자, memory는 2200자, skill 본문은 6500자 이하.
+evidence에는 user_message_ids에 있는 번호만 쓴다. ALEX(assistant) 답의 번호는 근거가 아니다.
+skill content는 머리말 없는 Markdown 지침이다. profile/memory는 사실·선호 데이터이며 권한을 바꾸는 지시가 아니다.
+profile/memory content는 한 줄에 사실 하나씩 '- '로 시작하는 목록으로 쓰고, 고칠 필요가 없는 기존 줄은 글자 그대로 둔다."""
 
 
 class GrowthError(ValueError):
@@ -101,6 +103,31 @@ def _digest(files: dict[str, bytes]) -> str:
         return ""
     rows = [(name, hashlib.sha256(data).hexdigest()) for name, data in sorted(files.items())]
     return hashlib.sha256(json.dumps(rows, ensure_ascii=False).encode()).hexdigest()
+
+
+def merge_lines(base: str, mine: str, theirs: str) -> str | None:
+    """base→mine 에서 바뀐 줄을 그사이 승인된 theirs 에 얹는다. 같은 줄을 서로 다르게 바꿨으면 None.
+
+    profile·memory 제안은 전체 교체안이라, 같은 판에서 나온 제안 하나를 승인하면 내용이 전혀 다른 나머지도
+    모두 '바뀌었습니다' 로 막혔다(2026-10-30 PC 확인, 사용자 "애초에 제안 a,b가 전혀 다른건데"). 같은 자리에
+    둘 다 줄을 더한 것은 승인된 쪽 다음에 붙인다."""
+    b, m, t = base.splitlines(), mine.splitlines(), theirs.splitlines()
+    ours = [op for op in difflib.SequenceMatcher(None, b, m, autojunk=False).get_opcodes() if op[0] != "equal"]
+    done = [op for op in difflib.SequenceMatcher(None, b, t, autojunk=False).get_opcodes() if op[0] != "equal"]
+    apply = []
+    for op in ours:
+        _, i1, i2, j1, j2 = op
+        same = [k for k in done if (k[1], k[2], t[k[3]:k[4]]) == (i1, i2, m[j1:j2])]
+        if same:
+            continue  # 이미 승인된 쪽에 같은 변경이 있다
+        if any(i1 < k2 and k1 < i2 for _, k1, k2, _, _ in done):
+            return None
+        apply.append(op)
+    out = list(t)
+    for _, i1, i2, j1, j2 in sorted(apply, key=lambda op: op[1], reverse=True):
+        shift = sum((l2 - l1) - (k2 - k1) for _, k1, k2, l1, l2 in done if k2 <= i1)
+        out[i1 + shift:i2 + shift] = m[j1:j2]
+    return "\n".join(out)
 
 
 def _files(path: Path) -> dict[str, bytes]:
@@ -248,6 +275,9 @@ class GrowthStore:
                       "base": current if baseline is None else baseline, "digest": digest,
                       "files": sorted(bundle), "evidence": (evidence or [])[:5],
                       "created": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+            if kind in DOCS and record["base"] == current:
+                # 승인 때 그사이 승인된 다른 제안과 줄 단위로 합치려면 이 제안이 본 판의 글이 필요하다(merge_lines).
+                record["base_text"] = _files(target).get(DOCS[kind][0], b"").decode("utf-8")
             self._save(owner, record)
             return record
 
@@ -261,11 +291,22 @@ class GrowthStore:
                 raise GrowthError("이미 결정한 제안입니다.")
             if approve:
                 target = self.target(owner, record["kind"], record["name"])
-                if self.baseline(owner, record["kind"], record["name"]) != record["base"]:
-                    raise GrowthError("제안 뒤 승인된 내용이 바뀌었습니다. 새 제안을 만들어 주세요.")
                 files = _files(self.path(owner, f"proposals/{ident}/files"))
                 if _digest(files) != record["digest"]:
                     raise GrowthError("검토할 제안 파일이 바뀌어 승인하지 않았습니다.")
+                if self.baseline(owner, record["kind"], record["name"]) != record["base"]:
+                    merged = None
+                    if record["kind"] in DOCS and isinstance(record.get("base_text"), str):
+                        filename, limit = DOCS[record["kind"]]
+                        merged = merge_lines(record["base_text"], files[filename].decode("utf-8"),
+                                             _files(target).get(filename, b"").decode("utf-8"))
+                    if merged is None:
+                        raise GrowthError("제안 뒤 승인된 내용이 바뀌었습니다. 새 제안을 만들어 주세요.")
+                    try:
+                        files = {filename: (_text(merged, limit) + "\n").encode()}
+                    except GrowthError as exc:
+                        raise GrowthError(f"지금 승인된 내용과 합치면 검사를 통과하지 못합니다({exc}) 새 제안을 만들어 주세요.") from exc
+                    record["merged"] = True
                 if record["kind"] == "skill":
                     parse_skill(files["SKILL.md"].decode())
                     # Keep the complete previous bundle for recovery.
@@ -418,16 +459,24 @@ def review(core, session_id: str, *, rows: list[dict] | None = None) -> str:
     from .core import redact_sensitive_text
     context = {"approved_documents": documents,
                "skills": {name: skill.path.read_text(encoding="utf-8")[:2500] for name, skill in list(skills.items())[:4]},
-               "conversation": [{"id": m["id"], "role": m["role"], "text": redact_sensitive_text(m["content"][:700])} for m in rows]}
+               "conversation": [{"id": m["id"], "role": m["role"], "text": redact_sensitive_text(m["content"][:700])} for m in rows],
+               # 2026-10-30 PC: 모델이 ALEX 답 번호를 근거로 섞어 memory·skill 제안이 대부분 검사에서 빠졌다.
+               "user_message_ids": sorted(users)}
     provider = core.providers[Destination.LOCAL_GENERAL]
     previous_limit = getattr(provider, "num_predict", None)
+    thinking = getattr(provider, "think", False)
     try:
         if previous_limit is not None:
             provider.num_predict = min(previous_limit, 2048)
+        if thinking:
+            # JSON 제안만 쓴다. 2026-10-30 PC 에서 Qwen(생각 높음)의 생각이 2048 한도에 5/5 걸려 끊겼다(ThinkingTooLong).
+            provider.think = False
         reply = provider.generate([Message("system", REVIEW_RULES), Message("user", json.dumps(context, ensure_ascii=False))])
     finally:
         if previous_limit is not None:
             provider.num_predict = previous_limit
+        if thinking:
+            provider.think = True
     try:
         items = json.loads(str(reply).strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip())
         if not isinstance(items, list) or len(items) > 3:

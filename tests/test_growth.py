@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 from jarvis.app import handle_command
 from jarvis.growth import GrowthError, GrowthStore, parse_skill, review
 from jarvis.harness.sessions import CodeSessions
-from jarvis.providers import Message
+from jarvis.providers import Message, ThinkingTooLong
 from jarvis.router import Destination
 from jarvis.storage import OWNER
 from test_web import make_state
@@ -37,14 +37,38 @@ class StoreTests(unittest.TestCase):
             self.store.decide(OWNER, record["id"], True)
 
     def test_rejected_and_stale_proposals_cannot_overwrite_the_approved_profile(self):
-        first = self.store.propose(OWNER, "profile", "첫째 선호")
-        second = self.store.propose(OWNER, "profile", "둘째 선호")
+        # 같은 판에서 나온 서로 다른 추가는 합쳐 승인한다(2026-10-30) — 늦게 승인한 쪽이 먼저 것을 지우지 않는다.
+        first = self.store.propose(OWNER, "profile", "- 첫째 선호")
+        second = self.store.propose(OWNER, "profile", "- 둘째 선호")
         rejected = self.store.propose(OWNER, "memory", "확인된 작업 메모")
         self.store.decide(OWNER, rejected["id"], False)
         self.store.decide(OWNER, first["id"], True)
+        self.assertTrue(self.store.decide(OWNER, second["id"], True)["merged"])
+        self.assertEqual(self.store.documents(OWNER), {"USER.md": "- 첫째 선호\n- 둘째 선호"})
+        # 같은 줄을 서로 다르게 고친 제안은 합치지 않는다
+        third = self.store.propose(OWNER, "profile", "- 첫째 선호(수정 A)\n- 둘째 선호")
+        fourth = self.store.propose(OWNER, "profile", "- 첫째 선호(수정 B)\n- 둘째 선호")
+        self.store.decide(OWNER, third["id"], True)
         with self.assertRaisesRegex(GrowthError, "바뀌었습니다"):
+            self.store.decide(OWNER, fourth["id"], True)
+        self.assertEqual(self.store.documents(OWNER), {"USER.md": "- 첫째 선호(수정 A)\n- 둘째 선호"})
+
+    def test_merged_approval_is_checked_like_a_new_proposal(self):
+        first = self.store.propose(OWNER, "profile", "- " + "가" * 1000)
+        second = self.store.propose(OWNER, "profile", "- " + "나" * 1000)
+        self.store.decide(OWNER, first["id"], True)
+        with self.assertRaisesRegex(GrowthError, "합치면"):
             self.store.decide(OWNER, second["id"], True)
-        self.assertEqual(self.store.documents(OWNER), {"USER.md": "첫째 선호"})
+        self.assertEqual(self.store.documents(OWNER), {"USER.md": "- " + "가" * 1000})
+        # 예전 기록(본 판의 글 없음)은 지금처럼 막는다
+        third = self.store.propose(OWNER, "memory", "- 메모 하나")
+        fourth = self.store.propose(OWNER, "memory", "- 메모 둘")
+        record = json.loads(self.store.path(OWNER, f"proposals/{fourth['id']}.json").read_text(encoding="utf-8"))
+        record.pop("base_text")
+        self.store._save(OWNER, record)
+        self.store.decide(OWNER, third["id"], True)
+        with self.assertRaisesRegex(GrowthError, "바뀌었습니다"):
+            self.store.decide(OWNER, fourth["id"], True)
 
     def test_a_tampered_proposal_and_unsafe_content_are_refused(self):
         record = self.store.propose(OWNER, "memory", "테스트 결과를 근거로 판단한다.")
@@ -381,6 +405,32 @@ class CoreTests(unittest.TestCase):
             model.assert_called_once()
             conversation = json.loads(model.call_args.args[0][1].content)["conversation"]
             self.assertEqual([m["text"] for m in conversation if m["role"] == "user"], [f"새 선호 {n}" for n in range(3)])
+
+    def test_review_asks_without_thinking_and_lists_the_user_message_ids(self):
+        # 2026-10-30 PC: 실제 설정(생각 켬·높음)에서 생각이 2048 한도에 걸려 매번 ThinkingTooLong 으로 끝났고,
+        # 모델이 ALEX 답 번호를 근거로 섞어 memory·skill 제안이 검사에서 빠졌다.
+        self.core.storage.add_message(self.session, "user", "나는 한국어로 짧은 답을 선호한다.")
+        ident = self.core.storage.message_page(self.session)["messages"][-1]["id"]
+        self.core.storage.add_message(self.session, "assistant", "알겠습니다.")
+        reply_id = self.core.storage.message_page(self.session)["messages"][-1]["id"]
+        local = self.core.providers[Destination.LOCAL_GENERAL]
+        local.think = True
+        seen = []
+
+        def answer(messages):
+            seen.append((local.think, json.loads(messages[-1].content)["user_message_ids"]))
+            if local.think:
+                raise ThinkingTooLong("생각이 약 1024토큰을 넘어 끊었습니다")
+            return json.dumps([{"kind": "profile", "content": "- 한국어로 짧게 답하는 것을 선호한다.", "evidence": [ident]}],
+                              ensure_ascii=False)
+        local.generate = Mock(side_effect=answer)
+        self.assertIn("배움 제안 1개", review(self.core, self.session))
+        self.assertEqual(len(seen), 1)
+        self.assertFalse(seen[0][0])
+        self.assertIn(ident, seen[0][1])
+        self.assertNotIn(reply_id, seen[0][1])
+        self.assertEqual(seen[0][1], sorted(seen[0][1]))
+        self.assertTrue(local.think)
 
     def test_review_reads_fenced_json_and_keeps_environment_failures_out_of_memory(self):
         self.core.storage.add_message(self.session, "user", "시험은 unittest 로 돌린다. yosys 는 설치되지 않았다.")
