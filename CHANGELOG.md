@@ -1,3 +1,9 @@
+## 2026-10-30 (밤) — 노트북에서 데스크톱 모델로 ALEX 쓰기(모델 노드)
+
+- `connect_desktop.cmd models`: 데스크톱의 Qwen(Strata)·임베딩 서버를 Tailscale 위 SSH 터널로 노트북에 잇고, 노트북의 ALEX 를 그 모델로 켠다.
+  - 파일 작업·명령(Unity 등)은 노트북에서, 답은 데스크톱 GPU 가 만든다(ADR-124).
+- 설정 `model_nodes` 로 다른 기기(Mac·DGX Spark 등)의 모델 서버를 한 줄씩 더할 수 있다. ALEX 는 여전히 127.0.0.1 의 모델 주소만 쓴다. 사용법은 REMOTE_SETUP.md.
+
 ## 2026-10-30 — /growth 실제 모델 확인과 보완, GLM 시험 후 제외
 
 - `/growth review` 를 PC 의 실제 Qwen3.8-Flash-Next 로 확인했다.

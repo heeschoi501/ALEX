@@ -1742,3 +1742,16 @@ Agent Skills 형식의 네이티브 묶음과 보조 파일을 보존하며 승�
 ## ADR-123 — GLM-5.3-Flash REAP-50 시험 후 제외 (2026-10-30, 사용자 결정 · Codex 설치·조정, Claude 연결·진단)
 
 Qwen3.8-Flash-Next 옆에 두 번째 Strata 모델로 GLM-5.3-Flash REAP-50 Q23 을 붙여 시험했다. 한국어 출력이 모델 자체에서 깨졌다. 포크가 영어 코드·문서로만 보정해 전문가를 절반 잘랐기 때문이다. 생성 속도는 결과를 바꾸지 않는 최선 설정(단계 파이프라인)에서 약 16 tok/s 였다. 라우팅 근사·MTP·Q8·스레드와 그 조합은 더 빠르지 않거나 답을 망가뜨렸다. 모델·엔진·선택 코드를 지우고 Strata 는 Qwen 하나로 돌아갔다. 결과는 [GLM_REAP50_EVALUATION_20261030.md](docs/GLM_REAP50_EVALUATION_20261030.md).
+
+## ADR-124 — 모델 노드: 모델은 다른 기기, 일은 이 기기 (2026-10-30, 사용자 요청 · Claude)
+
+**결정:** `python -m jarvis.remote models`(`connect_desktop.cmd models`)는 다른 기기의 모델 서버를 Tailscale 위 SSH 터널로 이 기기의 127.0.0.1 포트에 잇는다. 그 뒤 이 기기의 ALEX 를 환경변수(`JARVIS_LOCAL_BACKEND=strata`, 임베딩도 이으면 `JARVIS_EMBEDDING_ENABLED=1`)로 켠다. 설정 `model_nodes`(`이름=사용자@기기:이기기포트>그기기포트,…; …`)에 기기를 더하고, 비우면 `connect_desktop.cmd setup` 으로 저장한 데스크톱의 Strata·임베딩 포트를 같은 번호로 잇는다.
+
+**계기:** Unity·Unreal 작업은 노트북에서 하고 모델은 데스크톱 GPU 를 쓰려 한다. 데스크톱 GPU 는 Qwen 이 거의 다 쓰고 있어 같은 기기에서 에디터를 함께 띄우면 위험하다. 나중에 Mac·DGX Spark·데스크톱을 함께 쓰는 구성도 고려한다.
+
+**지킨 것:**
+- ALEX 는 여전히 127.0.0.1 의 모델 주소만 쓴다. 로그인·암호화는 SSH 가, 길은 Tailscale 이 맡는다(ADR-052).
+- 노트북 쪽 포트는 127.0.0.1 로 묶는다. 설정값은 검증해서 ssh 옵션으로 읽히지 않게 한다. 이 기기 포트는 기기끼리, ALEX 화면 포트와도 겹치지 않는다.
+- 노트북의 설정 파일은 바꾸지 않는다. 터널 너머가 Strata 가 아니면 ALEX 를 켜지 않는다.
+
+**하지 않은 것:** Strata 가 아닌 서버(vLLM, MLX 등)용 공급자, 여러 노드 중 일에 맞는 모델 고르기, 원격 기기에서 명령 실행은 기기가 생긴 뒤 설계한다. 실제 두 기기 연결은 아직 확인하지 않았다.

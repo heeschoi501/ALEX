@@ -262,6 +262,113 @@ class ConnectTests(RemoteTestBase):
         self.assertEqual(Path(command[command.index("-E") + 1]), self.dir / remote.LOG_NAME)
 
 
+class ModelNodeParseTests(unittest.TestCase):
+    """모델 노드(ADR-124): 다른 기기의 모델 서버를 이 기기 127.0.0.1 포트에 잇는 설정."""
+
+    def test_several_nodes_with_their_own_local_ports(self):
+        nodes = remote.parse_model_nodes("desktop=alexuser@desktop-5080:8080>8080,8081>8081; spark=me@spark-1:18000>8000")
+        self.assertEqual([(n.name, n.user, n.host, n.forwards) for n in nodes],
+                         [("desktop", "alexuser", "desktop-5080", ((8080, 8080), (8081, 8081))),
+                          ("spark", "me", "spark-1", ((18000, 8000),))])
+
+    def test_bad_values_never_reach_ssh(self):
+        for text in ("desktop=alexuser@desktop-5080", "desktop=alexuser@-oProxyCommand=calc:8080>8080",
+                     "Desktop=alexuser@desktop-5080:8080>8080", "a=alexuser@x:8080>8080; a=alexuser@y:9000>9000",
+                     "a=alexuser@x:8080>8080; b=alexuser@y:8080>9000", "a=alexuser@x:8765>8765", "a=alexuser@x:80>80",
+                     "a=alexuser@x:8080>abc", "a=user name@x:8080>8080"):
+            with self.subTest(text=text), self.assertRaises(remote.RemoteError):
+                remote.parse_model_nodes(text)
+
+    def test_empty_setting_means_the_saved_desktop_with_strata_and_embedding_ports(self):
+        settings = replace(Settings(), remote_host="desktop-5080", remote_user="alexuser")
+        node, = remote.model_nodes(settings)
+        self.assertEqual((node.name, node.host, node.forwards), ("desktop", "desktop-5080", ((8080, 8080), (8081, 8081))))
+        self.assertEqual(remote.model_nodes(Settings()), [])
+
+    def test_the_setting_is_checked_when_settings_load(self):
+        from jarvis.config import ConfigError, validate
+        self.assertEqual(LOCAL_FIELDS["model_nodes"], str)
+        with self.assertRaises(ConfigError):
+            validate(replace(Settings(), model_nodes="desktop=alexuser@-oProxyCommand=calc:8080>8080"))
+        validate(replace(Settings(), model_nodes="desktop=alexuser@desktop-5080:8080>8080"))
+
+    def test_every_forward_is_bound_to_loopback_in_one_ssh(self):
+        command = remote.tunnel_command("ssh", "desktop-5080", "alexuser", [(8080, 8080), (18000, 8000)], None)
+        forwards = [command[i + 1] for i, part in enumerate(command) if part == "-L"]
+        self.assertEqual(forwards, ["127.0.0.1:8080:127.0.0.1:8080", "127.0.0.1:18000:127.0.0.1:8000"])
+        self.assertEqual(command[-1], "alexuser@desktop-5080")
+
+
+class ModelsTests(RemoteTestBase):
+    def setUp(self):
+        super().setUp()
+        self.strata, self.embed = free_port(), free_port()
+        self.settings = replace(self.settings, strata_host=f"http://127.0.0.1:{self.strata}",
+                                embedding_host=f"http://127.0.0.1:{self.embed}")
+        self.started: list[dict] = []
+        self.processes: list[FakeProcess] = []
+        patcher = patch.object(remote, "WEB", f"http://127.0.0.1:{free_port()}")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def popen_models(self, strata_health):
+        def popen(command):
+            self.commands.append(command)
+            self.servers.append(FakeAlex(self.strata, strata_health))
+            self.servers.append(FakeAlex(self.embed, {}))
+            process = FakeProcess()
+            self.processes.append(process)
+            return process
+        return popen
+
+    def start_alex(self, environment):
+        self.started.append(environment)
+        for process in self.processes:  # 사용자가 창을 닫은 것처럼 연결을 끝낸다
+            process.returncode = 0
+
+    def run_models(self, popen, which=lambda name: "ssh"):
+        return remote.models(self.settings, popen=popen, which=which, start_alex=self.start_alex,
+                             log_dir=self.dir, wait_limit=5, health_wait=0.5, out=self.out)
+
+    def test_desktop_model_starts_this_alex_on_strata_without_touching_its_settings_file(self):
+        code = self.run_models(self.popen_models({"service": "strata", "model": "qwen3.8-flash-next-iq3_s"}))
+        self.assertEqual(code, 0)
+        self.assertEqual(self.started, [{"JARVIS_LOCAL_BACKEND": "strata", "JARVIS_EMBEDDING_ENABLED": "1"}])
+        forwards = [self.commands[0][i + 1] for i, part in enumerate(self.commands[0]) if part == "-L"]
+        self.assertEqual(forwards, [f"127.0.0.1:{self.strata}:127.0.0.1:{self.strata}",
+                                    f"127.0.0.1:{self.embed}:127.0.0.1:{self.embed}"])
+        self.assertIn("qwen3.8-flash-next-iq3_s", self.said)
+
+    def test_no_model_server_behind_the_tunnel_starts_nothing(self):
+        self.assertEqual(self.run_models(self.popen_models({"app": "jarvis"})), 1)
+        self.assertEqual(self.started, [])
+        self.assertTrue(all(p.terminated for p in self.processes))
+        self.assertIn("모델 서버(Strata)가 응답하지 않습니다", self.said)
+
+    def test_a_running_alex_here_must_be_closed_first(self):
+        with patch.object(remote, "WEB", f"http://127.0.0.1:{self.port}"):
+            self.servers.append(FakeAlex(self.port, self.alex_health()))
+            self.assertEqual(self.run_models(self.popen_models({"service": "strata"})), 2)
+        self.assertEqual(self.commands, [])
+        self.assertIn("이미 켜져 있습니다", self.said)
+
+    def test_a_local_model_server_on_the_same_port_is_reported(self):
+        self.servers.append(FakeAlex(self.strata, {"service": "strata"}))
+        self.assertEqual(self.run_models(self.popen_models({"service": "strata"})), 1)
+        self.assertEqual(self.commands, [])
+        self.assertIn(f"{self.strata}", self.said)
+
+    def test_ssh_failure_is_translated(self):
+        self.assertEqual(self.run_models(self.popen_failing("ssh: connect to host desktop-5080 port 22: Connection refused")), 1)
+        self.assertIn("SSH 서버가 받지 않습니다", self.said)
+        self.assertEqual(self.started, [])
+
+    def test_not_configured_explains_setup(self):
+        self.settings = replace(self.settings, remote_host="", remote_user="")
+        self.assertEqual(self.run_models(self.popen_models({"service": "strata"})), 2)
+        self.assertIn("connect_desktop.cmd setup", self.said)
+
+
 class SetupTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()

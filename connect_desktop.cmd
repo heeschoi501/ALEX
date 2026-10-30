@@ -3,6 +3,7 @@ rem Connect this laptop to the ALEX on your desktop (ADR-052). ASCII only: cp949
 rem   connect_desktop.cmd            connect and open the browser
 rem   connect_desktop.cmd setup ...  first time: make a key and save the desktop name
 rem   connect_desktop.cmd check      what is ready
+rem   connect_desktop.cmd models     run ALEX here with the desktop's model (ADR-124)
 setlocal
 cd /d "%~dp0"
 set "ALEX_PY=%LOCALAPPDATA%\Programs\Python\Python311\python.exe"

@@ -15,7 +15,7 @@ Tailscale 이 집 밖에서도 두 기기를 사설망으로 이어 주므로 �
 from __future__ import annotations
 
 import argparse
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import json
 import os
 from pathlib import Path
@@ -30,7 +30,7 @@ import urllib.request
 import webbrowser
 
 from .config import LOCAL_FIELDS, Settings, load_settings, local_config_path, validate
-from .launcher import code_fingerprint
+from .launcher import WEB, code_fingerprint
 
 ROOT = Path(__file__).resolve().parent.parent
 KEY_NAME = "alex_desktop_ed25519"
@@ -103,6 +103,12 @@ def key_path() -> Path:
 def ssh_command(ssh: str, host: str, user: str, local_port: int, alex_port: int,
                 identity: Path | None, log_file: Path | None = None) -> list[str]:
     """고정된 인자 목록. 셸을 거치지 않는다(ADR-044 와 같은 규칙)."""
+    return tunnel_command(ssh, host, user, [(local_port, alex_port)], identity, log_file)
+
+
+def tunnel_command(ssh: str, host: str, user: str, forwards, identity: Path | None,
+                   log_file: Path | None = None) -> list[str]:
+    """(이 기기 포트, 그 기기 포트) 여럿을 한 SSH 연결로 잇는다 — ALEX 화면(ADR-052)과 모델 노드(ADR-124)가 같이 쓴다."""
     host, user = validate_target(host, user)
     command = [
         ssh, "-N",
@@ -111,9 +117,10 @@ def ssh_command(ssh: str, host: str, user: str, local_port: int, alex_port: int,
         "-o", "ServerAliveCountMax=3",
         "-o", "ConnectTimeout=15",
         "-o", "StrictHostKeyChecking=accept-new",  # 처음 보는 데스크톱은 기억하고, 바뀐 신원은 거부한다
-        # 127.0.0.1 로 명시한다 — 카페 와이파이의 다른 사람은 노트북의 이 포트에 붙지 못한다.
-        "-L", f"127.0.0.1:{local_port}:127.0.0.1:{alex_port}",
     ]
+    for local_port, far_port in forwards:
+        # 127.0.0.1 로 명시한다 — 카페 와이파이의 다른 사람은 노트북의 이 포트에 붙지 못한다.
+        command += ["-L", f"127.0.0.1:{int(local_port)}:127.0.0.1:{int(far_port)}"]
     if identity is not None and identity.exists():
         command += ["-i", str(identity), "-o", "IdentitiesOnly=yes"]
     if log_file is not None:
@@ -253,6 +260,173 @@ def connect(settings: Settings, *, open_browser=webbrowser.open, popen=subproces
     return 0
 
 
+NODE_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
+NODE_HELP = "형식: 이름=사용자@기기:이기기포트>그기기포트,… 여러 기기는 ';' 로. 예: desktop=user@desktop-5080:8080>8080,8081>8081"
+
+ALEX_ALREADY_RUNNING = """이 기기의 ALEX 가 이미 켜져 있습니다. 지금 켜진 ALEX 는 이 기기의 모델 설정을 쓰고 있어서,
+다른 기기의 모델로 바꾸려면 먼저 ALEX 화면의 계정 메뉴에서 '앱 종료' 를 누른 뒤 다시 실행하십시오."""
+
+MODEL_NODE_DOWN = """'{name}' 기기에 연결은 됐는데 모델 서버(Strata)가 응답하지 않습니다.
+  - 그 기기에서 ALEX 가 Strata(Qwen) 엔진으로 켜져 있는지 보십시오. 막 켰다면 1~3분 뒤 다시 실행하십시오."""
+
+
+@dataclass(frozen=True)
+class ModelNode:
+    """모델을 돌리는 다른 기기 — 지금은 데스크톱, 나중에 Mac·DGX Spark(2026-10-30 사용자)."""
+    name: str
+    user: str
+    host: str
+    forwards: tuple[tuple[int, int], ...]   # (이 기기 포트, 그 기기 포트)
+
+
+def parse_model_nodes(text: str) -> list[ModelNode]:
+    """model_nodes 설정을 읽는다. 이 기기 포트는 겹치지 않고 ALEX 화면 포트(8765·8766)와도 다르다."""
+    nodes: list[ModelNode] = []
+    used = {8765, 8766}
+    for part in [p.strip() for p in (text or "").split(";") if p.strip()]:
+        match = re.fullmatch(r"([^=]+)=([^@]+)@([^:]+):(.+)", part)
+        if not match:
+            raise RemoteError(f"모델 노드를 읽지 못했습니다: {part!r}. {NODE_HELP}")
+        name, user, host, ports = (value.strip() for value in match.groups())
+        if not NODE_RE.fullmatch(name) or any(node.name == name for node in nodes):
+            raise RemoteError(f"모델 노드 이름은 겹치지 않는 영문 소문자·숫자·- 로 씁니다: {name!r}")
+        host, user = validate_target(host, user)
+        forwards = []
+        for pair in ports.split(","):
+            local, _, far = pair.strip().partition(">")
+            if not (local.isdigit() and far.isdigit()):
+                raise RemoteError(f"'{name}' 의 포트를 읽지 못했습니다: {pair.strip()!r}. {NODE_HELP}")
+            local_port, far_port = int(local), int(far)
+            if not (1024 <= local_port <= 65535 and 1 <= far_port <= 65535) or local_port in used:
+                raise RemoteError(f"'{name}' 의 이 기기 포트 {local_port} 는 쓸 수 없습니다(1024~65535, 겹치지 않게).")
+            used.add(local_port)
+            forwards.append((local_port, far_port))
+        nodes.append(ModelNode(name, user, host, tuple(forwards)))
+    return nodes
+
+
+def _port(url: str) -> int:
+    return int(url.rsplit(":", 1)[1].split("/", 1)[0])
+
+
+def model_nodes(settings: Settings) -> list[ModelNode]:
+    """설정한 노드. 없으면 connect_desktop.cmd setup 으로 저장한 데스크톱의 Strata·임베딩 포트를 같은 번호로 잇는다."""
+    if settings.model_nodes.strip():
+        return parse_model_nodes(settings.model_nodes)
+    host, user = settings.remote_host.strip(), settings.remote_user.strip()
+    if not host or not user:
+        return []
+    ports = (_port(settings.strata_host), _port(settings.embedding_host))
+    return parse_model_nodes(f"desktop={user}@{host}:" + ",".join(f"{p}>{p}" for p in ports))
+
+
+def read_strata(port: int, timeout: float = 5.0) -> dict:
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(f"http://127.0.0.1:{port}/health", timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except (OSError, ValueError, urllib.error.URLError) as exc:
+        raise RemoteError(f"모델 서버 응답 없음: {type(exc).__name__}") from None
+    if not isinstance(data, dict) or data.get("service") != "strata":
+        raise RemoteError("그 포트에서 응답한 것은 Strata 모델 서버가 아닙니다.")
+    return data
+
+
+def start_local_alex(environment: dict[str, str]):
+    """이 기기의 ALEX 를 다른 기기 모델로 켠다. 환경변수가 jarvis.local.json 보다 앞서므로 설정 파일은 그대로다."""
+    return subprocess.Popen([sys.executable, "-m", "jarvis.launcher"], cwd=ROOT, env={**os.environ, **environment})
+
+
+def models(settings: Settings, *, popen=subprocess.Popen, which=shutil.which, start_alex=start_local_alex,
+           log_dir: Path | None = None, wait_limit: float = 120.0, health_wait: float = 10.0, out=print) -> int:
+    """다른 기기(모델 노드)의 모델로 이 기기의 ALEX 를 쓴다(2026-10-30, ADR-124).
+
+    ALEX 의 파일 작업·명령(예: 노트북의 Unity)은 이 기기에서, 모델은 그 기기의 GPU 에서 돈다. ALEX 는 여전히
+    127.0.0.1 의 모델 주소만 쓰고(strata_host 검사 그대로), SSH 가 로그인·암호화를, Tailscale 이 길을 맡는다."""
+    try:
+        nodes = model_nodes(settings)
+    except RemoteError as exc:
+        out(str(exc))
+        return 2
+    if not nodes:
+        out(SETUP_HELP)
+        return 2
+    if port_open(_port(WEB)):
+        out(ALEX_ALREADY_RUNNING)
+        return 2
+    busy = [local for node in nodes for local, _ in node.forwards if port_open(local)]
+    if busy:
+        out(f"이 기기의 {', '.join(map(str, busy))} 번 포트를 이미 다른 프로그램이 씁니다. 이 기기에서 모델 서버가 떠 있거나 "
+            "다른 연결 창이 열려 있습니다. 그것을 끄고 다시 실행하십시오.")
+        return 1
+    ssh = which("ssh")
+    if not ssh:
+        out(NO_SSH_HELP)
+        return 2
+    log_dir = log_dir or ROOT / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    running = []
+    for node in nodes:
+        log_file = log_dir / f"remote-model-{node.name}.log"
+        log_file.write_text("", encoding="utf-8")
+        out(f"'{node.name}'({node.user}@{node.host}) 의 모델에 연결합니다…")
+        running.append((node, log_file, popen(tunnel_command(ssh, node.host, node.user, node.forwards, key_path(), log_file))))
+
+    def stop_all():
+        for _, _, process in running:
+            if process.poll() is None:
+                process.terminate()
+
+    deadline = time.monotonic() + wait_limit
+    for node, log_file, process in running:
+        while not all(port_open(local) for local, _ in node.forwards):
+            if process.poll() is not None or time.monotonic() >= deadline:
+                stop_all()
+                out(f"'{node.name}': " + diagnose(log_file.read_text(encoding="utf-8", errors="replace"),
+                                                  process.returncode, node.forwards[0][0]))
+                return 1
+            time.sleep(0.3)
+    environment: dict[str, str] = {}
+    forwarded = {local for node in nodes for local, _ in node.forwards}
+    strata = _port(settings.strata_host)
+    if strata in forwarded:
+        node = next(n for n in nodes if any(local == strata for local, _ in n.forwards))
+        until = time.monotonic() + health_wait
+        while True:
+            try:
+                health = read_strata(strata)
+                break
+            except RemoteError:
+                if time.monotonic() >= until:
+                    stop_all()
+                    out(MODEL_NODE_DOWN.format(name=node.name))
+                    return 1
+                time.sleep(1.0)
+        out(f"모델: '{node.name}' 의 {health.get('model') or 'Strata'}")
+        environment["JARVIS_LOCAL_BACKEND"] = "strata"
+    if _port(settings.embedding_host) in forwarded:
+        environment["JARVIS_EMBEDDING_ENABLED"] = "1"
+    start_alex(environment)
+    out("이 기기의 ALEX 를 켭니다. 파일 작업·명령은 이 기기에서, 답은 연결한 기기의 모델이 만듭니다.")
+    out("이 창을 닫으면 모델 연결이 끊깁니다. 대화는 이 기기에 저장됩니다.")
+    try:
+        while all(process.poll() is None for _, _, process in running):
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        stop_all()
+        return 0
+    failed = False
+    for node, log_file, process in running:
+        if process.poll() is not None and process.returncode:
+            failed = True
+            out(f"'{node.name}' 연결이 끊겼습니다. " + diagnose(log_file.read_text(encoding="utf-8", errors="replace"),
+                                                         process.returncode, node.forwards[0][0]))
+    stop_all()
+    if not failed:
+        out("모델 연결이 끊겼습니다.")
+    return 1 if failed else 0
+
+
 def save_target(host: str, user: str, *, path: Path | None = None) -> Path:
     """웹 설정 저장과 같은 방식 — 검증 → 임시 파일 → 원자적 교체. 원래 파일은 .bak 으로 남긴다."""
     host, user = validate_target(host, user)
@@ -346,6 +520,7 @@ def main(argv: list[str] | None = None) -> int:
     p_setup.add_argument("--user", required=True, help="데스크톱의 윈도우 사용자 이름")
     sub.add_parser("check", help="준비 상태 확인")
     sub.add_parser("connect", help="연결(기본)")
+    sub.add_parser("models", help="다른 기기의 모델로 이 기기의 ALEX 를 켠다(ADR-124)")
     args = parser.parse_args(argv)
     os.chdir(ROOT)
     if args.command == "setup":
@@ -353,6 +528,8 @@ def main(argv: list[str] | None = None) -> int:
     settings = load_settings()
     if args.command == "check":
         return check(settings)
+    if args.command == "models":
+        return models(settings)
     return connect(settings)
 
 
