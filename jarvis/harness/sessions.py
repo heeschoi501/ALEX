@@ -37,6 +37,7 @@ from . import permission as perm
 from .agent import AgentResult, CodingAgent
 from .tools import ShellPolicy, Workspace
 from .verification import TestIndex, python_snapshot, source_changes, verify_copy
+from .worknode import NodeError, NodeLink, NodeRoot, message_from
 
 PERMISSION_WAIT = 600.0
 KEEP_EVENTS = 2000
@@ -74,8 +75,14 @@ class CodeSession:
     model: str = ""               # '' = 이 PC 모델(ALEX 하네스), 'opencode/<모델>' = OpenCode 무료 모델(2026-10-23)
     oc_session: str = ""          # 무료 모델 세션의 OpenCode 세션 id(이어 말하기)
     transcript: list[dict] = field(default_factory=list)   # 무료 모델 세션의 대화(ALEX 에이전트가 없으니 따로)
+    node: str = ""                # 작업 노드 이름 — 세션이 그 기기에서 돈다(ADR-125, 2026-10-30)
+    link: object = None           # worknode.NodeLink
+    remote: dict = field(default_factory=dict)   # 그 기기 세션의 마지막 상태(public)
 
     def public(self) -> dict:
+        if self.node:
+            return {**self.remote, "id": self.id, "directory": f"{self.node}:{self.root}", "node": self.node,
+                    "status": self.remote.get("status", self.status)}
         last = self.last
         return {"id": self.id, "title": self.title, "directory": str(self.root), "status": self.status, "tier": self.tier,
                 "mode": self.agent.mode if self.agent else "build", "created": self.created, "model": self.model,
@@ -130,8 +137,10 @@ class CodeSessions:
                  shell: ShellPolicy | None = None, fetch=None, search=None, mcp=None,
                  lessons: Callable[[], str] | None = None, max_steps: int = 80, timeout: float = 900, logger=None,
                  outcome: Callable[[dict], None] | None = None, opencode_home: Path | None = None,
-                 opencode_command: list[str] | None = None, library_skills: Callable[[str], dict] | None = None) -> None:
+                 opencode_command: list[str] | None = None, library_skills: Callable[[str], dict] | None = None,
+                 node_popen=None) -> None:
         self.provider_getter = provider_getter
+        self.node_popen = node_popen or subprocess.Popen   # 작업 노드 SSH(시험은 이 PC 의 일꾼을 바로 띄운다)
         self.outcome = outcome   # 배울 기록 남기기(dev-outcomes 'code' — /dev-learn 이 읽음, 2026-10-23)
         # OpenCode 무료 모델 세션용 opencode.exe 폴더(무료 단계는 OpenCode 안에서만 된다 — jarvis/freemodels.py)
         self.opencode_home = Path(opencode_home) if opencode_home else Path(__file__).resolve().parents[3] / "tools" / "opencode"
@@ -180,6 +189,8 @@ class CodeSessions:
         return workspace
 
     def create(self, owner: str, root: Path, tier: str = "ask", title: str = "", model: str = "") -> CodeSession:
+        if isinstance(root, NodeRoot):
+            return self._create_on_node(owner, root, tier, title, model)
         root = Path(root).resolve()
         if not root.is_dir():
             raise ValueError(f"작업 폴더가 없습니다: {root}")
@@ -199,6 +210,80 @@ class CodeSessions:
             raise KeyError("코딩 세션을 찾지 못했습니다.")
         return session
 
+    # ── 작업 노드(ADR-125): 세션은 그 기기에서, 모델은 여기서
+    def _create_on_node(self, owner: str, root: NodeRoot, tier: str, title: str, model: str) -> CodeSession:
+        if model:
+            raise ValueError("다른 기기의 코딩 세션은 이 ALEX 의 모델만 씁니다.")
+        session = CodeSession("ses_" + secrets.token_hex(8), owner, Path(root.path), tier if tier in ("read", "ask", "auto") else "ask",
+                              title=str(title or "")[:80], node=root.node)
+        link = NodeLink(list(root.command), on_event=lambda message: self._node_event(session, message),
+                        on_model=lambda message: self._node_model(session, message),
+                        on_model_cancel=lambda _ident: session.cancel.set(), popen=self.node_popen)
+        try:
+            link.hello(bool(getattr(self.provider_getter(), "think", False)))
+            session.remote = link.open(root.path, session.tier, session.title)
+        except (NodeError, KeyError, ValueError) as exc:
+            link.close()
+            raise ValueError(f"'{root.node}' 에서 코딩 세션을 열지 못했습니다: {exc}") from exc
+        session.link = link
+        self.sessions[session.id] = session
+        self._emit(session, "session.created", info=session.public())
+        return session   # 대화·되돌리기 기록은 그 기기 세션에 있다 — 여기 store 에 남기지 않는다
+
+    def _node_event(self, session: CodeSession, message: dict) -> None:
+        event = dict(message.get("event") or {})
+        session.remote = message.get("info") or session.remote
+        session.status = session.remote.get("status", session.status)
+        kind = event.pop("type", "")
+        for key in ("n", "time"):
+            event.pop(key, None)
+        if not kind or kind == "session.created":
+            return
+        if "info" in event:
+            event["info"] = session.public()
+        self._emit(session, kind, **event)
+
+    def _node_model(self, session: CodeSession, message: dict) -> tuple[str, list]:
+        """그 기기의 에이전트가 부른 모델 한 차례 — 여기 모델 차례를 잡고, 글 조각은 여기 세션 사건으로 흘린다."""
+        buffer: list[str] = []
+        flushed = [time.monotonic()]
+
+        def flush() -> None:
+            if buffer:
+                self._emit(session, "message.delta", text="".join(buffer))
+                buffer.clear()
+            flushed[0] = time.monotonic()
+
+        def delta(chunk: str) -> None:
+            buffer.append(str(chunk))
+            if sum(map(len, buffer)) >= DELTA_CHARS or time.monotonic() - flushed[0] >= DELTA_SECONDS:
+                flush()
+
+        @contextmanager
+        def turn():
+            with self.model_turn(session):
+                try:
+                    yield
+                finally:
+                    flush()
+
+        left = message.get("deadline_in")
+        provider = _Gated(self.provider_getter, turn, delta)
+        return provider.chat_step_controlled([message_from(m) for m in message.get("messages") or []], message.get("tools"),
+                                             cancel_event=session.cancel,
+                                             deadline=None if left is None else time.monotonic() + float(left),
+                                             think=message.get("think"))
+
+    def _relay(self, session: CodeSession, method: str, *args, **kwargs):
+        link = session.link
+        if link is None or not link.alive:
+            session.status = "error"
+            raise ValueError(link.failure() if link is not None else f"'{session.node}' 연결이 없습니다. 새 세션을 여세요.")
+        try:
+            return link.call(method, *args, **kwargs)
+        except NodeError as exc:
+            raise ValueError(str(exc)) from exc
+
     def list(self, owner: str) -> list[dict]:
         return [s.public() for s in sorted(self.sessions.values(), key=lambda s: -s.created) if s.owner == owner]
 
@@ -206,6 +291,11 @@ class CodeSessions:
         session = self.get(session_id, owner)
         if session.status == "running":
             raise ValueError("일하는 중인 세션은 지울 수 없습니다. 중단한 뒤 지워 주세요.")
+        if session.node:
+            self.sessions.pop(session.id, None)
+            if session.link is not None:
+                session.link.close()
+            return
         self.sessions.pop(session.id, None)
         if self.store is not None:
             (self.store / f"{session.id}.json").unlink(missing_ok=True)
@@ -215,6 +305,8 @@ class CodeSessions:
     def messages(self, session_id: str, owner: str | None = None) -> list[dict]:
         """대화(시스템 지시문 빼고) — 화면에 다시 그릴 때."""
         session = self.get(session_id, owner)
+        if session.node:
+            return self._relay(session, "messages")
         if session.agent is None:
             return [dict(m) for m in session.transcript]
         return [{"role": m.role, "content": m.content, "tool_calls": m.tool_calls, "tool_name": m.tool_name}
@@ -244,6 +336,8 @@ class CodeSessions:
 
     def reply_permission(self, session_id: str, request_id: str, response: str, owner: str | None = None) -> None:
         session = self.get(session_id, owner)
+        if session.node:
+            return self._relay(session, "reply_permission", request_id, response)
         request = session.permissions.get(request_id)
         if request is None or request.answered.is_set():
             raise KeyError("기다리는 권한 요청이 없습니다.")
@@ -255,12 +349,17 @@ class CodeSessions:
     # ── 일 시키기
     def commands(self, session_id: str, owner: str | None = None) -> list[dict]:
         session = self.get(session_id, owner)
+        if session.node:
+            return self._relay(session, "commands")
         return [{"name": c.name, "description": c.description, "source": c.source, "subtask": c.subtask}
                 for c in cmds.find_commands(session.root).values()]
 
     def command(self, session_id: str, name: str, arguments: str = "", *, owner: str | None = None, mode: str = "") -> None:
         """'/이름 인자'(OpenCode session.command) — 지시문을 채워 보낸다. agent 가 general·explore 거나 subtask 면 하위 에이전트로."""
         session = self.get(session_id, owner)
+        if session.node:
+            session.cancel.clear()
+            return self._relay(session, "command", name, arguments, mode=mode)
         found = cmds.find_commands(session.root).get(str(name or "").lstrip("/"))
         if found is None:
             names = ", ".join("/" + n for n in cmds.find_commands(session.root))
@@ -277,6 +376,10 @@ class CodeSessions:
         """mode: build·plan — 비우면 지금 모드 그대로. 질문(question)에 멈춘 세션이면 이 글이 답이 된다.
         명령에서 올 때: shown(화면·대화에 보일 '/이름 인자'), subtask(하위 에이전트 종류), shell(!`명령` 을 bash 도구로 채움)."""
         session = self.get(session_id, owner)
+        if session.node:
+            session.cancel.clear()   # 여기 모델 차례의 중단 신호 — 그 기기 세션은 자기 것을 따로 쓴다
+            return self._relay(session, "prompt", text, mode=mode, shown=shown, subtask=subtask,
+                               description=description, shell=shell)
         if session.status == "running":
             raise ValueError("이 세션은 아직 일하는 중입니다. 끝나거나 중단한 뒤 보내 주세요.")
         if not str(text or "").strip():
@@ -590,6 +693,8 @@ class CodeSessions:
     def abort(self, session_id: str, owner: str | None = None) -> None:
         session = self.get(session_id, owner)
         session.cancel.set()
+        if session.node:
+            return self._relay(session, "abort")
         for request in list(session.permissions.values()):
             if not request.answered.is_set():
                 request.response = "reject"
@@ -598,14 +703,20 @@ class CodeSessions:
 
     def diff(self, session_id: str, owner: str | None = None) -> str:
         session = self.get(session_id, owner)
+        if session.node:
+            return self._relay(session, "diff")
         return session.workspace.diff() if session.workspace else ""
 
     def todo(self, session_id: str, owner: str | None = None) -> list[dict]:
         session = self.get(session_id, owner)
+        if session.node:
+            return self._relay(session, "todo")
         return list(session.workspace.todos) if session.workspace else []
 
     def revert(self, session_id: str, step: int = 0, owner: str | None = None) -> list[str]:
         session = self.get(session_id, owner)
+        if session.node:
+            return self._relay(session, "revert", int(step))
         if session.status == "running":
             raise ValueError("일하는 중에는 되돌릴 수 없습니다. 중단한 뒤 되돌려 주세요.")
         restored = session.workspace.revert(int(step)) if session.workspace else []

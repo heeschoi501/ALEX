@@ -2998,7 +2998,13 @@ class JarvisCore:
 
         model = identify(self.providers.get(destination)) if destination else ""
         model = model or identify(self.providers.get(Destination.LOCAL_GENERAL))
-        facts = [f"너는 Project ALEX 이고 이 기계에서 로컬 모델 {model or '(미상)'} 로 돌고 있다."]
+        node = os.getenv("JARVIS_MODEL_NODE", "").strip()
+        if node:
+            # 모델 노드(ADR-124). 2026-10-30 노트북 ALEX 가 "데스크탑이랑 잘 연결된거 맞아?" 에 자기 상태를 몰라 웹을 검색했다.
+            facts = [f"너는 Project ALEX 이고 이 기계에서 돌지만, 답을 만드는 모델 {model or '(미상)'} 은 다른 기기 '{node}' 의 것을 "
+                     "SSH 터널로 빌려 쓰고 있다. 파일 작업·명령은 이 기계에서 한다."]
+        else:
+            facts = [f"너는 Project ALEX 이고 이 기계에서 로컬 모델 {model or '(미상)'} 로 돌고 있다."]
 
         hardware = self.hardware
         parts = [f"프로필 {hardware.profile.value}"]

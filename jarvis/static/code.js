@@ -385,10 +385,12 @@ $('backdrop').addEventListener('click', () => { document.body.classList.remove('
 (async () => {
   setStatus('idle');
   try {
-    const {root, directory, models} = await api('/api/code/path');
+    const {root, directory, models, nodes} = await api('/api/code/path');
     for (const m of models || []) $('new-model').append(new Option(`OpenCode 무료 · ${m.name}`, m.id));
     $('new-dir').placeholder = directory || root;
-    $('root-note').textContent = root ? `비우면 지금 프로젝트. 상대 경로는 ${root} 기준.` : '승인된 파일 루트가 없어 세션을 열 수 없습니다.';
+    $('root-note').textContent = (root ? `비우면 지금 프로젝트. 상대 경로는 ${root} 기준.` : '승인된 파일 루트가 없어 세션을 열 수 없습니다.')
+      // 작업 노드(ADR-125): 다른 기기에서 돌 세션은 '이름:그 기기의 폴더'
+      + ((nodes || []).length ? ` 다른 기기에서: ${nodes.map(n => `${n}:그 기기의 폴더`).join(', ')}` : '');
   } catch (err) { note(err.message, 'error'); }
   await loadList();
   let last = new URLSearchParams(location.search).get('session');   // 대화에서 연 세션(2026-10-23)

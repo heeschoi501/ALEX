@@ -1129,6 +1129,9 @@ def handle_command(core: JarvisCore, session_id: str, text: str) -> tuple[str, b
             f"profile: {core.hardware.profile.value}",
             f"general_model: {model_name(general_provider)}",
             coder_line,
+            # 모델 노드(ADR-124): 답을 만드는 모델이 다른 기기에 있으면 어디인지
+            *([f"model_node: {os.getenv('JARVIS_MODEL_NODE')} (SSH 터널, {getattr(general_provider, 'host', '')})"]
+              if os.getenv("JARVIS_MODEL_NODE") else []),
             f"session: {session_id}",
             f"session_title: {title or '-'}",
             f"project: {project}",

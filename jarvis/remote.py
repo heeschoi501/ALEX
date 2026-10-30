@@ -309,6 +309,10 @@ def _port(url: str) -> int:
     return int(url.rsplit(":", 1)[1].split("/", 1)[0])
 
 
+# 그 기기 쪽 포트로 역할을 안다 — ALEX 가 띄우는 Strata·임베딩 서버의 기본 자리.
+STRATA_FAR, EMBEDDING_FAR = _port(Settings().strata_host), _port(Settings().embedding_host)
+
+
 def model_nodes(settings: Settings) -> list[ModelNode]:
     """설정한 노드. 없으면 connect_desktop.cmd setup 으로 저장한 데스크톱의 Strata·임베딩 포트를 같은 번호로 잇는다."""
     if settings.model_nodes.strip():
@@ -316,8 +320,75 @@ def model_nodes(settings: Settings) -> list[ModelNode]:
     host, user = settings.remote_host.strip(), settings.remote_user.strip()
     if not host or not user:
         return []
-    ports = (_port(settings.strata_host), _port(settings.embedding_host))
-    return parse_model_nodes(f"desktop={user}@{host}:" + ",".join(f"{p}>{p}" for p in ports))
+    return parse_model_nodes(f"desktop={user}@{host}:{STRATA_FAR}>{STRATA_FAR},{EMBEDDING_FAR}>{EMBEDDING_FAR}")
+
+
+def free_port() -> int:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def with_free_ports(node: ModelNode) -> ModelNode:
+    """이 기기의 같은 번호 포트가 이미 쓰이면 빈 포트로 바꾼다(2026-10-30 노트북 8080 충돌 — 설정 세 곳을 손으로 맞춰야 했다)."""
+    return replace(node, forwards=tuple((free_port() if port_open(local) else local, far) for local, far in node.forwards))
+
+
+# ── 작업 노드(ADR-125): 이 ALEX 가 다른 기기에서 코드 세션을 돌린다 — 모델 노드의 반대 방향
+NODE_KEY_NAME = "alex_node_ed25519"   # 이 ALEX 가 작업 노드에 들어갈 때 쓰는 키(공개키를 노드마다 등록)
+PATH_BAD = re.compile(r"[\"'&|;<>^%$`\r\n]")   # 원격 명령줄에 들어간다 — 셸 문자를 받지 않는다
+WORK_HELP = "형식: 이름=사용자@기기:그기기의ALEX폴더 여러 기기는 ';' 로. 예: laptop=user@laptop-1:C:\\ALEX\\ALEX-main"
+
+
+@dataclass(frozen=True)
+class WorkNode:
+    """일을 시킬 다른 기기 — 지금 노트북, 나중에 Mac·DGX Spark·데스크톱(2026-10-30 사용자)."""
+    name: str
+    user: str
+    host: str
+    alex: str   # 그 기기의 ALEX 폴더(일꾼 python -m jarvis.harness.worknode 를 여기서 띄운다)
+
+    @property
+    def windows(self) -> bool:
+        return bool(re.match(r"[A-Za-z]:[\\/]", self.alex))
+
+
+def node_key_path() -> Path:
+    return Path.home() / ".ssh" / NODE_KEY_NAME
+
+
+def absolute_node_path(path: str) -> bool:
+    return bool(re.match(r"[A-Za-z]:[\\/]", path) or path.startswith("/")) and not PATH_BAD.search(path)
+
+
+def parse_work_nodes(text: str) -> list[WorkNode]:
+    nodes: list[WorkNode] = []
+    for part in [p.strip() for p in (text or "").split(";") if p.strip()]:
+        match = re.fullmatch(r"([^=]+)=([^@]+)@([^:]+):(.+)", part)
+        if not match:
+            raise RemoteError(f"작업 노드를 읽지 못했습니다: {part!r}. {WORK_HELP}")
+        name, user, host, alex = (value.strip() for value in match.groups())
+        # 두 글자 이상 — 'C:\…' 의 드라이브 글자와 헷갈리지 않게
+        if len(name) < 2 or not NODE_RE.fullmatch(name) or any(node.name == name for node in nodes):
+            raise RemoteError(f"작업 노드 이름은 겹치지 않는 두 글자 이상 영문 소문자·숫자·- 로 씁니다: {name!r}")
+        host, user = validate_target(host, user)
+        if not absolute_node_path(alex):
+            raise RemoteError(f"'{name}' 의 ALEX 폴더는 절대 경로이고 따옴표·&·| 같은 문자가 없어야 합니다: {alex!r}")
+        nodes.append(WorkNode(name, user, host, alex))
+    return nodes
+
+
+def node_command(ssh: str, node: WorkNode, identity: Path | None) -> list[str]:
+    """그 기기에서 일꾼을 띄우는 고정 인자 목록. 원격 명령은 그 기기의 셸이 읽는다 — 경로는 parse_work_nodes 가 거른 것."""
+    if node.windows:   # 윈도우 OpenSSH 의 기본 셸은 cmd
+        remote = f'cd /d "{node.alex}" && py -3.11 -X utf8 -m jarvis.harness.worknode'
+    else:              # macOS·리눅스(Mac Studio·DGX Spark)
+        remote = f"cd '{node.alex}' && exec python3 -X utf8 -m jarvis.harness.worknode"
+    command = [ssh, "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=30",
+               "-o", "ServerAliveCountMax=3", "-o", "StrictHostKeyChecking=accept-new"]
+    if identity is not None and identity.exists():
+        command += ["-i", str(identity), "-o", "IdentitiesOnly=yes"]
+    return command + [f"{node.user}@{node.host}", remote]
 
 
 def read_strata(port: int, timeout: float = 5.0) -> dict:
@@ -354,6 +425,8 @@ def models(settings: Settings, *, popen=subprocess.Popen, which=shutil.which, st
     if port_open(_port(WEB)):
         out(ALEX_ALREADY_RUNNING)
         return 2
+    if not settings.model_nodes.strip():  # 손으로 정한 포트는 그대로 두고, 기본 데스크톱 연결만 빈 포트를 고른다
+        nodes = [with_free_ports(node) for node in nodes]
     busy = [local for node in nodes for local, _ in node.forwards if port_open(local)]
     if busy:
         out(f"이 기기의 {', '.join(map(str, busy))} 번 포트를 이미 다른 프로그램이 씁니다. 이 기기에서 모델 서버가 떠 있거나 "
@@ -386,15 +459,15 @@ def models(settings: Settings, *, popen=subprocess.Popen, which=shutil.which, st
                                                   process.returncode, node.forwards[0][0]))
                 return 1
             time.sleep(0.3)
+    # 역할은 그 기기 쪽 포트로 안다. 이 기기 쪽 주소는 환경변수로 넘겨 jarvis.local.json 의 strata_host 등을 맞출 필요가 없다.
     environment: dict[str, str] = {}
-    forwarded = {local for node in nodes for local, _ in node.forwards}
-    strata = _port(settings.strata_host)
-    if strata in forwarded:
-        node = next(n for n in nodes if any(local == strata for local, _ in n.forwards))
+    strata = next(((node, local) for node in nodes for local, far in node.forwards if far == STRATA_FAR), None)
+    if strata is not None:
+        node, local = strata
         until = time.monotonic() + health_wait
         while True:
             try:
-                health = read_strata(strata)
+                health = read_strata(local)
                 break
             except RemoteError:
                 if time.monotonic() >= until:
@@ -402,10 +475,12 @@ def models(settings: Settings, *, popen=subprocess.Popen, which=shutil.which, st
                     out(MODEL_NODE_DOWN.format(name=node.name))
                     return 1
                 time.sleep(1.0)
-        out(f"모델: '{node.name}' 의 {health.get('model') or 'Strata'}")
-        environment["JARVIS_LOCAL_BACKEND"] = "strata"
-    if _port(settings.embedding_host) in forwarded:
-        environment["JARVIS_EMBEDDING_ENABLED"] = "1"
+        out(f"모델: '{node.name}' 의 {health.get('model') or 'Strata'} (이 기기 127.0.0.1:{local})")
+        environment.update({"JARVIS_LOCAL_BACKEND": "strata", "JARVIS_STRATA_HOST": f"http://127.0.0.1:{local}",
+                            "JARVIS_MODEL_NODE": f"{node.name}({node.user}@{node.host})"})
+    embedding = next((local for node in nodes for local, far in node.forwards if far == EMBEDDING_FAR), None)
+    if embedding is not None:
+        environment.update({"JARVIS_EMBEDDING_ENABLED": "1", "JARVIS_EMBEDDING_HOST": f"http://127.0.0.1:{embedding}"})
     start_alex(environment)
     out("이 기기의 ALEX 를 켭니다. 파일 작업·명령은 이 기기에서, 답은 연결한 기기의 모델이 만듭니다.")
     out("이 창을 닫으면 모델 연결이 끊깁니다. 대화는 이 기기에 저장됩니다.")

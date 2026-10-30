@@ -710,8 +710,33 @@ class WebAppState:
                     self.queue.remove(ticket)
                 self.queue_cv.notify_all()
 
+    def work_nodes(self) -> list:
+        from .remote import parse_work_nodes
+        return parse_work_nodes(self.settings.work_nodes) if self.settings is not None else []
+
+    def node_root(self, raw: str):
+        """'이름:그기기의폴더' → 그 기기에서 돌 세션(ADR-125). 이 PC 경로('C:\\…'·상대 경로)면 None.
+        그 기기는 사용자의 기기다 — 이 PC 의 승인 파일 루트 대신 세션의 권한 단계가 지킨다."""
+        name, sep, path = raw.partition(":")
+        if not sep or len(name) < 2 or "\\" in name or "/" in name:
+            return None
+        from .harness.worknode import NodeRoot
+        from .remote import absolute_node_path, node_command, node_key_path
+        node = next((n for n in self.work_nodes() if n.name == name), None)
+        if node is None:
+            raise ValueError(f"'{name}' 은 등록된 작업 노드가 아닙니다. 설정 work_nodes 에 더하세요(REMOTE_SETUP.md).")
+        path = path.strip()
+        if not absolute_node_path(path):
+            raise ValueError(f"'{name}' 의 폴더는 그 기기의 절대 경로로 쓰세요(따옴표·&·| 같은 문자 없이): {path!r}")
+        ssh = shutil.which("ssh")
+        if not ssh:
+            raise ValueError("이 PC 에 ssh 가 없습니다. 윈도우 설정 → 선택적 기능 → 'OpenSSH 클라이언트' 를 추가하세요.")
+        return NodeRoot(node.name, path, tuple(node_command(ssh, node, node_key_path())))
+
     def code_root(self, raw: Any) -> Path:
-        """코딩 세션 폴더 — 시작할 때 승인한 파일 루트 안만. 비우면 지금 프로젝트 폴더."""
+        """코딩 세션 폴더 — 시작할 때 승인한 파일 루트 안만. 비우면 지금 프로젝트 폴더. '이름:폴더' 는 작업 노드."""
+        if raw and (remote := self.node_root(str(raw))) is not None:
+            return remote
         approved = getattr(self.core, "_approved_file_root", None)
         if approved is None:
             raise ValueError("승인된 파일 루트가 없어 코딩 세션을 열 수 없습니다.")
@@ -2007,7 +2032,7 @@ def _handler_factory(state: WebAppState):
                     approved = getattr(state.core, "_approved_file_root", None)
                     self._json(HTTPStatus.OK, {"root": str(approved or ""),
                                                "directory": str(state.core.current_project_root() or approved or ""),
-                                               "models": state.free_models()})
+                                               "models": state.free_models(), "nodes": [n.name for n in state.work_nodes()]})
                     return
                 if not parts or parts[0] != "session":
                     raise LookupError("not found")

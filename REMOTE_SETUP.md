@@ -106,6 +106,36 @@ connect_desktop.cmd models
 - ALEX 는 지금처럼 127.0.0.1 의 모델 주소만 씁니다.
 - Strata 가 아닌 서버(Spark 의 vLLM, Mac 의 MLX 등)를 ALEX 가 고르는 기능은 기기가 생긴 뒤 붙입니다.
 
+## 메인 ALEX 가 다른 기기에서 일하기 — 작업 노드 (2026-10-30, ADR-125)
+
+메인 ALEX(지금 데스크톱, 나중에 Mac Studio·DGX Spark)가 **다른 기기의 폴더에서 코딩 세션**을 돌립니다.
+- 대화·기억·배움·모델은 메인 ALEX 하나에 있습니다.
+- 파일 읽기·고치기·명령(Unity 컴파일 등)은 그 기기에서 일어납니다.
+- 그 기기에는 모델도 GPU 도 필요 없습니다. ALEX 코드(같은 판)와 Python 만 있으면 됩니다.
+
+### 기기마다 처음 한 번
+
+1. 그 기기를 Tailscale 에 같은 계정으로 로그인합니다.
+2. 그 기기의 SSH 서버를 켭니다.
+   - 윈도우: 관리자 PowerShell 에서 OpenSSH 서버를 설치하고, 방화벽은 Tailscale 주소(100.64.0.0/10)만 받게 합니다.
+   - Mac: 시스템 설정 → 일반 → 공유 → 원격 로그인. DGX Spark(리눅스)는 처음부터 켜져 있습니다.
+3. 메인의 키(`%USERPROFILE%\.ssh\alex_node_ed25519.pub`)를 그 기기에 등록합니다.
+   - 윈도우는 `administrators_authorized_keys` 와 사용자 `authorized_keys` 둘 다에 넣습니다.
+4. 그 기기에 ALEX 를 GitHub main 최신판으로 받아 둡니다.
+5. 메인 ALEX 의 `jarvis.local.json` 에 한 줄을 더합니다.
+
+```
+"work_nodes": "laptop=<사용자>@<노트북 이름>:<노트북의 ALEX 폴더>; mac=<사용자>@<mac 이름>:/Users/<사용자>/ALEX"
+```
+
+### 쓰기
+
+코딩 화면의 폴더 칸에 **`이름:그 기기의 폴더`** 를 씁니다(예: `laptop:C:\Unity\MyGame`).
+
+- 권한 단계(읽기만·확인 후 실행·자동)는 이 PC 에서와 같습니다. '확인 후 실행' 의 허락 요청은 메인 화면에 뜹니다.
+- 바뀐 내용 보기·되돌리기·중단도 이 PC 세션과 같습니다.
+- 메인 ALEX 를 다시 켜면 그 기기 세션은 끝납니다. 새 세션을 여십시오.
+
 ## 두 PC의 업데이트를 한곳에 모으려면
 
 데스크톱을 **기준 ALEX**로 정하십시오. 데스크톱 설치가 끝난 뒤에는 노트북에서

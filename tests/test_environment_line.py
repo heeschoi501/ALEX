@@ -7,10 +7,12 @@
 앱은 둘 다 알고 있었다. 넘겨주지 않았을 뿐이다. 날짜가 2023년으로 나오던 것과 같은
 구조다 — 모델은 우리가 준 글만 본다.
 """
+import os
 import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -62,6 +64,14 @@ class EnvironmentLineTests(unittest.TestCase):
 
     def test_local_only_is_stated(self):
         self.assertIn("로컬 전용", self.core._environment_line())
+
+    def test_a_model_borrowed_from_another_machine_is_stated(self):
+        # 2026-10-30 노트북 ALEX 가 "데스크탑이랑 잘 연결된거 맞아?" 에 자기 상태를 몰라 웹을 검색했다(ADR-124).
+        self.assertNotIn("다른 기기", self.core._environment_line())
+        with patch.dict(os.environ, {"JARVIS_MODEL_NODE": "desktop(alexuser@desktop-5080)"}):
+            line = self.core._environment_line()
+        self.assertIn("다른 기기 'desktop(alexuser@desktop-5080)'", line)
+        self.assertIn("파일 작업·명령은 이 기계에서", line)
 
     def test_learning_capabilities_are_present_for_conversation(self):
         base = self.core._system_base()

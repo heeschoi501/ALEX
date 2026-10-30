@@ -299,12 +299,45 @@ class ModelNodeParseTests(unittest.TestCase):
         self.assertEqual(command[-1], "alexuser@desktop-5080")
 
 
+class WorkNodeParseTests(unittest.TestCase):
+    """작업 노드(ADR-125): 이 ALEX 가 코드 세션을 돌릴 다른 기기 — 윈도우·macOS·리눅스."""
+
+    def test_windows_and_posix_nodes(self):
+        laptop, mac = remote.parse_work_nodes(
+            r"laptop=alexuser@laptop-1:C:\Users\alexuser\local ai project\ALEX-main; mac=me@mac-studio:/Users/me/ALEX")
+        self.assertEqual((laptop.name, laptop.user, laptop.host, laptop.windows), ("laptop", "alexuser", "laptop-1", True))
+        self.assertEqual((mac.alex, mac.windows), ("/Users/me/ALEX", False))
+
+    def test_bad_values_never_reach_the_remote_command_line(self):
+        for text in (r"c=alexuser@x:C:\ALEX", r"laptop=alexuser@-oProxyCommand=calc:C:\ALEX", "laptop=alexuser@x:ALEX",
+                     'laptop=alexuser@x:C:\\ALEX" & calc', "laptop=alexuser@x:/a;rm -rf ~", "laptop=alexuser@x:/a`id`",
+                     r"laptop=alexuser@x:C:\a; laptop=alexuser@y:C:\b", "laptop=alexuser@x:/a$HOME"):
+            with self.subTest(text=text), self.assertRaises(remote.RemoteError):
+                remote.parse_work_nodes(text)
+
+    def test_the_worker_command_for_each_system(self):
+        laptop, mac = remote.parse_work_nodes(r"laptop=alexuser@laptop-1:C:\local ai\ALEX-main; mac=me@mac-studio:/Users/me/ALEX")
+        command = remote.node_command("ssh", laptop, None)
+        self.assertEqual(command[:2], ["ssh", "-T"])
+        self.assertIn("BatchMode=yes", command)
+        self.assertEqual(command[-2:], ["alexuser@laptop-1", r'cd /d "C:\local ai\ALEX-main" && py -3.11 -X utf8 -m jarvis.harness.worknode'])
+        self.assertEqual(remote.node_command("ssh", mac, None)[-1],
+                         "cd '/Users/me/ALEX' && exec python3 -X utf8 -m jarvis.harness.worknode")
+
+    def test_the_setting_is_checked_when_settings_load(self):
+        from jarvis.config import ConfigError, validate
+        self.assertEqual(LOCAL_FIELDS["work_nodes"], str)
+        with self.assertRaises(ConfigError):
+            validate(replace(Settings(), work_nodes='laptop=alexuser@x:C:\\a" & calc'))
+        validate(replace(Settings(), work_nodes=r"laptop=alexuser@x:C:\ALEX"))
+
+
 class ModelsTests(RemoteTestBase):
     def setUp(self):
         super().setUp()
         self.strata, self.embed = free_port(), free_port()
-        self.settings = replace(self.settings, strata_host=f"http://127.0.0.1:{self.strata}",
-                                embedding_host=f"http://127.0.0.1:{self.embed}")
+        # 그 기기 쪽은 ALEX 의 기본 자리(Strata 8080·임베딩 8081), 이 기기 쪽은 빈 포트
+        self.settings = replace(self.settings, model_nodes=f"desktop=alexuser@desktop-5080:{self.strata}>8080,{self.embed}>8081")
         self.started: list[dict] = []
         self.processes: list[FakeProcess] = []
         patcher = patch.object(remote, "WEB", f"http://127.0.0.1:{free_port()}")
@@ -333,11 +366,23 @@ class ModelsTests(RemoteTestBase):
     def test_desktop_model_starts_this_alex_on_strata_without_touching_its_settings_file(self):
         code = self.run_models(self.popen_models({"service": "strata", "model": "qwen3.8-flash-next-iq3_s"}))
         self.assertEqual(code, 0)
-        self.assertEqual(self.started, [{"JARVIS_LOCAL_BACKEND": "strata", "JARVIS_EMBEDDING_ENABLED": "1"}])
+        # 이 기기 쪽 주소를 환경변수로 넘긴다 — jarvis.local.json 의 strata_host 등을 손으로 맞추지 않는다(2026-10-30 노트북)
+        self.assertEqual(self.started, [{
+            "JARVIS_LOCAL_BACKEND": "strata", "JARVIS_STRATA_HOST": f"http://127.0.0.1:{self.strata}",
+            "JARVIS_MODEL_NODE": "desktop(alexuser@desktop-5080)",
+            "JARVIS_EMBEDDING_ENABLED": "1", "JARVIS_EMBEDDING_HOST": f"http://127.0.0.1:{self.embed}"}])
         forwards = [self.commands[0][i + 1] for i, part in enumerate(self.commands[0]) if part == "-L"]
-        self.assertEqual(forwards, [f"127.0.0.1:{self.strata}:127.0.0.1:{self.strata}",
-                                    f"127.0.0.1:{self.embed}:127.0.0.1:{self.embed}"])
+        self.assertEqual(forwards, [f"127.0.0.1:{self.strata}:127.0.0.1:8080", f"127.0.0.1:{self.embed}:127.0.0.1:8081"])
         self.assertIn("qwen3.8-flash-next-iq3_s", self.said)
+
+    def test_the_default_desktop_link_moves_off_a_busy_port_by_itself(self):
+        node = remote.parse_model_nodes(f"desktop=alexuser@desktop-5080:{self.strata}>8080,{self.embed}>8081")[0]
+        self.servers.append(FakeAlex(self.strata, {"service": "strata"}))   # 이 기기의 같은 번호를 이미 무언가가 쓴다
+        moved = remote.with_free_ports(node)
+        self.assertNotEqual(moved.forwards[0][0], self.strata)
+        self.assertEqual(moved.forwards[0][1], 8080)
+        self.assertEqual(moved.forwards[1], (self.embed, 8081))       # 비어 있는 포트는 그대로
+        self.assertFalse(remote.port_open(moved.forwards[0][0]))
 
     def test_no_model_server_behind_the_tunnel_starts_nothing(self):
         self.assertEqual(self.run_models(self.popen_models({"app": "jarvis"})), 1)
@@ -364,7 +409,7 @@ class ModelsTests(RemoteTestBase):
         self.assertEqual(self.started, [])
 
     def test_not_configured_explains_setup(self):
-        self.settings = replace(self.settings, remote_host="", remote_user="")
+        self.settings = replace(self.settings, remote_host="", remote_user="", model_nodes="")
         self.assertEqual(self.run_models(self.popen_models({"service": "strata"})), 2)
         self.assertIn("connect_desktop.cmd setup", self.said)
 

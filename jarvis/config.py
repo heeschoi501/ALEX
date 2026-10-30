@@ -56,6 +56,9 @@ class Settings:
     # 모델 노드(2026-10-30, ADR-124): 다른 기기의 모델 서버를 SSH 터널로 이 기기 127.0.0.1 포트에 잇는다.
     # '이름=사용자@기기:이기기포트>그기기포트,…; 다음…'. 비우면 remote_host 데스크톱의 Strata·임베딩 포트(같은 번호).
     model_nodes: str = ""
+    # 작업 노드(2026-10-30, ADR-125): 이 ALEX 가 코드 세션을 돌릴 다른 기기. '이름=사용자@기기:그기기의ALEX폴더; …'.
+    # 코딩 화면의 폴더 칸에 '이름:그기기의폴더' 로 연다. 파일·명령은 그 기기에서, 모델은 이 ALEX 것.
+    work_nodes: str = ""
     ollama_host: str = "http://127.0.0.1:11434"
     allow_remote_ollama: bool = False
     general_model: str = "qwen3:8b-q4_K_M"
@@ -319,12 +322,13 @@ def validate(settings: Settings) -> Settings:
             raise ConfigError("remote_web_host 는 Tailscale 주소(…ts.net)만 허용합니다. 예: my-pc.tail1234.ts.net")
         if not [u for u in settings.remote_web_users.split(",") if u.strip()]:
             raise ConfigError("remote_web_host 를 쓰려면 remote_web_users 에 허용할 Tailscale 로그인을 적어야 합니다.")
-    if settings.model_nodes:
-        from .remote import RemoteError, parse_model_nodes
-        try:
-            parse_model_nodes(settings.model_nodes)
-        except RemoteError as exc:
-            raise ConfigError(f"model_nodes: {exc}") from exc
+    if settings.model_nodes or settings.work_nodes:
+        from .remote import RemoteError, parse_model_nodes, parse_work_nodes
+        for name, parse in (("model_nodes", parse_model_nodes), ("work_nodes", parse_work_nodes)):
+            try:
+                parse(getattr(settings, name))
+            except RemoteError as exc:
+                raise ConfigError(f"{name}: {exc}") from exc
     if not 64 <= settings.strata_max_output_tokens <= settings.strata_num_ctx // 2:
         raise ConfigError("strata_max_output_tokens 는 64 이상, 문맥 창(strata_num_ctx)의 절반 이하여야 합니다.")
     if settings.strata_context_char_budget != 0 and not 1000 <= settings.strata_context_char_budget <= 500_000:
@@ -441,7 +445,7 @@ LOCAL_FIELDS = {
     "ram_offload_budget_gb": float, "num_gpu_layers": int, "num_gpu_layers_model": str,
     "context_char_budget": int, "force_profile": str, "web_enabled": bool,
     "remote_host": str, "remote_user": str, "remote_local_port": int, "remote_alex_port": int,
-    "remote_web_host": str, "remote_web_users": str, "model_nodes": str,
+    "remote_web_host": str, "remote_web_users": str, "model_nodes": str, "work_nodes": str,
     "lesson_context_limit": int, "web_tool_enabled": bool, "auto_lessons_enabled": bool, "coding_insights_enabled": bool, "coding_auto_learn_enabled": bool, "fact_reminder_enabled": bool, "stable_prompt_prefix": bool, "coding_api_map_enabled": bool,
     "coding_num_ctx": int, "coding_num_gpu_layers": int, "coding_context_char_budget": int, "coding_auto_attempts": int, "coding_regression_check": bool, "coding_diagnostic_context": bool, "coding_build_loop_enabled": bool, "coding_code_check_enabled": bool, "coding_worker": str, "opencode_dir": str, "opencode_model": str, "opencode_context": int, "opencode_timeout": int, "coding_free_model": str,
     "local_backend": str, "strata_host": str, "strata_model": str, "strata_num_ctx": int, "strata_reasoning_effort": str,
