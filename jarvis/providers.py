@@ -61,6 +61,17 @@ class GenerationTimeout(ProviderError):
 MAX_TOOL_ROUNDS = 3
 
 
+def _socket_timed_out(exc: BaseException) -> bool:
+    """예외 사슬 안에 소켓 시간 초과(TimeoutError, urllib 이 감싼 것 포함)가 있는가."""
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, TimeoutError) or isinstance(getattr(exc, "reason", None), TimeoutError):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
+
+
 @dataclass(slots=True)
 class Message:
     role: str
@@ -431,8 +442,13 @@ class OllamaProvider(BaseLLMProvider):
             value = request.chat_step(messages, tools, on_chunk)
             check()
             return value
-        except Exception:
+        except Exception as exc:
             check()
+            # 기한이 소켓 시간 한도를 정했으면(남은 시간 < 원래 한도) 소켓 시간 초과는 곧 기한 끝이다. Windows 의 소켓 타이머는
+            # time.monotonic 보다 조금 일찍 울릴 수 있어(2026-11-08 Windows CI: 0.2초 기한에서 expired 가 아직 False)
+            # 위 check() 만으로는 '네트워크 오류' 로 잘못 알린다.
+            if deadline is not None and request.timeout < self.timeout and _socket_timed_out(exc):
+                raise GenerationTimeout("코딩 요청의 제한 시간이 끝났습니다.") from exc
             raise
         finally:
             for name in ('last_metrics', 'last_tool_calls', '_tools_unsupported', '_thinking_unsupported'):
