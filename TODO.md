@@ -14,6 +14,7 @@
 6. Hermes 승인형 스킬·프로필(ADR-122) — 10-30 실제 모델로 `/growth review` 를 확인하고 보완했다(`907b1ea`). 남은 것: 11-08 에 넣은 '근거 있는 사실만' 규칙이 실제 모델에서 성향 추측·한 번 한 요청을 거르는지, 그 뒤 필요하면 `/growth auto on`. 기본 자동 검토는 꺼짐.
 7. 프로젝트 폴더 창 '새 폴더 만들기'(ADR-127) — Windows 경로에서 만들고 '이 폴더로 작업' 으로 열리는지. Codex 의 폴더 선택 화면(PC 사본에만 있음)을 올릴 때 이 기능과 합친다([인수인계](docs/HANDOFF_20261108.md#pc-에서-확인할-것)).
 8. 모델 노드·작업 노드(ADR-124·125) — 노트북 실기기 확인.
+9. Verilog 설계 능력(ADR-128) — `python -X utf8 scripts/rtl_design_tasks.py prepare --out <rtl 폴더>`(설정 `rtl_root`)로 `cpu8-design`·`gpu_fill-design`·`vram16-design` 을 만들고, `/rtl cpu8-design` 처럼 하나씩 돌린다(각 최대 8회). 폴더의 `rtl-run.json`(회차별 통과 시험 수·Verilator 경고)을 넘기면 비교한다.
 
 ## 2026-11-30 까지 결정(ADR-121, `docs/upstreams.json`)
 
