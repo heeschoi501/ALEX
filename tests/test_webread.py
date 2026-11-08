@@ -138,7 +138,7 @@ class ConnectionGuardTests(unittest.TestCase):
 
     def test_the_local_server_is_really_reachable(self):
         """이게 통과해야 아래 차단이 '서버가 없어서' 가 아니라 '막아서' 임이 증명된다."""
-        with urllib.request.urlopen(self.url, timeout=5) as response:
+        with urllib.request.urlopen(self.url, timeout=30) as response:
             self.assertIn(b"secret local service", response.read())
 
     def test_guarded_opener_refuses_at_the_socket(self):

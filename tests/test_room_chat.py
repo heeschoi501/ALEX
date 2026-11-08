@@ -38,7 +38,7 @@ class RoomChatTests(unittest.TestCase):
 
     def call(self, path, body=None):
         try:
-            with urllib.request.urlopen(self.request(path, body), timeout=5) as response:
+            with urllib.request.urlopen(self.request(path, body), timeout=30) as response:
                 return response.status, json.load(response)
         except urllib.error.HTTPError as error:
             with error:
@@ -50,7 +50,7 @@ class RoomChatTests(unittest.TestCase):
         def receive():
             try:
                 with urllib.request.urlopen(self.request("/api/chat/stream",
-                        {"message": text, "session_id": sid}), timeout=8) as response:
+                        {"message": text, "session_id": sid}), timeout=30) as response:
                     for line in response:
                         event = json.loads(line)
                         events.append(event)

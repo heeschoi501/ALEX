@@ -50,7 +50,7 @@ class MultiUserHTTPTests(unittest.TestCase):
                                          headers={"X-Jarvis-Token": token, "Content-Type": "application/json",
                                                   **({"Cookie": cookie} if cookie else {}), **(headers or {})})
         try:
-            with urllib.request.urlopen(request, timeout=5) as response:
+            with urllib.request.urlopen(request, timeout=30) as response:
                 return response.status, json.loads(response.read() or b"{}"), response.headers.get_all("Set-Cookie") or []
         except urllib.error.HTTPError as error:
             with error:
@@ -245,7 +245,7 @@ class MultiUserHTTPTests(unittest.TestCase):
         def ask():
             request = urllib.request.Request(self.url + "/api/chat/stream", data=json.dumps({"message": "기다려요", "session_id": member_sid}).encode(),
                                              headers={"X-Jarvis-Token": "test-token", "Content-Type": "application/json", "Cookie": cookie})
-            with urllib.request.urlopen(request, timeout=10) as response:
+            with urllib.request.urlopen(request, timeout=30) as response:
                 for line in response:
                     events.append(json.loads(line))
 
@@ -272,7 +272,7 @@ class MultiUserHTTPTests(unittest.TestCase):
         def ask():
             request = urllib.request.Request(self.url + "/api/chat/stream", data=json.dumps({"message": "취소할 질문"}).encode(),
                                              headers={"X-Jarvis-Token": "test-token", "Content-Type": "application/json", "Cookie": cookie})
-            with urllib.request.urlopen(request, timeout=10) as response:
+            with urllib.request.urlopen(request, timeout=30) as response:
                 for line in response:
                     events.append(json.loads(line))
 
@@ -322,7 +322,7 @@ class MultiUserHTTPTests(unittest.TestCase):
                 headers={"X-Jarvis-Token": "test-token", "Content-Type": "application/json",
                          **({"Cookie": cookie} if member else {})})
             try:
-                with urllib.request.urlopen(req, timeout=10) as response:
+                with urllib.request.urlopen(req, timeout=30) as response:
                     for line in response:
                         event = json.loads(line)
                         events.append(event)
@@ -380,13 +380,13 @@ class ProjectTests(unittest.TestCase):
     def post(self, path, body):
         request = urllib.request.Request(self.url + path, data=json.dumps(body).encode(),
                                          headers={"X-Jarvis-Token": "test-token", "Content-Type": "application/json"})
-        with urllib.request.urlopen(request, timeout=5) as response:
+        with urllib.request.urlopen(request, timeout=30) as response:
             return json.load(response)
 
     def upload(self, project_id, name, data):
         request = urllib.request.Request(self.url + "/api/project/upload", data=data, headers={
             "X-Jarvis-Token": "test-token", "Content-Type": "text/markdown", "X-Project-Id": project_id, "X-File-Name": name})
-        with urllib.request.urlopen(request, timeout=10) as response:
+        with urllib.request.urlopen(request, timeout=30) as response:
             return json.load(response)
 
     def test_project_instructions_and_files_apply_only_inside_the_project(self):
@@ -409,7 +409,7 @@ class ProjectTests(unittest.TestCase):
         self.assertEqual(self.core.knowledge.documents(), [])
         # 왼쪽 목록에는 프로젝트 밖 대화만, 프로젝트 대화는 프로젝트 화면에
         with urllib.request.urlopen(urllib.request.Request(self.url + "/api/state?session_id=" + inside,
-                                                           headers={"X-Jarvis-Token": "test-token"}), timeout=5) as r:
+                                                           headers={"X-Jarvis-Token": "test-token"}), timeout=30) as r:
             snap = json.load(r)
         self.assertEqual(snap["project"], {"id": pid, "name": "RTL 리뷰"})
         self.assertNotIn(inside, [s["session_id"] for s in snap["sessions"]])

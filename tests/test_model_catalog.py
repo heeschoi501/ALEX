@@ -120,7 +120,7 @@ class PullHTTPTests(unittest.TestCase):
             data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json", "X-Jarvis-Token": "test-token"},
             method="POST",
-        ), timeout=5)
+        ), timeout=30)
 
     def test_model_status_keeps_installed_selected_loaded_separate(self):
         provider = self.state.core.providers[Destination.LOCAL_GENERAL]

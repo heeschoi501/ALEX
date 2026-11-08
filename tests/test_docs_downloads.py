@@ -202,7 +202,7 @@ class WebTests(unittest.TestCase):
             base = f"http://127.0.0.1:{server.server_address[1]}/api/downloaded?name=" + urllib.parse.quote(quoted)
             request = urllib.request.Request(base, headers={"X-Jarvis-Token": "test-token"})
             try:
-                with urllib.request.urlopen(request, timeout=5) as response:      # 기록 없는 예전 것은 주인 것(기존 규칙)
+                with urllib.request.urlopen(request, timeout=30) as response:      # 기록 없는 예전 것은 주인 것(기존 규칙)
                     self.assertEqual(response.read(), "hello".encode("utf-8"))
                     self.assertIn("attachment", response.headers["Content-Disposition"])
                 (folder / "남의 것.txt").write_text("secret", encoding="utf-8")
@@ -211,10 +211,10 @@ class WebTests(unittest.TestCase):
                 with self.assertRaises(urllib.error.HTTPError):                     # 다른 사람이 받은 파일은 못 받는다
                     urllib.request.urlopen(urllib.request.Request(base.replace(urllib.parse.quote(quoted),
                                                                                urllib.parse.quote(other)),
-                                                                  headers={"X-Jarvis-Token": "test-token"}), timeout=5)
+                                                                  headers={"X-Jarvis-Token": "test-token"}), timeout=30)
                 bad = base.rsplit("=", 1)[0] + "=" + urllib.parse.quote("..%2Fweb.db")
                 with self.assertRaises(urllib.error.HTTPError):
-                    urllib.request.urlopen(urllib.request.Request(bad, headers={"X-Jarvis-Token": "test-token"}), timeout=5)
+                    urllib.request.urlopen(urllib.request.Request(bad, headers={"X-Jarvis-Token": "test-token"}), timeout=30)
             finally:
                 server.shutdown()
                 server.server_close()

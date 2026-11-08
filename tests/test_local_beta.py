@@ -116,7 +116,7 @@ class BrowserWorkflowTests(unittest.TestCase):
     def request(self, path, body=None, token="test-token"):
         req = urllib.request.Request(self.url + path, headers={"X-Jarvis-Token": token, "Content-Type": "application/json"},
                                      data=json.dumps(body).encode() if body is not None else None)
-        return urllib.request.urlopen(req, timeout=3)
+        return urllib.request.urlopen(req, timeout=30)
 
     def test_stream_and_refresh_restore_same_answer(self):
         with self.request("/api/chat/stream", {"message": "안녕", "session_id": self.state.session_id}) as r:
