@@ -692,8 +692,9 @@ def build_core(
         misroute_log_path=settings.log_dir / "misroute.jsonl",
     )
     apply_coding_worker(core, settings, notes)
-    from .selfknow import SelfKnowledge  # 자기 기능 알기 — 명령 목록과 화면에서(2026-10-23)
-    core.self_knowledge = SelfKnowledge(HELP_TEXT, Path(__file__).resolve().parent / "static" / "index.html", extra=(
+    from .selfknow import SelfKnowledge, principle_lines  # 자기 기능 알기 — 명령 목록과 화면에서(2026-10-23), 개발 원칙은 AGENTS.md 에서
+    core.self_knowledge = SelfKnowledge(HELP_TEXT, Path(__file__).resolve().parent / "static" / "index.html", extra=tuple(
+        principle_lines(Path(__file__).resolve().parents[1] / "AGENTS.md")) + (
         "말로 파일 고치기·수정 — 채팅에 '프로젝트에 있는 파일 이름 + 고쳐줘·수정해줘·추가해줘·바꿔줘' 라고 하면 코딩 세션이 그 파일을 "
         "직접 읽고 쓰고 고친다(폴더는 지금 프로젝트, 권한은 입력창 선택, 관리자만). 허락은 채팅에서 '응'·'항상'·'아니' 로 답하고, "
         "'되돌려줘' 로 되돌린다. '코딩 세션에서 ~해줘' 라고 해도 된다. 새 프로그램을 짜 달라는 말은 코드를 답으로 준다(파일로 만들려면 /build).",
