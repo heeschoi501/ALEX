@@ -87,6 +87,23 @@ MEMBER_COMMANDS = frozenset({
     "/task-add", "/tasks", "/task-done", "/task-open", "/task-delete", "/knowledge", "/knowledge-search",
     "/ask-knowledge", "/search", "/web", "/good", "/bad",
 })
+# 새 폴더 이름 — Windows·macOS·Linux 어디서나 쓸 수 있는 것만(2026-11-08, 프로젝트 폴더 창의 '새 폴더 만들기').
+WINDOWS_DEVICE_NAMES = {"CON", "PRN", "AUX", "NUL", *(f"COM{n}" for n in range(1, 10)), *(f"LPT{n}" for n in range(1, 10))}
+
+
+def folder_name_problem(name: str) -> str:
+    """쓸 수 없는 폴더 이름이면 그 까닭, 괜찮으면 ''."""
+    if not name or name in {".", ".."} or len(name) > 255:
+        return "폴더 이름을 확인하세요."
+    if re.search(r'[<>:"/\\|?*\x00-\x1f]', name):
+        return '폴더 이름에는 < > : " / \\ | ? * 와 제어 문자를 쓸 수 없습니다.'
+    if name != name.rstrip(" ."):
+        return "폴더 이름은 공백이나 점으로 끝날 수 없습니다(Windows)."
+    if name.split(".")[0].upper() in WINDOWS_DEVICE_NAMES:
+        return f"'{name}' 은 Windows 장치 이름이라 폴더 이름으로 쓸 수 없습니다."
+    return ""
+
+
 def provisional_title(text: str) -> str:
     """첫 답이 오기 전까지 쓸 임시 제목 — 첫 메시지를 한 줄로 줄이고 40자 넘으면 낱말 경계에서 자른다.
     문서를 붙였으면 '[첨부 문서: …]' 표시 줄은 빼고, 질문이 없으면 첫 문서 이름으로."""
@@ -99,7 +116,7 @@ def provisional_title(text: str) -> str:
     return (cut[:space] if space >= 20 else cut) + "…"
 
 
-ADMIN_PATHS = frozenset({"/api/settings", "/api/workspace", "/api/shutdown", "/api/restart", "/api/pull", "/api/users", "/api/coding"})
+ADMIN_PATHS = frozenset({"/api/settings", "/api/workspace", "/api/workspace/mkdir", "/api/shutdown", "/api/restart", "/api/pull", "/api/users", "/api/coding"})
 
 
 @dataclass(frozen=True)
@@ -1124,6 +1141,31 @@ class WebAppState:
         if self.settings:
             self.settings = replace(self.settings, file_search_root=root)
         return {"project_root": str(root)}
+
+    def create_workspace_folder(self, path: Any, confirmed: Any, viewer: Viewer | None = None, session_id: Any = None) -> dict:
+        """프로젝트 폴더 창의 '새 폴더 만들기'(2026-11-08 사용자: "새폴더를 만들거나 그런건되는지를 모르겠네, 확인해서 없으면
+        구현해줘"). register_workspace 와 같은 경계 — 관리자 화면에서 명시적으로 확인할 때만, 모델 글로는 부를 수 없다.
+        이미 있는 폴더 아래 한 단계만 만들고, 읽기 전용 대화에서는 만들지 않는다. 연 것은 아니다 — 열기는 register_workspace."""
+        viewer = viewer or self.owner_viewer()
+        if confirmed is not True or not isinstance(path, str) or not path.strip():
+            raise ValueError("만들 폴더의 전체 경로와 명시적 확인이 필요합니다.")
+        if isinstance(session_id, str) and self.owns(viewer, session_id) and self.session_permission(viewer, session_id) == "read":
+            raise ValueError(READ_ONLY_BLOCKED)
+        target = Path(path.strip()).expanduser()
+        if not target.is_absolute():
+            raise ValueError("만들 폴더의 전체 경로를 입력하세요.")
+        if problem := folder_name_problem(target.name):
+            raise ValueError(problem)
+        if not target.parent.is_dir():
+            raise ValueError("새 폴더를 만들 위치(위 폴더)가 없습니다. 경로를 확인하세요.")
+        created = target.parent.resolve() / target.name
+        try:
+            created.mkdir()   # 이미 있으면(파일·폴더·링크) FileExistsError — 덮어쓰지 않는다
+        except FileExistsError:
+            raise ValueError("같은 이름의 파일이나 폴더가 이미 있습니다.") from None
+        except OSError as exc:
+            raise ValueError(f"폴더를 만들지 못했습니다: {exc.strerror or exc}") from None
+        return {"path": str(created)}
 
     def delete_session(self, target: Any, confirmed: Any, viewer: Viewer | None = None,
                        viewing: Any = None) -> dict[str, Any]:
@@ -2328,7 +2370,7 @@ def _handler_factory(state: WebAppState):
                 self._code_post()
                 return
             if self.path not in {"/api/project", "/api/chat", "/api/chat/stream", "/api/job", "/api/cancel", "/api/settings", "/api/workspace",
-                                 "/api/shutdown", "/api/pull", "/api/session/delete", "/api/login", "/api/logout",
+                                 "/api/workspace/mkdir", "/api/shutdown", "/api/pull", "/api/session/delete", "/api/login", "/api/logout",
                                  "/api/local-owner", "/api/password", "/api/users", "/api/memory", "/api/task",
                                  "/api/session/new", "/api/session/rename", "/api/session/permission",
                                  "/api/document/discard", "/api/live/start", "/api/coding", "/api/restart"}:
@@ -2515,6 +2557,10 @@ def _handler_factory(state: WebAppState):
                         return
                     if self.path == "/api/workspace":
                         self._json(HTTPStatus.OK, state.register_workspace(body.get("path"), body.get("confirmed")))
+                        return
+                    if self.path == "/api/workspace/mkdir":
+                        self._json(HTTPStatus.OK, state.create_workspace_folder(body.get("path"), body.get("confirmed"), viewer,
+                                                                                body.get("session_id")))
                         return
                     if self.path == "/api/settings":
                         self._json(HTTPStatus.OK, state.save_settings(body.get("settings", {})))

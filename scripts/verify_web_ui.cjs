@@ -158,6 +158,19 @@ async function main() {
     await page.locator('#tasks .task.done').waitFor();
     await page.locator('#tasks-dialog [data-close]').click();
     log('memory and task controls');
+    // 프로젝트 폴더 창의 '새 폴더 만들기'(2026-11-08) — 디스크에 실제로 생기고, 만든 경로가 칸에 남는다(여는 것은 따로).
+    const madeFolder = path.join(temp, '새 프로젝트');
+    await page.locator('#context-toggle').click();
+    await page.locator('#workspace-change').click();
+    await page.locator('#workspace-path').fill(madeFolder);
+    await page.locator('#workspace-mkdir').click();
+    await page.locator('#notice').filter({hasText: '새 폴더를 만들었습니다'}).waitFor();
+    assert(fs.statSync(madeFolder).isDirectory(), 'the new folder must exist on disk');
+    await page.locator('#workspace-mkdir').click();
+    await page.locator('#workspace-error').filter({hasText: '이미 있습니다'}).waitFor();
+    await page.locator('#workspace-close').click();
+    if (await page.locator('.context-panel.open').count()) await page.locator('#context-close').click();
+    log('project folder dialog makes a new folder');
     await page.reload();
     assert.equal((await api('/api/state')).body.memories['테스트'], '기억 유지');
     const mobile = await browser.newContext({ignoreHTTPSErrors: true, viewport: {width: 390, height: 844},
