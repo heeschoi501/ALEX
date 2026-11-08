@@ -13,19 +13,22 @@
       "name": "opencode",
       "kind": "git",
       "repo": "https://github.com/anomalyco/opencode",
-      "ref": "v1.19.4",
+      "ref": "v1.19.5",
       "track": "tag:v1.",
       "track_note": "OpenCode 는 두 줄기를 함께 낸다 — v1.x(유지보수, v1.19.4 2026-10-22)와 v2.x(v2.0.0 2026-09-11 ~ v2.2.0 2026-10-27, 기본 가지 dev). 하네스는 v1.18.34 에서 옮겼으므로 v1.x 꼬리표를 따라간다. v2 에서는 흡수한 원본 파일 45개의 자리가 모두 바뀌었다(도구는 packages/core/src/tool/plugin/*.ts, 대화 반복은 packages/core/src/session/prompt.ts 등). v1 유지보수가 멈추거나 v2 에만 필요한 고침이 나오면 이 목록의 원본 파일 자리를 v2 로 새로 맞춘다 — 그 시점은 사람이 정한다(2026-10-27 기준 보류).",
-      "commit": "148842ef7cb1bc34192b3fff57d0f9721ab9c801",
+      "commit": "810c0eba1a7348036f8bdf61e6632d0c36c6876c",
       "ported_from": "v1.18.34 (aec0b9a6d8898f68f923aaf08b7306d931fd9d76) — 하네스를 옮긴 판",
       "license": "MIT — jarvis/harness/OPENCODE_LICENSE.txt",
-      "checked": "2026-10-27",
+      "checked": "2026-11-08",
       "releases_url": "https://github.com/anomalyco/opencode/releases",
       "security_url": "https://github.com/anomalyco/opencode/security/advisories",
       "history": [
         {"date": "2026-10-27", "from": "v1.18.34", "to": "v1.19.4",
          "changed": ["provider/provider.ts +6/−3", "cli/cmd/run.ts +4/−14"],
-         "decision": "반영할 것 없음 — provider.ts 는 설정한 모델의 reasoning_options 처리만 바뀌어 무료 모델 거름(입력 비용 0·지원 종료 제외)과 무관하다. run.ts 는 세션 공유를 없앤 것으로 ALEX 는 공유를 이미 끄고(share: disabled, OPENCODE_DISABLE_SHARE) --share 를 쓰지 않는다. 나머지 9곳은 원본이 그대로다."}
+         "decision": "반영할 것 없음 — provider.ts 는 설정한 모델의 reasoning_options 처리만 바뀌어 무료 모델 거름(입력 비용 0·지원 종료 제외)과 무관하다. run.ts 는 세션 공유를 없앤 것으로 ALEX 는 공유를 이미 끄고(share: disabled, OPENCODE_DISABLE_SHARE) --share 를 쓰지 않는다. 나머지 9곳은 원본이 그대로다."},
+        {"date": "2026-11-08", "from": "v1.19.4", "to": "v1.19.5",
+         "changed": ["session/instruction.ts +1/−2"],
+         "decision": "반영할 것 없음 — 쓰지 않는 import 두 줄(FetchHttpClient, MessageV2)을 지운 정리다. 나머지 10곳은 그대로다. v2 는 v2.2.6 까지 나왔고 이동 시점은 여전히 사람이 정한다."}
       ],
       "parts": [
         {"id": "opencode-loop", "status": "core", "adr": "ADR-112",
@@ -81,16 +84,19 @@
       "name": "hermes-agent",
       "kind": "git",
       "repo": "https://github.com/NousResearch/hermes-agent",
-      "ref": "69f73ec5f11f5a945cc864f29c4e2ad2307eaec3",
-      "commit": "69f73ec5f11f5a945cc864f29c4e2ad2307eaec3",
+      "ref": "2281116525106e3c109993ccb5dc74d02bfc1427",
+      "commit": "2281116525106e3c109993ccb5dc74d02bfc1427",
       "ported_from": "085f562af53a6fedadac3681e2c498fc71316132 — 처음 옮긴 판(ADR-119·120·122)",
       "license": "MIT — jarvis/HERMES_LICENSE.txt",
-      "checked": "2026-10-27",
+      "checked": "2026-11-08",
       "releases_url": "https://github.com/NousResearch/hermes-agent/releases",
       "security_url": "https://github.com/NousResearch/hermes-agent/security/advisories",
       "history": [
         {"date": "2026-10-27", "from": "085f562a", "to": "69f73ec5", "changed": [],
-         "decision": "흡수한 8곳(ADR-122 의 background-review·profile-memory·skills-library 포함)의 원본 파일이 모두 그대로라 기준만 옮겼다."}
+         "decision": "흡수한 8곳(ADR-122 의 background-review·profile-memory·skills-library 포함)의 원본 파일이 모두 그대로라 기준만 옮겼다."},
+        {"date": "2026-11-08", "from": "69f73ec5", "to": "22811165",
+         "changed": ["agent/background_review.py +28/−3", "agent/curator.py +8/−2", "tools/session_search_tool.py +10/−8", "agent/prompt_builder.py +2/−2"],
+         "decision": "1곳 반영: background_review 의 '근거 있는 사실만' 규칙(대화에서 가리킬 수 있는 사실만, 주제·말투로 성향·실력·선호를 추측하지 않음, '항상·앞으로·기억해' 가 없으면 한 번 한 요청을 고정 선호로 만들지 않음, 확실하지 않으면 뺌)을 jarvis/growth.py REVIEW_RULES 에 옮겼다. 반영하지 않음: 스킬 잠금(ALEX 스킬은 사람 승인으로만 바뀌고 자동 정리가 없다), 검토 중 비밀값 입력 건너뛰기·캐시 공유 분기의 대화 번호(ALEX 검토는 도구를 쓰지 않는 모델 한 번 호출), curator 의 잠금·압축 설정(자동 정리 없음), 검색어 없는 대화 목록 기본 10개(ALEX /chat-search 는 검색어가 있어야 하고 대화 목록은 화면에 있다), 스킬 목록 캐시 키를 내용 해시로(ALEX 는 스킬 목록을 파일 시각으로 캐시하지 않는다)."}
       ],
       "parts": [
         {"id": "hermes-threat-patterns", "status": "core", "adr": "ADR-120", "what": "프롬프트 주입·유출 패턴(+ ALEX 한국어 패턴)",
