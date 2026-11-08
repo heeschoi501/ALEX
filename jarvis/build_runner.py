@@ -43,6 +43,30 @@ def install_guard(workspace: Path) -> None:
         except (TypeError, ValueError, OSError):
             return False
 
+    if sys.platform == "darwin":
+        import fcntl  # imported here, not inside the audit hook
+
+    def fd_path(fd: int) -> str | None:
+        """열린 폴더·파일 번호가 가리키는 실제 경로(Linux /proc, macOS F_GETPATH). 모르면 None — 그러면 막는다."""
+        try:
+            if sys.platform.startswith("linux"):
+                return os.readlink(f"/proc/self/fd/{fd}")
+            if sys.platform == "darwin":
+                return os.fsdecode(fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024)).split(b"\0", 1)[0])
+        except (OSError, ValueError):
+            pass
+        return None
+
+    def target(path: object, dir_fd: object) -> object:
+        """감사 사건의 (경로, dir_fd) → 확인할 전체 경로. 번호 자체(chmod(fd))나 dir_fd 기준 상대 경로는 번호의 실제 경로로 푼다.
+        2026-11-08: Python 3.13.18 의 TemporaryDirectory 정리는 os.chmod(번호)·dir_fd 지우기로만 다시 시도한다."""
+        if isinstance(path, int):
+            return fd_path(path)
+        if dir_fd in (None, -1):
+            return path
+        base = fd_path(dir_fd) if isinstance(dir_fd, int) else None
+        return None if base is None else os.path.join(base, os.fsdecode(path))
+
     def guard(event: str, args: tuple) -> None:
         if event == "open":
             path, mode, flags = args
@@ -56,14 +80,15 @@ def install_guard(workspace: Path) -> None:
             if not inside(args[0], (workspace,)):
                 raise PermissionError("ALEX 실행 보호: 작업 폴더 밖 폴더 생성")
         elif event in SCRATCH_EVENTS:
-            # 경로 인수는 모두 임시 폴더 안이어야 한다(rename 은 양쪽). dir_fd 를 쓰는 상대 경로는 받지 않는다.
-            paths = args[:2] if event == "os.rename" else args[:1]
+            # 경로 인수는 모두 임시 폴더 안이어야 한다(rename 은 양쪽). 번호(fd·dir_fd)는 가리키는 실제 경로로 풀어 같은 검사를
+            # 한다 — 풀 수 없으면(Windows·알 수 없는 번호) 막는다.
             # 감사 사건 인수: remove·rmdir(path, dir_fd), chmod(path, mode, dir_fd), rename(src, dst, src_dir_fd, dst_dir_fd),
             # truncate(path 또는 fd, length) — dir_fd 를 주지 않으면 -1 이다.
-            dir_fds = {"os.rename": args[2:4], "os.chmod": args[2:3], "os.truncate": ()}.get(event, args[1:2])
-            if (not paths or any(isinstance(path, int) for path in paths)
-                    or any(fd not in (None, -1) for fd in dir_fds)
-                    or not all(inside(path, (scratch,)) for path in paths)):
+            pairs = {"os.rename": [(args[0], args[2]), (args[1], args[3])] if len(args) >= 4 else [],
+                     "os.chmod": [(args[0], args[2] if len(args) > 2 else -1)] if args else [],
+                     "os.truncate": [(args[0], -1)] if args else []}.get(event, [(args[0], args[1] if len(args) > 1 else -1)] if args else [])
+            paths = [target(path, dir_fd) for path, dir_fd in pairs]
+            if not paths or any(path is None for path in paths) or not all(inside(path, (scratch,)) for path in paths):
                 raise PermissionError(f"ALEX 실행 보호: {event} 금지(실행용 임시 폴더 밖)")
         elif event in {"os.link", "os.symlink", "os.system", "os.exec", "os.posix_spawn", "os.fork",
                        "os.forkpty", "os.kill", "os.killpg", "os.startfile", "os.startfile/2"}:
