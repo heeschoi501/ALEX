@@ -1,0 +1,16 @@
+# 줄바꿈 고정 — 사람·여러 AI·여러 기기(Windows·Linux·macOS)가 같은 저장소에 쓴다.
+# 2026-10-30 Windows 에서 고친 jarvis/harness/sessions.py 가 CRLF 로 올라와 실제 112줄 변경이 1,523줄 diff 로 보였다.
+# 글 파일은 저장소·작업 폴더 모두 LF.
+* text=auto eol=lf
+
+# Windows 가 직접 읽는 실행 파일은 올린 그대로 둔다(변환하지 않음) — cmd 는 LF 에서 레이블·goto 가 깨질 수 있다.
+*.cmd -text
+*.bat -text
+*.vbs -text
+*.ps1 -text
+
+# 바이너리
+*.png binary
+*.pdf binary
+*.hwp binary
+*.hwpx binary
