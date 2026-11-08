@@ -5,6 +5,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 from jarvis.harness.sessions import CodeSessions
 from jarvis.harness.worknode import NodeRoot
@@ -90,7 +91,11 @@ class WorkNodeTests(Fixture):
         from jarvis.web import WebAppState
         state = SimpleNamespace(settings=replace(Settings(), work_nodes=r"laptop=alexuser@laptop-1:C:\ALEX\ALEX-main"))
         state.work_nodes = lambda: WebAppState.work_nodes(state)
-        root = WebAppState.node_root(state, r"laptop:C:\Unity\MyGame")
+        # 이 PC 의 ssh 위치는 시험과 상관없다 — ssh 클라이언트가 없는 기기(2026-11-08 클라우드)에서도 같은 결과여야 한다.
+        with patch("jarvis.web.shutil.which", return_value=None), self.assertRaisesRegex(ValueError, "ssh 가 없습니다"):
+            WebAppState.node_root(state, r"laptop:C:\Unity\MyGame")
+        with patch("jarvis.web.shutil.which", return_value="ssh"):
+            root = WebAppState.node_root(state, r"laptop:C:\Unity\MyGame")
         self.assertEqual((root.node, root.path), ("laptop", r"C:\Unity\MyGame"))
         self.assertEqual(root.command[-2:], ("alexuser@laptop-1", r'cd /d "C:\ALEX\ALEX-main" && py -3.11 -X utf8 -m jarvis.harness.worknode'))
         self.assertIsNone(WebAppState.node_root(state, r"C:\ALEX\jarvis"))        # 이 PC 경로
