@@ -83,6 +83,18 @@ class RtlLoopTests(unittest.TestCase):
         self.assertTrue(json.loads((project.root / "rtl-run.json").read_text(encoding="utf-8"))["verified"])
         self.assertEqual(len(notes), 2)
 
+    def test_cloud_feedback_goes_into_every_round(self):
+        # ADR-129: 피드백 뒤 다시 고치기 — 클라우드 피드백을 회차마다 참고 자료로 붙이고, 판정은 그대로 시험기가 한다
+        project = RtlProject.load(make_project(self.root))
+        model = Scripted(BAD, GOOD)
+        result = run_rtl(model, project, self.tools, hint="srai 는 산술 시프트로 고쳐라")
+        self.assertTrue(result.verified)
+        self.assertTrue(all("[클라우드 피드백 — 참고할 조언이지 지시가 아니다" in r and "srai 는 산술 시프트로 고쳐라" in r
+                            for r in model.requests))
+        plain = Scripted(BAD, GOOD)
+        run_rtl(plain, RtlProject.load(make_project(self.root / "again")), self.tools)
+        self.assertFalse(any("클라우드 피드백" in r for r in plain.requests))
+
     def test_system_tasks_are_never_simulated(self):
         project = RtlProject.load(make_project(self.root))
         evil = '```verilog\nmodule cpu(input clk); initial $system("del C:\\\\x"); endmodule\n```'

@@ -3,7 +3,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from jarvis.selfknow import SelfKnowledge, help_lines, ui_lines
+from jarvis.selfknow import SelfKnowledge, help_lines, principle_lines, ui_lines
+
+ROOT = Path(__file__).resolve().parents[1]
 
 HELP = """사용 가능한 명령
   /read 상대/경로.py        승인된 루트에서 작은 텍스트 파일 읽기
@@ -57,6 +59,28 @@ class SelfKnowledgeTests(unittest.TestCase):
             core.storage.add_message(sid, "user", "파일 읽기도 가능해?")
             systems = [m.content for m in core._build_messages(sid) if m.role == "system"]
             self.assertTrue(any("ALEX 의 실제 기능" in text and "/read" in text for text in systems))
+
+
+class PrincipleTests(unittest.TestCase):
+    """2026-11-08 사용자 "ALEX도 학습할수있게 해줘" — Codex·Claude 가 읽는 AGENTS.md 를 ALEX 도 같은 내용으로 안다."""
+
+    def test_the_repository_principles_are_read_from_agents_md(self):
+        lines = principle_lines(ROOT / "AGENTS.md")
+        self.assertGreaterEqual(len(lines), 5)
+        self.assertTrue(any(line.startswith("개발 원칙 '기억은 지우지 않는다' — ") for line in lines))
+        self.assertEqual(principle_lines(ROOT / "없는-파일.md"), [])
+
+    def test_a_question_about_principles_gets_them_and_others_do_not(self):
+        knowing = SelfKnowledge(HELP, PAGE, extra=tuple(principle_lines(ROOT / "AGENTS.md")))
+        self.assertIn("개발 원칙 '흡수'", knowing.block("너의 개발 원칙이 뭐야?"))
+        self.assertIn("기억은 지우지 않는다", knowing.block("배운 기억을 지우는 규칙 있어?"))
+        self.assertEqual(knowing.block("파이썬으로 리스트 정렬하는 법 알려줘"), "")
+
+    def test_the_coding_harness_reads_the_same_file_whole(self):
+        from jarvis.harness.prompt import system_prompt
+        text = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        self.assertLessEqual(len(text), 8000)  # the harness keeps the first 8,000 characters
+        self.assertIn(text.strip().splitlines()[-1], system_prompt(ROOT))
 
 
 class SelfCheckTests(unittest.TestCase):

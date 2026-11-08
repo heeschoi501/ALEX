@@ -279,7 +279,7 @@ class HttpTests(unittest.TestCase):
         request = urllib.request.Request(self.base + path, data=json.dumps(body).encode(), method="POST",
                                          headers={"Content-Type": "application/json", "X-Jarvis-Token": "test-token"})
         try:
-            with urllib.request.urlopen(request, timeout=10) as response:
+            with urllib.request.urlopen(request, timeout=30) as response:
                 return response.status, json.loads(response.read())
         except urllib.error.HTTPError as exc:
             return exc.code, json.loads(exc.read())

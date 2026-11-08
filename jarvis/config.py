@@ -137,6 +137,8 @@ class Settings:
     # /dev-auto 회귀 검사(ADR-078, 계획 7절 ⑩): 합격 테스트가 통과하면 복사본에서 전체 테스트도 돌려, 이 수정이 새로 깨뜨린 테스트가 있으면
     # 그 실패를 주고 다시 고치게 한다. 전체 검사 한 번에 약 2분(CPU). 기본 꺼짐 — 실측 뒤 켠다.
     coding_regression_check: bool = False
+    # ADR-129(2026-11-08 사용자 규칙): /dev-auto·/rtl 이 로컬 5회차로 못 하면 클라우드에 피드백을 청하고 ALEX 가 그것으로 다시 고친다. 끄면 예전처럼 요청할 때만.
+    coding_cloud_after_local: bool = True
     # /dev-auto 수정 전 읽기 전용 진단 근거(ADR-080, Codex 가이드 우선순위 2): 실패 문구가 나오는 조건·실패한 테스트의 준비 코드를 찾아
     # 남는 자리에 붙인다. 모델 호출은 늘지 않는다. 기본 꺼짐 — 켬/끔 한 변수 비교로 효과를 잰 뒤 켠다.
     coding_diagnostic_context: bool = False
@@ -447,7 +449,7 @@ LOCAL_FIELDS = {
     "remote_host": str, "remote_user": str, "remote_local_port": int, "remote_alex_port": int,
     "remote_web_host": str, "remote_web_users": str, "model_nodes": str, "work_nodes": str,
     "lesson_context_limit": int, "web_tool_enabled": bool, "auto_lessons_enabled": bool, "coding_insights_enabled": bool, "coding_auto_learn_enabled": bool, "fact_reminder_enabled": bool, "stable_prompt_prefix": bool, "coding_api_map_enabled": bool,
-    "coding_num_ctx": int, "coding_num_gpu_layers": int, "coding_context_char_budget": int, "coding_auto_attempts": int, "coding_regression_check": bool, "coding_diagnostic_context": bool, "coding_build_loop_enabled": bool, "coding_code_check_enabled": bool, "coding_worker": str, "opencode_dir": str, "opencode_model": str, "opencode_context": int, "opencode_timeout": int, "coding_free_model": str,
+    "coding_num_ctx": int, "coding_num_gpu_layers": int, "coding_context_char_budget": int, "coding_auto_attempts": int, "coding_regression_check": bool, "coding_cloud_after_local": bool, "coding_diagnostic_context": bool, "coding_build_loop_enabled": bool, "coding_code_check_enabled": bool, "coding_worker": str, "opencode_dir": str, "opencode_model": str, "opencode_context": int, "opencode_timeout": int, "coding_free_model": str,
     "local_backend": str, "strata_host": str, "strata_model": str, "strata_num_ctx": int, "strata_reasoning_effort": str,
     "strata_max_output_tokens": int, "strata_context_char_budget": int, "strata_history_limit": int,
     "rtl_root": str, "rtl_tools_dir": str, "cloud_agent": str, "cloud_agent_timeout": int,
@@ -510,6 +512,7 @@ def load_settings() -> Settings:
         coding_context_char_budget=_env_int("JARVIS_CODING_CONTEXT_CHAR_BUDGET", 0),
         coding_auto_attempts=_env_int("JARVIS_CODING_AUTO_ATTEMPTS", 1),
         coding_regression_check=_env_flag("JARVIS_CODING_REGRESSION_CHECK", False),
+        coding_cloud_after_local=_env_flag("JARVIS_CODING_CLOUD_AFTER_LOCAL", True),
         coding_diagnostic_context=_env_flag("JARVIS_CODING_DIAGNOSTIC_CONTEXT", False),
         coding_build_loop_enabled=_env_flag("JARVIS_CODING_BUILD_LOOP", True),
         coding_code_check_enabled=_env_flag("JARVIS_CODING_CODE_CHECK", True),

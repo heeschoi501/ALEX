@@ -266,7 +266,7 @@ class DocumentHTTPTests(unittest.TestCase):
 
     def get(self, name, token=None):
         headers = {"X-Jarvis-Token": token} if token else {}
-        return urllib.request.urlopen(urllib.request.Request(self.base + "/api/document?name=" + quote(name), headers=headers), timeout=3)
+        return urllib.request.urlopen(urllib.request.Request(self.base + "/api/document?name=" + quote(name), headers=headers), timeout=30)
 
     def test_download_requires_token_and_returns_document_mime(self):
         path = export_document(self.root, "docx", SAMPLE)

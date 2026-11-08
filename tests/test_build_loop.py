@@ -230,6 +230,38 @@ class RunTests(unittest.TestCase):
             self.assertFalse((Path(tmp) / SCRATCH_DIR).exists())  # 실행이 끝나면 임시 폴더를 치운다
             self.assertEqual(workspace.files(), ["uses_temp.py"])  # 임시 파일은 작업 파일 목록에 섞이지 않는다
 
+    @unittest.skipIf(os.name == "nt", "Windows 의 shutil·tempfile 은 dir_fd 를 쓰지 않는다")
+    def test_fd_based_cleanup_is_allowed_inside_the_scratch_folder_only(self):
+        """2026-11-08 CI: Python 3.13.18 의 TemporaryDirectory 정리는 폴더 번호 기준(os.chmod(번호)·dir_fd 지우기)으로만
+        다시 시도해 '임시 파일을 쓰는 프로그램' 시험이 실패했다(3.13.17 은 전체 경로로 다시 시도해 통과). 번호가 가리키는 실제
+        폴더가 실행용 임시 폴더 안일 때만 허용하고, 작업 폴더를 가리키는 번호는 계속 막는다."""
+        program = (
+            "import os, tempfile\n"
+            "d = tempfile.mkdtemp()\n"
+            "open(os.path.join(d, 'f.txt'), 'w').write('x')\n"
+            "fd = os.open(d, os.O_RDONLY)\n"
+            "getattr(os, 'ch' + 'mod')(fd, 0o700)\n"
+            "getattr(os, 'un' + 'link')('f.txt', dir_fd=fd)\n"
+            "print('INSIDE-OK', os.path.exists(os.path.join(d, 'f.txt')))\n"
+            "work = os.open(os.path.dirname(os.path.abspath(__file__)), os.O_RDONLY)\n"
+            "for name, call in (('unlink', lambda: getattr(os, 'un' + 'link')('logic.py', dir_fd=work)),\n"
+            "                   ('chmod', lambda: getattr(os, 'ch' + 'mod')(work, 0o700))):\n"
+            "    try:\n"
+            "        call(); print('OUTSIDE-ALLOWED', name)\n"
+            "    except PermissionError:\n"
+            "        print('OUTSIDE-BLOCKED', name)\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = BuildWorkspace(Path(tmp))
+            workspace.write("logic.py", "VALUE = 1\n")
+            workspace.write("fd_cleanup.py", program)
+            status, output = workspace.run("fd_cleanup.py", None)
+            self.assertEqual(status, 0, output)
+            self.assertIn("INSIDE-OK False", output)
+            self.assertIn("OUTSIDE-BLOCKED unlink", output)
+            self.assertIn("OUTSIDE-BLOCKED chmod", output)
+            self.assertNotIn("OUTSIDE-ALLOWED", output)
+            self.assertEqual((Path(tmp) / "logic.py").read_text(encoding="utf-8"), "VALUE = 1\n")
+
     def test_work_files_still_cannot_be_deleted_or_replaced_at_runtime(self):
         """정적 검사를 피한 지우기·이름 바꾸기(getattr)도 실행 중 감시가 막는다 — 허용은 실행용 임시 폴더 안뿐이다."""
         snippets = [

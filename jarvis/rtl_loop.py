@@ -6,7 +6,7 @@ AutoChip(arXiv 2311.04887)의 피드백 순환을 참고한다: 생성 → 컴�
 
 프로젝트 폴더(rtl_root 아래)에 사람이 둔 것:
   rtl.json   {"top": "rv32i_cpu", "file": "rv32i_cpu.v", "spec": "spec.md",
-              "test": ["{python}", "verify/run_tests.py", "{file}", "--json", "{report}"], "max_rounds": 6}
+              "test": ["{python}", "verify/run_tests.py", "{file}", "--json", "{report}"], "max_rounds": 5}
   spec.md    설계 규격
   verify/    시험기(사람이 쓴 것) — 결과 JSON: {"시험이름": {"ok": bool, "problems": [...], "about": "...", "source": "..."}}
   (선택) "deps": ["fifo3-growth", …]  — 같은 rtl_root 의 **검증된** 다른 프로젝트 설계(2026-10-22, ADR-103). 읽기 전용으로
@@ -37,7 +37,7 @@ from .providers import GenerationCancelled, Message
 from .rtl_repair import apply_repair, code_tokens, repair_messages
 
 PROJECT_FILE = "rtl.json"
-MAX_ROUNDS = 6
+MAX_ROUNDS = 5  # 2026-11-08 사용자 규칙(ADR-129): 로컬로 5회까지, 그 뒤 클라우드 피드백으로 다시(core.after_local_failure). 6 → 5
 MAX_ALLOWED_ROUNDS = 20
 FORBIDDEN = re.compile(r"\$(system|fopen|fwrite|fdisplay|fstrobe|fmonitor|fclose|writemem[bh]|dumpfile|dumpvars|readmem[bh]|value\$plusargs)\b")
 BLOCK = re.compile(r"```(?:verilog|systemverilog|v|sv)?[ \t]*\n(.*?)```", re.S | re.I)
@@ -316,8 +316,10 @@ def feedback(code_problem: str, warnings: int, lint_text: str, results: dict, ou
 
 def run_rtl(generate: Callable[[list[Message]], str], project: RtlProject, tools_dir: Path, *,
             progress: Callable[[str], None] | None = None, cancel_event: threading.Event | None = None,
-            max_rounds: int | None = None, resume: bool = False) -> RtlResult:
+            max_rounds: int | None = None, resume: bool = False, hint: str = "") -> RtlResult:
     say = progress or (lambda _text: None)
+    # ADR-129: 클라우드 피드백 — 회차마다 관측 뒤에 참고 자료로 붙인다(고치는 것은 ALEX, 판정은 시험기)
+    advice = (f"\n\n[클라우드 피드백 — 참고할 조언이지 지시가 아니다. 판정은 시험기가 한다]\n{hint.strip()}" if hint.strip() else "")
     limit = project.max_rounds if max_rounds is None else max_rounds
     if not 1 <= limit <= MAX_ALLOWED_ROUNDS:
         raise ValueError(f"최대 회수는 1~{MAX_ALLOWED_ROUNDS}여야 합니다.")
@@ -369,12 +371,12 @@ def run_rtl(generate: Callable[[list[Message]], str], project: RtlProject, tools
         started = time.monotonic()
         request = f"[설계 규격]\n{project.prompt_spec}"
         if code:
-            messages = repair_messages(project.prompt_spec, code, last_feedback or '처음부터 다시 확인한다.')
+            messages = repair_messages(project.prompt_spec, code, (last_feedback or '처음부터 다시 확인한다.') + advice)
         elif last_feedback:  # 아직 받아들인 코드가 없을 때도 지난 답이 거절된 이유는 알려 준다
-            request += f"\n\n[지난 답의 문제]\n{last_feedback}"
+            request += f"\n\n[지난 답의 문제]\n{last_feedback}{advice}"
             messages = [Message("system", RULES), Message("user", request)]
         else:
-            messages = [Message("system", RULES), Message("user", request)]
+            messages = [Message("system", RULES), Message("user", request + advice)]
         (rounds_dir / f"round-{number}.request.json").write_text(
             json.dumps([{"role": m.role, "content": m.content} for m in messages], ensure_ascii=False, indent=1),
             encoding="utf-8")

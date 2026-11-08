@@ -114,7 +114,7 @@ class WebHTTPTests(unittest.TestCase):
         self.assertEqual(self.server.server_address[0], LOOPBACK_HOST)
 
     def test_root_has_security_headers_and_tokenized_page(self):
-        with urllib.request.urlopen(self.base + "/", timeout=2) as response:
+        with urllib.request.urlopen(self.base + "/", timeout=30) as response:
             body = response.read().decode("utf-8")
             self.assertIn("Project ALEX", body)
             self.assertIn("test-token", body)
@@ -124,7 +124,7 @@ class WebHTTPTests(unittest.TestCase):
     def test_root_rejects_non_local_host_header_before_exposing_token(self):
         request = urllib.request.Request(self.base + "/", headers={"Host": "evil.example"})
         with self.assertRaises(urllib.error.HTTPError) as ctx:
-            urllib.request.urlopen(request, timeout=2)
+            urllib.request.urlopen(request, timeout=30)
         self.assertEqual(ctx.exception.code, 403)
         body = ctx.exception.read().decode("utf-8")
         self.assertNotIn("test-token", body)
@@ -133,7 +133,7 @@ class WebHTTPTests(unittest.TestCase):
     def _get(self, path, headers):
         request = urllib.request.Request(self.base + path, headers=headers)
         try:
-            with urllib.request.urlopen(request, timeout=2) as response:
+            with urllib.request.urlopen(request, timeout=30) as response:
                 return response.status, response.read().decode("utf-8", "replace"), response.headers
         except urllib.error.HTTPError as exc:
             return exc.code, exc.read().decode("utf-8", "replace"), exc.headers
@@ -166,7 +166,7 @@ class WebHTTPTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("navigate", body)
         self.assertNotIn("caches.open", body)  # 토큰이 든 페이지·API 를 저장하지 않는다
-        with urllib.request.urlopen(self.base + "/icon-192.png", timeout=2) as response:
+        with urllib.request.urlopen(self.base + "/icon-192.png", timeout=30) as response:
             self.assertTrue(response.read().startswith(b"\x89PNG"))
             csp = response.headers["Content-Security-Policy"]
         self.assertIn("manifest-src 'self'", csp)
@@ -186,7 +186,7 @@ class WebHTTPTests(unittest.TestCase):
     def test_api_rejects_missing_token(self):
         request = urllib.request.Request(self.base + "/api/state")
         with self.assertRaises(urllib.error.HTTPError) as ctx:
-            urllib.request.urlopen(request, timeout=2)
+            urllib.request.urlopen(request, timeout=30)
         self.assertEqual(ctx.exception.code, 403)
 
     def test_chat_accepts_json_with_token(self):
@@ -196,7 +196,7 @@ class WebHTTPTests(unittest.TestCase):
             headers={"Content-Type": "application/json", "X-Jarvis-Token": "test-token"},
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=2) as response:
+        with urllib.request.urlopen(request, timeout=30) as response:
             result = json.loads(response.read())
         self.assertEqual(result["route"], "local_general")
         self.assertIn("GENERAL", result["response"])
@@ -209,7 +209,7 @@ class WebHTTPTests(unittest.TestCase):
             method="POST",
         )
         with self.assertRaises(urllib.error.HTTPError) as ctx:
-            urllib.request.urlopen(request, timeout=2)
+            urllib.request.urlopen(request, timeout=30)
         self.assertEqual(ctx.exception.code, 415)
 
 
@@ -240,7 +240,7 @@ class WebHTTPTests(unittest.TestCase):
             data = json.dumps(body).encode("utf-8") if body is not None else (b"" if method == "POST" else None)
             request = urllib.request.Request(self.base + path, data=data, headers=headers, method=method)
             try:
-                with urllib.request.urlopen(request, timeout=5) as response:
+                with urllib.request.urlopen(request, timeout=30) as response:
                     return response.status, json.loads(response.read().decode("utf-8"))
             except urllib.error.HTTPError as exc:
                 return exc.code, json.loads(exc.read().decode("utf-8"))
@@ -252,13 +252,13 @@ class WebHTTPTests(unittest.TestCase):
         request = urllib.request.Request(self.base + "/api/code/session", headers={"Content-Type": "application/json"},
                                          data=b"{}", method="POST")
         with self.assertRaises(urllib.error.HTTPError) as ctx:
-            urllib.request.urlopen(request, timeout=2)
+            urllib.request.urlopen(request, timeout=30)
         self.assertEqual(ctx.exception.code, 403)  # 토큰 없으면 거절
         status, _ = call("POST", f"/api/code/session/{sid}/prompt_async", {"parts": [{"type": "text", "text": "n.py 만들어"}]})
         self.assertEqual(status, 200)
         events = []
         stream = urllib.request.Request(self.base + f"/api/code/event?session={sid}&since=0", headers=headers)
-        with urllib.request.urlopen(stream, timeout=10) as response:
+        with urllib.request.urlopen(stream, timeout=30) as response:
             self.assertEqual(response.headers["Content-Type"], "text/event-stream; charset=utf-8")
             for raw in response:
                 line = raw.decode("utf-8").strip()
@@ -299,7 +299,7 @@ class WebHTTPTests(unittest.TestCase):
             data = json.dumps(body).encode("utf-8") if body is not None else None
             request = urllib.request.Request(self.base + path, data=data, headers=headers, method=method)
             try:
-                with urllib.request.urlopen(request, timeout=5) as response:
+                with urllib.request.urlopen(request, timeout=30) as response:
                     return response.status, json.loads(response.read().decode("utf-8"))
             except urllib.error.HTTPError as exc:
                 return exc.code, json.loads(exc.read().decode("utf-8"))
@@ -346,7 +346,7 @@ class WebHTTPTests(unittest.TestCase):
         def post(path):
             request = urllib.request.Request(self.base + path, data=b"{}", headers=headers, method="POST")
             try:
-                with urllib.request.urlopen(request, timeout=5) as response:
+                with urllib.request.urlopen(request, timeout=30) as response:
                     return response.status, json.loads(response.read().decode("utf-8"))
             except urllib.error.HTTPError as exc:
                 return exc.code, json.loads(exc.read().decode("utf-8"))

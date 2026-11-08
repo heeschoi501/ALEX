@@ -63,7 +63,9 @@ class TitleHTTPTests(unittest.TestCase):
     def post(self, path, body):
         request = urllib.request.Request(self.url + path, data=json.dumps(body).encode(),
                                          headers={"X-Jarvis-Token": "test-token", "Content-Type": "application/json"})
-        return urllib.request.urlopen(request, timeout=5)
+        # 멈춤을 잡는 한도이지 속도 기준이 아니다. 대화 한 번은 보통 0.05초인데, 시험을 나란히 돌리는 바쁜 Windows
+        # 실행기에서 5초를 넘겨 두 시험이 함께 실패한 적이 있다(2026-10-30 CI 907b1ea, 다시 돌리니 통과).
+        return urllib.request.urlopen(request, timeout=30)
 
     def stream(self, message):
         with self.post("/api/chat/stream", {"message": message, "session_id": self.state.session_id}) as response:

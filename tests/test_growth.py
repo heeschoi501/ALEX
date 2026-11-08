@@ -432,6 +432,16 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(seen[0][1], sorted(seen[0][1]))
         self.assertTrue(local.think)
 
+    def test_review_prompt_keeps_profile_and_memory_to_grounded_facts(self):
+        # Hermes background_review 2281116 (2026-11-07): 근거 규칙 없이 검토하면 성향 추측·한 번 한 요청을 고정 사실로 남겼다.
+        self.core.storage.add_message(self.session, "user", "이번 답은 짧게 해줘.")
+        local = self.core.providers[Destination.LOCAL_GENERAL]
+        local.generate = Mock(return_value="[]")
+        review(self.core, self.session)
+        rules = local.generate.call_args.args[0][0].content
+        for rule in ("성향·실력·역할·기분·선호를 추측하지 않는다", "한 번 한 요청을 고정 선호로 바꾸지 않는다", "확실하지 않으면 뺀다"):
+            self.assertIn(rule, rules)
+
     def test_review_reads_fenced_json_and_keeps_environment_failures_out_of_memory(self):
         self.core.storage.add_message(self.session, "user", "시험은 unittest 로 돌린다. yosys 는 설치되지 않았다.")
         ident = self.core.storage.message_page(self.session)["messages"][-1]["id"]

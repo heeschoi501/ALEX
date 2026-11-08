@@ -1585,6 +1585,17 @@ function filterSessions() {
 $('session-search').addEventListener('input', filterSessions);
 $('workspace-change').addEventListener('click', () => { if (anyWork()) { notice('모든 대화의 요청이 끝난 뒤 프로젝트 폴더를 바꾸세요.'); return; } $('workspace-path').value = state.project_root; $('workspace-error').textContent = ''; $('workspace-dialog').showModal(); });
 $('workspace-close').addEventListener('click', () => $('workspace-dialog').close());
+// 새 폴더(2026-11-08) — 입력한 전체 경로의 마지막 폴더를 만든다. 여는 것은 '이 폴더로 작업'(바꾸기 전 확인은 그대로).
+$('workspace-mkdir').addEventListener('click', async () => {
+  const path = $('workspace-path').value.trim();
+  $('workspace-error').textContent = path ? '' : '만들 폴더의 전체 경로를 입력하세요.';
+  if (!path) return;
+  try {
+    const r = await api('/api/workspace/mkdir', {path, confirmed: true, session_id: state.session_id});
+    $('workspace-path').value = r.path;
+    notice(`새 폴더를 만들었습니다: ${r.path} — '이 폴더로 작업' 을 누르면 엽니다.`);
+  } catch (e) { $('workspace-error').textContent = e.message; }
+});
 $('workspace-form').addEventListener('submit', async e => { e.preventDefault(); if (anyWork()) { $('workspace-error').textContent = '모든 대화의 요청이 끝난 뒤 바꾸세요.'; return; } try { await api('/api/workspace', {path: $('workspace-path').value, confirmed: true, session_id: state.session_id}); await refresh(); $('workspace-dialog').close(); notice('프로젝트 폴더를 변경했습니다. 기존의 미적용 수정안은 폐기됩니다.'); } catch (e) { $('workspace-error').textContent = e.message; } });
 // '다시 켜기'(2026-10-23) — 웹이 실행기를 따로 띄우고 꺼진다. 새 서버가 뜨면(화면 토큰이 바뀌면) 저절로 새로고침
 $('restart-app').addEventListener('click', async () => {

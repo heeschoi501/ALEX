@@ -1,3 +1,5 @@
+> **2026-11-08:** 여러 AI(Codex·Claude·ALEX 자신)가 함께 읽는 [AGENTS.md](AGENTS.md), 프로젝트 폴더 창의 '새 폴더 만들기'. [인수인계](docs/HANDOFF_20261108.md).
+
 > **2026-10-27 승인형 스킬·프로필(Codex)·교차 검토·자동 검사(CI):** `/growth review·approve` — 대화에서 배울 것을 제안하고 사람이 승인. 모든 push 에서 Linux·Windows 검사·웹 화면·비밀값 검사. [인수인계](docs/HANDOFF_20261027.md).
 
 > **2026-10-27 흡수·추적:** 흡수한 능력의 원본 변경 확인과 덩치 관리(`docs/upstreams.json`, `scripts/check_upstreams.py`). [종합 보고서 — 다른 AI 검토 요청](docs/GROWTH_ABSORPTION_REPORT_20261027.md).

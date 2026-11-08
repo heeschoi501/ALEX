@@ -187,7 +187,7 @@ class WebTests(unittest.TestCase):
         req = urllib.request.Request(self.base + path, data=body if method == "POST" else None, method=method,
                                      headers={"X-Jarvis-Token": "test-token", **(headers or {})})
         try:
-            with urllib.request.urlopen(req, timeout=20) as response:
+            with urllib.request.urlopen(req, timeout=30) as response:
                 return response.status, response.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
             return exc.code, exc.read().decode("utf-8")

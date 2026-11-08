@@ -186,7 +186,10 @@ class CoreTests(unittest.TestCase):
     def test_alex_knows_it_can_hand_off_when_asked(self):
         line = self.core._environment_line(next(k for k in self.core.providers if k.value == "local_general"))
         self.assertIn("클라우드로 넘겨줘", line)
-        self.assertIn("ALEX 가 스스로 넘기지 않는다", line)
+        self.assertIn("사용자가 요청할 때만", line)
+        # ADR-129: 로컬 5회차로 못 하면 ALEX 가 피드백을 청하고, 고치는 것은 ALEX 라고 알고 있어야 한다
+        self.assertIn("로컬로 5회차까지 고쳐도 통과하지 못하면 ALEX 가 클라우드에 피드백을 청한다", line)
+        self.assertIn("고치는 것은 ALEX 가 그 피드백으로 다시 한다", line)
 
 
 class WebTests(unittest.TestCase):
@@ -202,7 +205,7 @@ class WebTests(unittest.TestCase):
             base = f"http://127.0.0.1:{server.server_address[1]}/api/downloaded?name=" + urllib.parse.quote(quoted)
             request = urllib.request.Request(base, headers={"X-Jarvis-Token": "test-token"})
             try:
-                with urllib.request.urlopen(request, timeout=5) as response:      # 기록 없는 예전 것은 주인 것(기존 규칙)
+                with urllib.request.urlopen(request, timeout=30) as response:      # 기록 없는 예전 것은 주인 것(기존 규칙)
                     self.assertEqual(response.read(), "hello".encode("utf-8"))
                     self.assertIn("attachment", response.headers["Content-Disposition"])
                 (folder / "남의 것.txt").write_text("secret", encoding="utf-8")
@@ -211,10 +214,10 @@ class WebTests(unittest.TestCase):
                 with self.assertRaises(urllib.error.HTTPError):                     # 다른 사람이 받은 파일은 못 받는다
                     urllib.request.urlopen(urllib.request.Request(base.replace(urllib.parse.quote(quoted),
                                                                                urllib.parse.quote(other)),
-                                                                  headers={"X-Jarvis-Token": "test-token"}), timeout=5)
+                                                                  headers={"X-Jarvis-Token": "test-token"}), timeout=30)
                 bad = base.rsplit("=", 1)[0] + "=" + urllib.parse.quote("..%2Fweb.db")
                 with self.assertRaises(urllib.error.HTTPError):
-                    urllib.request.urlopen(urllib.request.Request(bad, headers={"X-Jarvis-Token": "test-token"}), timeout=5)
+                    urllib.request.urlopen(urllib.request.Request(bad, headers={"X-Jarvis-Token": "test-token"}), timeout=30)
             finally:
                 server.shutdown()
                 server.server_close()

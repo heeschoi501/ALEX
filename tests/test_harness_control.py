@@ -62,6 +62,31 @@ class RequestControlTests(unittest.TestCase):
                     self.assertIs(provider.cancel_event, old)
                     self.assertEqual(provider.timeout, 5)
 
+    def test_a_socket_timeout_set_by_the_deadline_is_a_deadline_timeout_even_if_it_fires_early(self):
+        # 2026-11-08 Windows CI: 소켓 타이머가 time.monotonic 보다 조금 일찍 울려 '네트워크 오류' 로 보고됐다.
+        # 기한이 소켓 한도를 정했으면 그 시간 초과는 기한 끝이다. 기한이 정하지 않았거나 시간 초과가 아니면 그대로 둔다.
+        from unittest.mock import patch
+
+        def socket_timeout(*_args, **_kwargs):
+            try:
+                raise TimeoutError("timed out")
+            except TimeoutError as exc:
+                raise ProviderError("Ollama 응답 시간 초과 또는 네트워크 오류: timed out") from exc
+
+        def refused(*_args, **_kwargs):
+            raise ProviderError("Ollama 서버에 연결할 수 없습니다")
+        provider = OllamaProvider('test', host='http://127.0.0.1:9', timeout=30)
+        with patch.object(OllamaProvider, 'chat_step', socket_timeout):
+            with self.assertRaisesRegex(GenerationTimeout, "제한 시간"):
+                provider.chat_step_controlled([Message('user', 'hello')], deadline=time.monotonic() + 5)
+            with self.assertRaises(ProviderError) as caught:                     # 기한이 한도를 정하지 않았다
+                provider.chat_step_controlled([Message('user', 'hello')], deadline=time.monotonic() + 100)
+            self.assertNotIsInstance(caught.exception, GenerationTimeout)
+        with patch.object(OllamaProvider, 'chat_step', refused):
+            with self.assertRaises(ProviderError) as caught:                     # 시간 초과가 아닌 오류
+                provider.chat_step_controlled([Message('user', 'hello')], deadline=time.monotonic() + 5)
+            self.assertNotIsInstance(caught.exception, GenerationTimeout)
+
     def test_user_cancel_interrupts_waiting_headers_without_becoming_a_timeout(self):
         with server('headers') as (host, entered):
             provider = OllamaProvider('test', host=host, timeout=5)

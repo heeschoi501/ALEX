@@ -40,7 +40,7 @@ from .storage import OWNER, Storage, StorageError
 from .tools import SafeFileReadTool, SafeFileSearchTool, SafeProjectContextTool, SafeProjectTreeTool, ToolError
 from .webread import WebReader
 from .workspace import SafeWorkspaceEditor
-from .developer import DeveloperMode
+from .developer import AUTO_MAX_ROUNDS, DeveloperMode
 from .opencode_worker import OpenCodeWorker
 from .cloudagent import CloudAgents
 from .imagegen import ComfyImageGenerator
@@ -149,7 +149,9 @@ HELP_TEXT = """사용 가능한 명령
                            (채팅의 '~ 만들어줘' 는 코드를 답으로 주고 뒤에서 실행만 확인)
   /dev-start 파일[, 파일2…] :: 테스트[, 테스트2…] :: 목표   개발 작업 시작 (여러 파일이면 묶음 수정안, 테스트는 모두 통과해야 함)
   /dev-next                테스트 → 실패 분석 → 수정안 생성 (최대 3회)
-  /dev-auto                격리 복사본에서 테스트→수정→재시험 최대 3회, 통과하면 최종 묶음 수정안만 제시
+  /dev-auto                격리 복사본에서 테스트→수정→재시험 최대 5회, 통과하면 최종 묶음 수정안만 제시
+                           (5회로도 못 하면 클라우드(Claude Code·Codex)에 피드백을 청하고, 그 피드백으로 ALEX 가 다시 5회
+                            — 클라우드는 읽기만 한다. coding_cloud_after_local 로 끔)
                            (coding_auto_attempts 가 2 이상이면 실패 때 처음 상태에서 새로 풀기를 그 횟수까지,
                             coding_regression_check 를 켜면 통과 뒤 전체 테스트로 다른 테스트를 깨뜨렸는지도 본다)
   /dev-propose             통과한 기준 테스트 뒤 목표에 따른 수정안 생성
@@ -692,8 +694,9 @@ def build_core(
         misroute_log_path=settings.log_dir / "misroute.jsonl",
     )
     apply_coding_worker(core, settings, notes)
-    from .selfknow import SelfKnowledge  # 자기 기능 알기 — 명령 목록과 화면에서(2026-10-23)
-    core.self_knowledge = SelfKnowledge(HELP_TEXT, Path(__file__).resolve().parent / "static" / "index.html", extra=(
+    from .selfknow import SelfKnowledge, principle_lines  # 자기 기능 알기 — 명령 목록과 화면에서(2026-10-23), 개발 원칙은 AGENTS.md 에서
+    core.self_knowledge = SelfKnowledge(HELP_TEXT, Path(__file__).resolve().parent / "static" / "index.html", extra=tuple(
+        principle_lines(Path(__file__).resolve().parents[1] / "AGENTS.md")) + (
         "말로 파일 고치기·수정 — 채팅에 '프로젝트에 있는 파일 이름 + 고쳐줘·수정해줘·추가해줘·바꿔줘' 라고 하면 코딩 세션이 그 파일을 "
         "직접 읽고 쓰고 고친다(폴더는 지금 프로젝트, 권한은 입력창 선택, 관리자만). 허락은 채팅에서 '응'·'항상'·'아니' 로 답하고, "
         "'되돌려줘' 로 되돌린다. '코딩 세션에서 ~해줘' 라고 해도 된다. 새 프로그램을 짜 달라는 말은 코드를 답으로 준다(파일로 만들려면 /build).",
@@ -724,6 +727,7 @@ def build_core(
         except (ToolError, StorageError) as exc:
             notes.append(f"Saved project root restore skipped: {exc}")
     core.cloud_agents = CloudAgents(settings.cloud_agent, settings.cloud_agent_timeout)
+    core.cloud_after_local = settings.coding_cloud_after_local  # ADR-129
     return core, notes
 
 
@@ -1067,7 +1071,12 @@ def handle_command(core: JarvisCore, session_id: str, text: str) -> tuple[str, b
             elif text == "/dev-list":
                 output = mode.history()
             elif text == "/dev-auto":
-                output = mode.auto(session_id)
+                # ADR-129: 클라우드 피드백이 와 있으면(피드백 뒤 다시 고치기) 그것을 참고로 다시 5회차
+                hint = core.take_cloud_hint(session_id) if hasattr(core, "take_cloud_hint") else ""
+                output = mode.auto(session_id, hint=hint) if hint else mode.auto(session_id)
+                if getattr(mode, "last_result", "") == "not_passed":  # 로컬 회차를 다 쓴 뒤에만 클라우드에 피드백을 청한다
+                    output += core.after_local_failure(session_id, "개발 작업(/dev-auto)", getattr(mode, "last_goal", ""), output,
+                                                       resume="/dev-auto", had_feedback=bool(hint))
             else:
                 output = mode.next(session_id)
             return output, True, session_id
@@ -1152,7 +1161,7 @@ def handle_command(core: JarvisCore, session_id: str, text: str) -> tuple[str, b
                     f"{key}={value}" for key, value in runtime.items() if key != "model"
                 ))
         if getattr(core, "coding_auto_attempts", 1) > 1:  # ADR-077
-            lines.append(f"dev_auto: 독립 풀이 최대 {core.coding_auto_attempts}번(풀이마다 최대 3회차)")
+            lines.append(f"dev_auto: 독립 풀이 최대 {core.coding_auto_attempts}번(풀이마다 최대 {AUTO_MAX_ROUNDS}회차)")
         if getattr(core, "coding_regression_check", False):  # ADR-078
             lines.append("dev_auto: 회귀 검사 켬(합격 테스트 통과 뒤 전체 테스트)")
         if getattr(core, "coding_diagnostic_context", False):  # ADR-080
@@ -1804,6 +1813,14 @@ def main() -> None:
         if text.startswith("/"):
             output, keep_going, session_id = handle_command(core, session_id, text)
             print(output)
+            # ADR-129: 로컬 5회차 실패 → 클라우드 피드백 → ALEX 가 그 피드백으로 다시. 터미널은 차례대로 기다린다.
+            # 피드백 뒤 다시 고치기도 못 하면 더 예약하지 않으므로 이 반복은 많아야 두 번 돈다.
+            while (followup := core.take_cloud_followup(session_id)):
+                if followup.startswith("/cloud"):
+                    print(core.handle_cloud(session_id, followup))
+                else:
+                    output, _keep, session_id = handle_command(core, session_id, followup)
+                    print(output)
             if not keep_going:
                 break
             continue

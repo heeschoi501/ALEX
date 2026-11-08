@@ -894,7 +894,7 @@ class WebImageTests(unittest.TestCase):
         self.url = f"http://127.0.0.1:{self.server.server_port}"
 
     def get(self, path, token="test-token"):
-        return urllib.request.urlopen(urllib.request.Request(self.url + path, headers={"X-Jarvis-Token": token}), timeout=3)
+        return urllib.request.urlopen(urllib.request.Request(self.url + path, headers={"X-Jarvis-Token": token}), timeout=30)
 
     def test_the_picture_is_served_only_with_the_token_and_a_valid_name(self):
         with self.get(f"/api/image?name={self.saved.name}") as r:
@@ -911,7 +911,7 @@ class WebImageTests(unittest.TestCase):
     def upload(self, data, content_type="image/png", token="test-token", name="흑태자.png"):
         request = urllib.request.Request(self.url + "/api/image/upload", data=data, method="POST", headers={
             "X-Jarvis-Token": token, "Content-Type": content_type, "X-File-Name": urllib.parse.quote(name)})
-        return urllib.request.urlopen(request, timeout=5)
+        return urllib.request.urlopen(request, timeout=30)
 
     def test_an_uploaded_picture_becomes_the_last_picture_and_can_be_saved_as_a_character(self):
         """2026-10-03: "창세기전2 흑태자 그려줘" 에 ALEX 가 인터넷 그림을 볼 수 없다고 답했다 — 참고 그림을 올리는 입구."""

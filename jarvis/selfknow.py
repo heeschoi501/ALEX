@@ -13,8 +13,8 @@ from pathlib import Path
 import math
 import re
 
-# 기능을 묻는 말(할 수 있어?·가능해?·어떻게 해?·기능·명령 …)
-ASKING = re.compile(r"수\s*있|할수있|있어\?|있나\?|가능|권한|되나|돼\?|되니|되요|돼요|되죠|지원|기능|어떻게\s*(해|하|써|쓰|켜|열)|방법|명령|할\s*줄|쓸\s*수|없어\?|못\s*해")
+# 기능을 묻는 말(할 수 있어?·가능해?·어떻게 해?·기능·명령 …), 자기 개발 원칙을 묻는 말(원칙·규칙)
+ASKING = re.compile(r"수\s*있|할수있|있어\?|있나\?|가능|권한|되나|돼\?|되니|되요|돼요|되죠|지원|기능|어떻게\s*(해|하|써|쓰|켜|열)|방법|명령|할\s*줄|쓸\s*수|없어\?|못\s*해|원칙|규칙")
 # 무엇을 할 수 있는지 통째로 묻는 말
 OVERVIEW = re.compile(r"(뭘|무엇을|뭐|무슨|어떤)\s*(것|거|일|기능)?\s*(을|를)?\s*(할\s*수|가능|해\s*줄|기능)|기능\s*(목록|소개|알려)")
 ENDINGS = sorted(("하기", "해줘", "하지", "하는", "해요", "할", "한", "기", "고", "어", "아", "는", "을", "를", "도", "은",
@@ -40,7 +40,7 @@ def _stems(question: str) -> list[str]:
     return stems
 
 
-HEADER = ("ALEX 의 실제 기능 — 이 PC 의 명령 목록(/help)과 화면에서 자동으로 뽑은 것이다. 여기 있는 것은 할 수 있다. "
+HEADER = ("ALEX 의 실제 기능 — 이 PC 의 명령 목록(/help)·화면과 개발 원칙(AGENTS.md)에서 자동으로 뽑은 것이다. 여기 있는 것은 할 수 있다. "
           "대화 중 모델이 스스로 부르는 도구(웹 검색 등)와, 사용자가 쓰는 명령·화면은 다르다 — 둘을 구분해서 어떻게 하면 되는지 알려라. "
           "여기 없다고 '못 한다' 고 단정하지 말고 /help 를 권하라.")
 
@@ -74,6 +74,21 @@ def ui_lines(page: str) -> list[str]:
         seen.add(name)
         out.append(f"화면 '{name[:30]}' — {html.unescape(title.group(1))}")
     return out
+
+
+def principle_lines(path: Path) -> list[str]:
+    """저장소 AGENTS.md 의 '## 원칙' 절 → '개발 원칙 …' 줄(2026-11-08 사용자 "ALEX도 학습할수있게 해줘").
+
+    Codex·Claude 와 ALEX 의 코딩 하네스가 읽는 같은 파일이라, 원칙을 고치면 ALEX 가 자기 이야기를 할 때도 따라 바뀐다.
+    파일이 없으면(설치본) 빈 목록.
+    """
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return []
+    section = re.search(r"^## 원칙[ \t]*$(.*?)(?=^## |\Z)", text, re.M | re.S)
+    return [f"개발 원칙 '{item.group(1).rstrip(':')}' — {item.group(2).strip()}"
+            for item in re.finditer(r"^- \*\*(.+?)\*\*[ \t]*(.+)$", section.group(1) if section else "", re.M)]
 
 
 class SelfKnowledge:
