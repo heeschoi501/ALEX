@@ -150,7 +150,8 @@ HELP_TEXT = """사용 가능한 명령
   /dev-start 파일[, 파일2…] :: 테스트[, 테스트2…] :: 목표   개발 작업 시작 (여러 파일이면 묶음 수정안, 테스트는 모두 통과해야 함)
   /dev-next                테스트 → 실패 분석 → 수정안 생성 (최대 3회)
   /dev-auto                격리 복사본에서 테스트→수정→재시험 최대 5회, 통과하면 최종 묶음 수정안만 제시
-                           (5회로도 못 하면 클라우드(Claude Code·Codex)에 이어서 맡김 — coding_cloud_after_local 로 끔)
+                           (5회로도 못 하면 클라우드(Claude Code·Codex)에 피드백을 청하고, 그 피드백으로 ALEX 가 다시 5회
+                            — 클라우드는 읽기만 한다. coding_cloud_after_local 로 끔)
                            (coding_auto_attempts 가 2 이상이면 실패 때 처음 상태에서 새로 풀기를 그 횟수까지,
                             coding_regression_check 를 켜면 통과 뒤 전체 테스트로 다른 테스트를 깨뜨렸는지도 본다)
   /dev-propose             통과한 기준 테스트 뒤 목표에 따른 수정안 생성
@@ -1070,9 +1071,12 @@ def handle_command(core: JarvisCore, session_id: str, text: str) -> tuple[str, b
             elif text == "/dev-list":
                 output = mode.history()
             elif text == "/dev-auto":
-                output = mode.auto(session_id)
-                if getattr(mode, "last_result", "") == "not_passed":  # ADR-129: 로컬 회차를 다 쓴 뒤 클라우드로 잇기
-                    output += core.after_local_failure(session_id, "개발 작업(/dev-auto)", getattr(mode, "last_goal", ""), output)
+                # ADR-129: 클라우드 피드백이 와 있으면(피드백 뒤 다시 고치기) 그것을 참고로 다시 5회차
+                hint = core.take_cloud_hint(session_id) if hasattr(core, "take_cloud_hint") else ""
+                output = mode.auto(session_id, hint=hint) if hint else mode.auto(session_id)
+                if getattr(mode, "last_result", "") == "not_passed":  # 로컬 회차를 다 쓴 뒤에만 클라우드에 피드백을 청한다
+                    output += core.after_local_failure(session_id, "개발 작업(/dev-auto)", getattr(mode, "last_goal", ""), output,
+                                                       resume="/dev-auto", had_feedback=bool(hint))
             else:
                 output = mode.next(session_id)
             return output, True, session_id
@@ -1809,9 +1813,14 @@ def main() -> None:
         if text.startswith("/"):
             output, keep_going, session_id = handle_command(core, session_id, text)
             print(output)
-            followup = core.take_cloud_followup(session_id)
-            if followup:  # ADR-129: 로컬이 회차를 다 쓴 일을 클라우드에 이어서 — 터미널은 끝날 때까지 기다린다
-                print(core.handle_cloud(session_id, followup))
+            # ADR-129: 로컬 5회차 실패 → 클라우드 피드백 → ALEX 가 그 피드백으로 다시. 터미널은 차례대로 기다린다.
+            # 피드백 뒤 다시 고치기도 못 하면 더 예약하지 않으므로 이 반복은 많아야 두 번 돈다.
+            while (followup := core.take_cloud_followup(session_id)):
+                if followup.startswith("/cloud"):
+                    print(core.handle_cloud(session_id, followup))
+                else:
+                    output, _keep, session_id = handle_command(core, session_id, followup)
+                    print(output)
             if not keep_going:
                 break
             continue

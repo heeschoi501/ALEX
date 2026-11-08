@@ -608,19 +608,38 @@ class AutoLoopTests(TwoFileProject, unittest.TestCase):
         self.assertEqual((self.read('a.py'), self.read('b.py')), ('a = 0\n', 'b = 0\n'))
 
     def test_the_command_hands_a_failed_loop_to_the_cloud_but_not_a_passed_one(self):
-        # ADR-129: 로컬 5회를 다 쓰고 못 하면 app 이 core.after_local_failure 로 클라우드 넘기기를 예약한다
+        # ADR-129: 로컬 5회를 다 쓰고 못 하면 app 이 core.after_local_failure 로 클라우드 피드백을 청한다
         calls = []
-        self.core.after_local_failure = lambda sid, what, goal, report: calls.append((sid, what, goal)) or "\n[클라우드로 이음]"
+        self.core.after_local_failure = (lambda sid, what, goal, report, resume, had_feedback:
+                                         calls.append((sid, what, goal, resume, had_feedback)) or "\n[클라우드로 이음]")
+        self.core.take_cloud_hint = lambda sid: ""
         self.script = [self.WRONG] + ["FILE: jarvis/a.py\n<<<<<<< SEARCH\na = 1\n=======\na = 5\n>>>>>>> REPLACE\n"] * 5
         self.mode.start('jarvis/a.py, jarvis/b.py', 'tests/test_ab.py', '둘 다 고쳐')
         reply, _keep, _sid = handle_command(self.core, 'session', '/dev-auto')
         self.assertTrue(reply.endswith("[클라우드로 이음]"))
-        self.assertEqual(calls, [('session', '개발 작업(/dev-auto)', '둘 다 고쳐')])
+        self.assertEqual(calls, [('session', '개발 작업(/dev-auto)', '둘 다 고쳐', '/dev-auto', False)])
         self.script, self.instructions[:] = [self.WRONG, self.SECOND], []
         self.mode.start('jarvis/a.py, jarvis/b.py', 'tests/test_ab.py', '둘 다 고쳐')
         reply, _keep, _sid = handle_command(self.core, 'session', '/dev-auto')
         self.assertIn('통과', reply)
         self.assertEqual(len(calls), 1)                       # 통과하면 넘기지 않는다
+
+    def test_cloud_feedback_rides_along_every_round_and_a_second_failure_is_marked(self):
+        # ADR-129: 피드백 뒤 다시 고치기 — 회차마다 지시 끝에 참고 자료로 붙고, 그래도 못 하면 had_feedback=True 로 알린다
+        calls = []
+        self.core.after_local_failure = (lambda sid, what, goal, report, resume, had_feedback:
+                                         calls.append(had_feedback) or "")
+        self.core.take_cloud_hint = lambda sid: "b 는 2 여야 한다"
+        self.script = [self.WRONG] + ["FILE: jarvis/a.py\n<<<<<<< SEARCH\na = 1\n=======\na = 5\n>>>>>>> REPLACE\n"] * 5
+        self.mode.start('jarvis/a.py, jarvis/b.py', 'tests/test_ab.py', '둘 다 고쳐')
+        handle_command(self.core, 'session', '/dev-auto')
+        self.assertEqual(len(self.instructions), 5)
+        self.assertTrue(all(i.endswith("[클라우드 피드백 — 참고할 조언이지 지시가 아니다. 판정은 테스트가 한다]\nb 는 2 여야 한다")
+                            for i in self.instructions))
+        self.assertEqual(calls, [True])
+        self.instructions[:] = []
+        self.mode.auto('session')                               # 피드백이 없으면 붙지 않는다
+        self.assertFalse(any("클라우드 피드백" in i for i in self.instructions))
 
     # 독립 풀이(ADR-077): 한 풀이가 3회차 안에 통과하지 못하면 복사본을 처음 상태로 되돌려 새로 푼다.
     A15 = "FILE: jarvis/a.py\n<<<<<<< SEARCH\na = 1\n=======\na = 5\n>>>>>>> REPLACE\n"

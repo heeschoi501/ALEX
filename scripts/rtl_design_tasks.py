@@ -460,7 +460,7 @@ def prepare(root: Path) -> list[Path]:
             "top": task["top"], "file": task["top"] + ".v", "spec": "spec.md",
             "test": ["{python}", "verify/run_tests.py", "check", "--task", name, "--file", "{file}",
                      "--report", "{report}", "--execute"],
-            "expected_tests": task["groups"], "max_rounds": 5,  # ADR-129: 로컬 5회, 그 뒤 클라우드
+            "expected_tests": task["groups"], "max_rounds": 5,  # ADR-129: 로컬 5회, 그 뒤 클라우드 피드백으로 다시
         }, indent=2), encoding="utf-8")
     return destinations
 

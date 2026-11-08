@@ -413,6 +413,10 @@ class WebAppState:
             with self.ticket_running(ticket, "background", chunk):
                 answer = self.core.cloud_finish(sid, task, run, error)
             task = None
+            followup = self.core.take_cloud_followup(sid)
+            if followup and not error and not self.shutting_down:
+                # ADR-129: 받은 피드백으로 ALEX 가 다시 고친다 — 같은 대화의 새 뒤 작업으로(권한은 이 요청 그대로)
+                self.start_job(viewer, sid, followup, permission)
             job.update(status="cancelled" if error == "사용자가 중단했습니다." else "done",
                        result=answer[:JOB_RESULT_CHARS])
         except Exception as exc:  # noqa: BLE001
@@ -1338,7 +1342,7 @@ class WebAppState:
                     output = "Web UI에서는 /exit로 서버를 종료하지 않습니다. 터미널에서 Ctrl+C를 사용하세요."
                 followup = self.core.take_cloud_followup(sid)
                 if followup and viewer.is_admin and not self.shutting_down:
-                    # ADR-129: 로컬이 5회차로 못 한 일을 같은 대화의 클라우드 뒤 작업으로 잇는다 — 이 답이 끝난 뒤 차례가 온다
+                    # ADR-129: 로컬이 5회차로 못 한 일에 클라우드 피드백을 청하는 뒤 작업 — 이 답이 끝난 뒤 차례가 온다
                     self.start_job(viewer, sid, followup, None)
                 result = {"response": output, "route": "command", "session_id": new_session}
             else:

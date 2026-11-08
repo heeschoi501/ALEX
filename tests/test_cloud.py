@@ -273,9 +273,11 @@ if __name__ == "__main__":
     unittest.main()
 
 
+
 class LocalFirstTests(unittest.TestCase):
     """ADR-129(2026-11-08 사용자: "기본적으로 5회까진 스스로 하고 이후에 클라우드llm요청하는방식", "ALEX가 스스로 수정은
-    최대한해야하니까") — /dev-auto·/rtl 이 로컬 회차를 다 쓰고도 못 하면 같은 일을 클라우드 넘기기로 잇는다."""
+    최대한해야하니까", "5회가 넘어가면 ALEX가 요청하는거야. 그거에 대해서 클라우드는 피드백을하는거고") — /dev-auto·/rtl 이
+    로컬 5회차로 못 하면 ALEX 가 클라우드에 피드백을 청하고, 클라우드는 읽기만 하며, ALEX 가 그 피드백으로 다시 고친다."""
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -292,23 +294,46 @@ class LocalFirstTests(unittest.TestCase):
 
     REPORT = "1회차 테스트: 실패\n…\n5회차 테스트: 실패(종료 코드 1)\nAssertionError: 3 != 5"
 
-    def test_a_failed_local_loop_books_one_cloud_handoff_for_the_same_room(self):
+    def test_alex_asks_for_feedback_and_the_cloud_only_reads(self):
         note = self.core.after_local_failure(self.sid, "개발 작업(/dev-auto)", "더하기 고쳐", self.REPORT)
-        self.assertIn("클라우드(Claude Code)에 이어서 맡깁니다", note)
-        self.assertIn("승인해야 바뀝니다", note)
+        self.assertIn("피드백을 청합니다", note)
+        self.assertIn("클라우드는 읽기만", note)
         self.assertIsNone(self.core.take_cloud_followup("other-room"))   # 다른 방으로는 보내지 않고 버린다
         self.core.after_local_failure(self.sid, "개발 작업(/dev-auto)", "더하기 고쳐", self.REPORT)
         message = self.core.take_cloud_followup(self.sid)
         self.assertIsNone(self.core.take_cloud_followup(self.sid))       # 한 번만
-        self.assertIsNotNone(parse_request(message))
+        self.assertIn("파일은 고치지 말고", message)
         self.assertIn("목표: 더하기 고쳐", message)
         self.assertIn("AssertionError: 3 != 5", message)
+        seen = {}
+        real_run = self.core.cloud_agents.run
+
+        def spy(*args, **kwargs):
+            seen.update(kwargs)
+            return real_run(*args, **kwargs)
+        self.core.cloud_agents.run = spy
         reply = self.core.handle_cloud(self.sid, message)
-        self.assertTrue(reply.startswith(CLOUD_HEADER))
-        self.assertIn("편집 제안 ID", reply)                               # 적용은 여전히 승인
+        self.assertFalse(seen["edit"])                                    # 읽기 전용(Claude: Read·Glob·Grep, Codex: read-only)
+        self.assertTrue(reply.startswith("클라우드 피드백 — Claude Code"))
+        self.assertIn("1) calc.py 의 add 를 고쳤습니다", reply)            # 가짜 에이전트의 보고가 피드백이 된다
+        self.assertNotIn("편집 제안 ID", reply)                            # 클라우드가 복사본을 바꿔도 수정안을 만들지 않는다
         self.assertIn("return a - b", (self.project / "calc.py").read_text(encoding="utf-8"))
-        asked = self.core.storage.message_page(self.sid)["messages"][0]["content"]  # 무엇을 보냈는지 대화에 남는다
-        self.assertIn("[ALEX 의 마지막 보고]", asked)
+        self.assertEqual(self.core.take_cloud_followup(self.sid), "/dev-auto")   # ALEX 가 다시 고친다
+        self.assertIn("calc.py 의 add", self.core.take_cloud_hint(self.sid))
+        self.assertEqual(self.core.take_cloud_hint(self.sid), "")         # 피드백은 한 번 쓴다
+
+    def test_after_feedback_a_second_failure_stops(self):
+        note = self.core.after_local_failure(self.sid, "개발 작업(/dev-auto)", "더하기", self.REPORT, had_feedback=True)
+        self.assertIn("더 청하지 않고 여기서 멈춥니다", note)
+        self.assertIsNone(self.core.take_cloud_followup(self.sid))
+
+    def test_no_feedback_no_rerun(self):
+        self.core.cloud_agents = agents(self.base, "limit", "limit")
+        self.core.after_local_failure(self.sid, "개발 작업(/dev-auto)", "더하기", self.REPORT)
+        reply = self.core.handle_cloud(self.sid, self.core.take_cloud_followup(self.sid))
+        self.assertTrue(reply.startswith("클라우드 피드백 — 받지 못함"))
+        self.assertIsNone(self.core.take_cloud_followup(self.sid))
+        self.assertEqual(self.core.take_cloud_hint(self.sid), "")
 
     def test_nothing_is_booked_when_off_read_only_or_no_agent(self):
         self.core.cloud_after_local = False
@@ -323,7 +348,7 @@ class LocalFirstTests(unittest.TestCase):
 
     def test_a_folder_is_sent_only_from_inside_the_project(self):
         self.core.after_local_failure(self.sid, "Verilog", "y", self.REPORT, folder=self.project / "sub")
-        self.assertTrue(self.core.take_cloud_followup(self.sid).startswith("/cloud @sub ALEX"))
+        self.assertTrue(self.core.take_cloud_followup(self.sid).startswith("/cloud @sub [피드백만] ALEX"))
         (self.project / "my rtl").mkdir()
         self.assertIn("빈칸", self.core.after_local_failure(self.sid, "Verilog", "y", self.REPORT, folder=self.project / "my rtl"))
         self.assertIsNone(self.core.take_cloud_followup(self.sid))
@@ -333,43 +358,68 @@ class LocalFirstTests(unittest.TestCase):
         self.assertIn("프로젝트 폴더가 이 폴더를 품어야 합니다", note)
         self.assertIsNone(self.core.take_cloud_followup(self.sid))
 
-    def test_a_failed_rtl_loop_hands_over_but_a_cancelled_one_does_not(self):
+    def test_a_failed_rtl_loop_asks_and_the_rerun_uses_the_feedback(self):
         from unittest.mock import patch
         from jarvis import rtl_loop
         from scripts.rtl_design_tasks import prepare
         folder = prepare(self.project / "rtl")[0]
         self.core.rtl_root, self.core.rtl_tools_dir = self.project / "rtl", self.base / "tools"
+        calls = []
+
+        def fake_run(*args, **kwargs):
+            calls.append(kwargs)
+            return rtl_loop.RtlResult(folder, False, [object()], stopped)
         for stopped, booked in (("5회 안에 모든 시험을 통과하지 못함", True), ("사용자 취소", False)):
-            with self.subTest(stopped=stopped), \
-                    patch.object(rtl_loop, "run_rtl", lambda *a, **k: rtl_loop.RtlResult(folder, False, [object()], stopped)), \
+            with self.subTest(stopped=stopped), patch.object(rtl_loop, "run_rtl", fake_run), \
                     patch.object(rtl_loop, "answer_text", lambda result, project: f"RTL 보고: {result.stopped}"):
                 reply = self.core.handle_rtl(self.sid, folder.name)
                 message = self.core.take_cloud_followup(self.sid)
                 self.assertEqual(message is not None, booked)
                 if booked:
-                    self.assertTrue(message.startswith(f"/cloud @rtl/{folder.name} "))
-                    self.assertIn("이어서 맡깁니다", reply)
+                    self.assertTrue(message.startswith(f"/cloud @rtl/{folder.name} [피드백만] "))
+                    self.assertIn("피드백을 청합니다", reply)
+                    self.assertEqual(self.core.feedback_resume[self.sid], f"/rtl {folder.name} --continue")
+        stopped = "5회 안에 모든 시험을 통과하지 못함"
+        self.core.cloud_hints[self.sid] = "reset 때 mem 을 지우지 않는다"
+        with patch.object(rtl_loop, "run_rtl", fake_run), patch.object(rtl_loop, "answer_text", lambda r, p: "RTL 보고"):
+            reply = self.core.handle_rtl(self.sid, folder.name, resume=True)
+        self.assertEqual(calls[-1]["hint"], "reset 때 mem 을 지우지 않는다")   # 피드백을 참고로 다시 고친다
+        self.assertIn("더 청하지 않고 여기서 멈춥니다", reply)                # 그래도 못 하면 멈춘다
+        self.assertIsNone(self.core.take_cloud_followup(self.sid))
 
-    def test_the_web_runs_the_handoff_as_a_background_job_after_the_answer(self):
+    def test_the_web_runs_ask_feedback_and_rerun_as_background_jobs(self):
         from unittest.mock import patch
         state = WebAppState(self.core, self.sid, token="t")
         viewer = state.owner_viewer()
+        hints = []
 
-        def failing_dev_auto(core, sid, text):
+        def dev_auto(core, sid, text):
+            hint = core.take_cloud_hint(sid)
+            hints.append(hint)
+            if hint:
+                return "피드백으로 다시: 2회차 테스트: 통과", True, sid
             return "5회차 테스트: 실패" + core.after_local_failure(sid, "개발 작업(/dev-auto)", "더하기", self.REPORT), True, sid
-        try:
-            with patch("jarvis.web.handle_command", failing_dev_auto):
-                result = state.process("/dev-auto", viewer=viewer, session_id=self.sid)
-            self.assertIn("이어서 맡깁니다", result["response"])
-            job = next(j for j in state.jobs.values() if j["request"].startswith("/cloud ALEX"))
+
+        def settle():
             deadline = time.monotonic() + 30
-            while state.jobs[job["id"]]["status"] in ("queued", "running") and time.monotonic() < deadline:
+            while time.monotonic() < deadline:
+                if all(j["status"] not in ("queued", "running") for j in state.jobs.values()) and \
+                        not any(t.name.startswith("alex-job-") for t in threading.enumerate()):
+                    return
                 time.sleep(0.05)
-            for thread in threading.enumerate():  # 뒤 작업 스레드의 마무리(기록 저장)까지 기다린다 — 다음 시험에 새지 않게
-                if thread.name == f"alex-job-{job['id'][:6]}":
-                    thread.join(10)
-            self.assertEqual(state.jobs[job["id"]]["status"], "done")
-            last = self.core.storage.message_page(self.sid)["messages"][-1]["content"]
-            self.assertTrue(last.startswith(CLOUD_HEADER))
+            raise AssertionError(state.jobs)
+        try:
+            with patch("jarvis.web.handle_command", dev_auto):
+                result = state.process("/dev-auto", viewer=viewer, session_id=self.sid)
+                self.assertIn("피드백을 청합니다", result["response"])
+                settle()
+            requests = [j["request"][:12] for j in sorted(state.jobs.values(), key=lambda j: j["created"])]
+            self.assertEqual([r.split()[0] for r in requests], ["/cloud", "/dev-auto"])
+            self.assertTrue(all(j["status"] == "done" for j in state.jobs.values()), state.jobs)
+            self.assertEqual(hints[0], "")
+            self.assertIn("calc.py 의 add", hints[1])
+            texts = [m["content"] for m in self.core.storage.message_page(self.sid)["messages"]]
+            self.assertTrue(any(t.startswith("클라우드 피드백 — Claude Code") for t in texts))
+            self.assertIn("return a - b", (self.project / "calc.py").read_text(encoding="utf-8"))
         finally:
             state.shutting_down = True

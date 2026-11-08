@@ -358,6 +358,8 @@ CLOUD_HEADER = "클라우드 작업 결과"  # 화면이 이 줄로 시작하는
 CLOUD_HISTORY = 6
 CLOUD_HISTORY_CHARS = 1500
 CLOUD_FAILURE_CHARS = 3000  # ADR-129: 로컬 실패 보고의 끝부분(남은 실패가 끝에 있다)만 넘긴다
+FEEDBACK_MARK = "[피드백만]"  # ADR-129: 이 표시로 시작하는 /cloud 요청은 읽기 전용으로 돌리고 피드백만 받는다
+FEEDBACK_HEADER = "클라우드 피드백"  # '클라우드 작업 결과'(적용 버튼)와 다르게 — 피드백에는 적용할 수정안이 없다
 CLOUD_DIFF_CHARS = 30_000
 CLOUD_USAGE = ("사용법: /cloud [claude|codex] [@하위폴더] 요청 — 또는 말로 '클라우드로 넘겨줘'·'코덱스로 넘겨줘'·'클로드한테 맡겨줘'.\n"
                "작업 패널의 프로젝트 폴더를 복사해서 클라우드가 그 복사본에서 고치고, ALEX 가 다시 확인한 뒤 수정안을 보여 드립니다. "
@@ -375,6 +377,7 @@ class CloudTask:
     source: Path | None
     root: Path | None
     sent: str
+    feedback: bool = False  # ADR-129: 읽기 전용, 피드백만
 
 
 @dataclass(slots=True)
@@ -463,9 +466,11 @@ class JarvisCore:
         # ADR-102. 어려운 일은 클라우드로(요청할 때만, 복사본에서). app.build_core 가 설정의 기본 에이전트로 바꾼다.
         self.cloud_agents = CloudAgents()
         # ADR-129(2026-11-08 사용자: "기본적으로 5회까진 스스로 하고 이후에 클라우드llm요청하는방식"): /dev-auto·/rtl 이 로컬 회차를
-        # 다 쓰고도 통과하지 못하면 같은 일을 클라우드 넘기기로 잇는다. 설정 coding_cloud_after_local(app.build_core 가 넣는다).
+        # 다 쓰고도 통과하지 못하면 ALEX 가 클라우드에 피드백을 청하고 그것으로 다시 고친다("클라우드는 피드백을하는거고"). 설정 coding_cloud_after_local(app.build_core 가 넣는다).
         self.cloud_after_local = True
-        self.cloud_followup: tuple[str, str] | None = None   # (대화, '/cloud …') — 웹·터미널이 답을 낸 뒤 꺼내 돌린다
+        self.cloud_followup: tuple[str, str] | None = None   # (대화, 다음 명령) — 웹·터미널이 답을 낸 뒤 꺼내 돌린다
+        self.feedback_resume: dict[str, str] = {}             # 대화 → 피드백 뒤 다시 돌 명령('/dev-auto'·'/rtl 폴더 --continue')
+        self.cloud_hints: dict[str, str] = {}                 # 대화 → 받은 피드백(다시 고치기가 한 번 쓴다)
         # ADR-100. 월별 대화 기록(data/archive/26년 11월.md …). 웹이 답할 때마다 sync 한다.
         self.archive = ConversationArchive(storage, storage.db_path.parent / "archive")
         # ADR-094. None 이면 기억을 낱말로만 찾는다(임베딩 서버를 안 쓰는 설정·기기).
@@ -909,53 +914,68 @@ class JarvisCore:
                 sent.append(f"비밀값이 보여 뺀 파일 {len(copied.secret_files)}개: {', '.join(copied.secret_files[:5])}"
                             + (" …" if len(copied.secret_files) > 5 else ""))
         return CloudTask(preferred=preferred, request=request, prompt="\n".join(lines), temp=temp, work=work,
-                         source=source, root=root, sent=" · ".join(sent))
+                         source=source, root=root, sent=" · ".join(sent), feedback=request.startswith(FEEDBACK_MARK))
 
-    def after_local_failure(self, session_id: str, what: str, goal: str, report: str, folder: Path | None = None) -> str:
-        """로컬 고치기가 회차를 다 쓰고도 통과하지 못했을 때(ADR-129) — 클라우드 넘기기(ADR-102)를 예약하고 답에 붙일 글을 준다.
+    def after_local_failure(self, session_id: str, what: str, goal: str, report: str, folder: Path | None = None,
+                            resume: str = "/dev-auto", had_feedback: bool = False) -> str:
+        """로컬 고치기가 회차를 다 쓰고도 통과하지 못했을 때(ADR-129) — 클라우드에 피드백을 청하고 답에 붙일 글을 준다.
 
-        ALEX 가 먼저 최대한 스스로 고친다(사용자: "ALEX가 스스로 수정은 최대한해야하니까"). 그 뒤에만 넘긴다. 보내는 길·거르는 것·
-        ALEX 확인·승인해야 적용은 /cloud 와 같다(cloud_prepare 를 그대로 쓴다). 넘기지 못하면 이유만 적고 예약하지 않는다."""
+        사용자: "5회가 넘어가면 ALEX가 요청하는거야. 그거에 대해서 클라우드는 피드백을하는거고", "ALEX가 스스로 수정은 최대한해야하니까".
+        그래서 클라우드는 읽기만 하고 원인·고칠 방향을 말한다. 고치는 것은 ALEX 다 — 피드백이 오면 resume 명령으로 다시 5회차를 돈다.
+        피드백을 받고 다시 돈 것(had_feedback)도 못 하면 더 청하지 않고 멈춘다(끝없이 오가지 않게). 보내는 길·거르는 것은 /cloud 와
+        같다(cloud_prepare). 청하지 못하면 이유만 적고 예약하지 않는다."""
         if not self.cloud_after_local:
             return ""
+        if had_feedback:
+            return ("\n\n클라우드 피드백을 받고 다시 고쳤지만 통과하지 못했습니다. 더 청하지 않고 여기서 멈춥니다 — 직접 맡기려면 "
+                    "'클라우드로 넘겨줘' 라고 해 주세요.")
         if self.permission_mode == "read" or getattr(self, "member_mode", False):
             return ""
         if not any(self.cloud_agents.executable(agent) is not None for agent in CLOUD_AGENT_NAMES):
-            return "\n\n(로컬에서 통과하지 못했습니다. 클라우드로 이어서 맡기려 했지만 이 PC 에 Claude Code·Codex 가 없습니다.)"
+            return "\n\n(로컬에서 통과하지 못했습니다. 클라우드에 피드백을 청하려 했지만 이 PC 에 Claude Code·Codex 가 없습니다.)"
         prefix = ""
         if folder is not None:
             root = self.current_project_root()
             resolved = folder.resolve()
             if root is None or (resolved != root.resolve() and root.resolve() not in resolved.parents):
-                return (f"\n\n(로컬에서 통과하지 못했습니다. 클라우드로 이어서 맡기려면 프로젝트 폴더가 이 폴더를 품어야 합니다: {folder} — "
-                        "프로젝트 폴더를 그 위로 정한 뒤 '클라우드로 넘겨줘' 라고 해 주세요.)")
+                return (f"\n\n(로컬에서 통과하지 못했습니다. 클라우드에 피드백을 청하려면 프로젝트 폴더가 이 폴더를 품어야 합니다: {folder} — "
+                        "프로젝트 폴더를 그 위로 정해 주세요.)")
             if resolved != root.resolve():
                 relative = resolved.relative_to(root.resolve()).as_posix()
                 if any(char.isspace() for char in relative):  # /cloud @폴더 는 빈칸 없는 이름만 읽는다
-                    return f"\n\n(로컬에서 통과하지 못했습니다. 폴더 이름에 빈칸이 있어 클라우드로 넘기지 못했습니다: {relative})"
+                    return f"\n\n(로컬에서 통과하지 못했습니다. 폴더 이름에 빈칸이 있어 클라우드에 보내지 못했습니다: {relative})"
                 prefix = "@" + relative + " "
         tail = redact_sensitive_text(report.strip())[-CLOUD_FAILURE_CHARS:]
-        message = (f"/cloud {prefix}ALEX 가 로컬에서 {what} 을(를) 스스로 고쳤지만 통과하지 못했다. 아래 ALEX 의 마지막 보고(실패한 시험·남은 "
-                   f"문제)를 보고 이어서 고쳐 줘. 시험 자체는 바꾸지 않는다.\n목표: {goal.strip() or what}\n\n[ALEX 의 마지막 보고]\n{tail}")
+        message = (f"/cloud {prefix}{FEEDBACK_MARK} ALEX 가 로컬에서 {what} 을(를) 스스로 고쳤지만 통과하지 못했다. 파일은 고치지 말고, "
+                   "아래 ALEX 의 마지막 보고(실패한 시험·남은 문제)와 작업 폴더를 읽고 피드백만 줘 — 무엇이 원인인지, 어느 파일의 "
+                   "어느 부분을 어떻게 바꾸면 되는지, 왜 그런지. ALEX 가 그 피드백으로 직접 다시 고친다. 시험 자체는 바꾸지 않는다.\n"
+                   f"목표: {goal.strip() or what}\n\n[ALEX 의 마지막 보고]\n{tail}")
         self.cloud_followup = (session_id, message)
+        self.feedback_resume[session_id] = resume
         agent = CLOUD_LABEL.get(self.cloud_agents.default, self.cloud_agents.default)
-        return (f"\n\n로컬에서 통과하지 못해 클라우드({agent})에 이어서 맡깁니다 — 뒤 작업으로 돌고, 결과는 ALEX 가 다시 확인하며 "
-                "원본은 승인해야 바뀝니다(설정 coding_cloud_after_local 로 끕니다).")
+        return (f"\n\n로컬 {what} 5회차로 통과하지 못해 클라우드({agent})에 피드백을 청합니다 — 클라우드는 읽기만 하고, "
+                "피드백이 오면 ALEX 가 그것으로 다시 고칩니다(설정 coding_cloud_after_local 로 끕니다).")
 
     def take_cloud_followup(self, session_id: str) -> str | None:
-        """예약된 클라우드 넘기기를 꺼낸다(한 번만). 다른 대화의 예약은 버린다 — 엉뚱한 방으로 보내지 않게."""
+        """예약된 다음 일('/cloud …' 피드백 요청, 또는 피드백 뒤 다시 고치기 명령)을 꺼낸다(한 번만).
+        다른 대화의 예약은 버린다 — 엉뚱한 방으로 보내지 않게."""
         pending, self.cloud_followup = self.cloud_followup, None
         return pending[1] if pending and pending[0] == session_id else None
 
+    def take_cloud_hint(self, session_id: str) -> str:
+        """피드백 뒤 다시 고치기가 쓸 클라우드 피드백(한 번만). 없으면 빈 글 — 그러면 보통 고치기다."""
+        return self.cloud_hints.pop(session_id, "")
+
     def cloud_run(self, task: "CloudTask", cancel_event=None, progress=None) -> CloudRun:
         """클라우드 에이전트를 돌린다 — 로컬 모델을 쓰지 않으므로 웹은 이 동안 잠금을 풀어 둔다."""
-        return self.cloud_agents.run(task.prompt, task.work, task.preferred, edit=task.source is not None,
+        return self.cloud_agents.run(task.prompt, task.work, task.preferred, edit=task.source is not None and not task.feedback,
                                      cancel_event=cancel_event, progress=progress)
 
     def cloud_finish(self, session_id: str, task: "CloudTask", run: CloudRun | None, error: str = "") -> str:
         """ALEX 가 복사본을 다시 확인하고, 바뀐 파일을 묶음 수정안으로 만들어 답을 남긴다. 복사본은 지운다."""
         try:
-            answer, verdict, files = self._cloud_answer(task, run, error)
+            answer, verdict, files = (self._feedback_answer(session_id, task, run, error) if task.feedback
+                                      else self._cloud_answer(task, run, error))
         finally:
             shutil.rmtree(task.temp, ignore_errors=True)
         record_cloud(self.storage.db_path.parent / "cloud_handoffs.jsonl", {
@@ -964,6 +984,26 @@ class JarvisCore:
             "request": task.request[:200]})
         self.storage.add_message(session_id, "assistant", answer)
         return answer
+
+    def _feedback_answer(self, session_id: str, task: "CloudTask", run: CloudRun | None, error: str) -> tuple[str, str, int]:
+        """ADR-129: 클라우드의 피드백을 대화에 남기고, ALEX 가 그것으로 다시 고치도록 예약한다(고치는 것은 ALEX)."""
+        resume = self.feedback_resume.pop(session_id, "")
+        if run is None or not run.useful or not run.report.strip():
+            tried = "\n".join(f"- {line}" for line in (run.tried if run else [])) or "-"
+            detail = error or (run.log_tail[-800:].strip() if run else "")
+            return (f"{FEEDBACK_HEADER} — 받지 못함\n\n보낸 것: {task.sent}\n\n청한 순서:\n{tried}\n"
+                    + (f"\n마지막 출력:\n```\n{detail}\n```" if detail else "")), "none", 0
+        report = run.report.strip()
+        minutes, seconds = divmod(int(run.seconds), 60)
+        lines = [f"{FEEDBACK_HEADER} — {CLOUD_LABEL[run.agent]} · {minutes}분 {seconds}초\n", f"- 보낸 것: {task.sent}"]
+        if run.tried:
+            lines.append("- 먼저 청한 쪽: " + " / ".join(run.tried) + f" → {CLOUD_LABEL[run.agent]} 가 답했습니다")
+        lines.append(f"\n### {CLOUD_LABEL[run.agent]} 의 피드백\n{report}")
+        if resume:
+            self.cloud_hints[session_id] = report[:CLOUD_FAILURE_CHARS * 2]
+            self.cloud_followup = (session_id, resume)
+            lines.append(f"\nALEX 가 이 피드백으로 다시 고칩니다({resume}).")
+        return "\n".join(lines), "feedback", 0
 
     def _cloud_answer(self, task: "CloudTask", run: CloudRun | None, error: str) -> tuple[str, str, int]:
         if run is None or not run.useful:
@@ -1169,11 +1209,13 @@ class JarvisCore:
         except (OSError, ValueError, KeyError) as exc:
             return f"RTL 프로젝트를 읽지 못했습니다({target}): {exc}\n폴더에 rtl.json·spec.md·시험기가 있어야 합니다."
         cancel = getattr(self, "command_cancel_event", None)
-        self._progress(f"[RTL 모드: {project.top} — Verilog 를 쓰고 린트·시뮬레이션 결과로 고칩니다]\n")
+        hint = self.take_cloud_hint(session_id) if resume else ""  # ADR-129: 피드백 뒤 다시 고치기는 --continue 로 온다
+        self._progress(f"[RTL 모드: {project.top} — Verilog 를 쓰고 린트·시뮬레이션 결과로 고칩니다"
+                       + (" · 클라우드 피드백 참고" if hint else "") + "]\n")
         try:
             with self._coder_model(cancel) as generate:
                 result = run_rtl(generate, project, self.rtl_tools_dir, progress=self._progress, cancel_event=cancel,
-                                 max_rounds=rounds, resume=resume)
+                                 max_rounds=rounds, resume=resume, hint=hint)
         except (OSError, ValueError, subprocess.SubprocessError, ProviderError) as exc:
             return f"RTL 작업을 진행하지 못했습니다: {exc}\n프로젝트: `{project.root}`"
         self.logger.info("rtl loop: verified=%s rounds=%s project=%s", result.verified, len(result.rounds), project.root)
@@ -1183,7 +1225,9 @@ class JarvisCore:
                 and not (cancel is not None and cancel.is_set())):
             answer += self.after_local_failure(session_id, f"Verilog 설계 {project.top}",
                                                f"{project.root.name} 의 규격(spec.md)대로 {project.file} 를 고쳐 시험을 모두 통과",
-                                               answer, folder=project.root)
+                                               answer, folder=project.root,
+                                               resume=f"/rtl {target.relative_to(base).as_posix()} --continue",
+                                               had_feedback=bool(hint))
         return answer
 
     def _last_route_was_build(self, session_id: str) -> bool:
@@ -3089,9 +3133,9 @@ class JarvisCore:
         # 예산이 빠듯한 프롬프트(파일 질문 등, brief)에서는 학습 안내처럼 뺀다.
         if not brief:
             facts.append("이것과 별개로, 사용자가 직접 '/cloud 요청' 이나 '클라우드로 넘겨줘'·'코덱스로 넘겨줘' 라고 하면 이 PC 에 "
-                         "로그인된 Claude Code·Codex 에 프로젝트 복사본을 맡겨 고치게 할 수 있다(사용자가 요청할 때, 그리고 "
-                         "/dev-auto·/rtl 이 로컬로 5회차까지 고쳐도 통과하지 못했을 때 — ALEX 가 먼저 최대한 스스로 고친다. 결과는 ALEX 가 "
-                         "확인하고, 사용자가 '적용' 을 눌러야 원본이 바뀐다).")
+                         "로그인된 Claude Code·Codex 에 프로젝트 복사본을 맡겨 고치게 할 수 있다(사용자가 요청할 때만. 결과는 ALEX 가 확인하고, "
+                         "사용자가 '적용' 을 눌러야 원본이 바뀐다). 또 /dev-auto·/rtl 이 로컬로 5회차까지 고쳐도 통과하지 못하면 ALEX 가 "
+                         "클라우드에 피드백을 청한다 — 클라우드는 읽기만 하고 원인·고칠 방향을 말하며, 고치는 것은 ALEX 가 그 피드백으로 다시 한다.")
         # 2026-09-25: 위 문장이 "외부 API 로 나가지 않는다" 였을 때 ALEX 는 쇼핑·검색 요청에
         # "인터넷에 접근할 수 없다" 고 답했다. 웹 읽기가 생긴 뒤에도 그렇게 답하면 안 된다.
         # 같은 날 데스크톱: "너 스스로 접속할 수는 없다" 를 모델은 "직접 인터넷 검색을 못 한다" 로 옮겨
