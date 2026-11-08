@@ -556,7 +556,7 @@ class MultiFileDeveloperTests(TwoFileProject, unittest.TestCase):
 
 
 class AutoLoopTests(TwoFileProject, unittest.TestCase):
-    """/dev-auto — 격리 복사본에서 테스트→수정→재시험을 최대 3회. 실제 파일은 최종 묶음을 사용자가 승인할 때만 바뀐다."""
+    """/dev-auto — 격리 복사본에서 테스트→수정→재시험을 최대 5회(ADR-129, 예전 3회). 실제 파일은 최종 묶음을 사용자가 승인할 때만 바뀐다."""
 
     WRONG = ("FILE: jarvis/a.py\n<<<<<<< SEARCH\na = 0\n=======\na = 1\n>>>>>>> REPLACE\n"
              "FILE: jarvis/b.py\n<<<<<<< SEARCH\nb = 0\n=======\nb = 3\n>>>>>>> REPLACE\n")
@@ -602,9 +602,25 @@ class AutoLoopTests(TwoFileProject, unittest.TestCase):
         self.mode.start('jarvis/a.py, jarvis/b.py', 'tests/test_ab.py', '둘 다 고쳐')
         reply = self.mode.auto('session')
         self.assertIn('통과시키지 못했습니다', reply)
-        self.assertEqual(len(self.instructions), 3)  # 최대 3번 고쳤다
+        self.assertEqual(len(self.instructions), 5)  # 기본 최대 5번 고쳤다(2026-11-08 사용자 규칙, ADR-129)
+        self.assertEqual(self.mode.last_result, 'not_passed')  # → app 이 클라우드로 잇는 신호
         self.assertEqual(DeveloperRun.load(self.store).phase, 'needs_test')
         self.assertEqual((self.read('a.py'), self.read('b.py')), ('a = 0\n', 'b = 0\n'))
+
+    def test_the_command_hands_a_failed_loop_to_the_cloud_but_not_a_passed_one(self):
+        # ADR-129: 로컬 5회를 다 쓰고 못 하면 app 이 core.after_local_failure 로 클라우드 넘기기를 예약한다
+        calls = []
+        self.core.after_local_failure = lambda sid, what, goal, report: calls.append((sid, what, goal)) or "\n[클라우드로 이음]"
+        self.script = [self.WRONG] + ["FILE: jarvis/a.py\n<<<<<<< SEARCH\na = 1\n=======\na = 5\n>>>>>>> REPLACE\n"] * 5
+        self.mode.start('jarvis/a.py, jarvis/b.py', 'tests/test_ab.py', '둘 다 고쳐')
+        reply, _keep, _sid = handle_command(self.core, 'session', '/dev-auto')
+        self.assertTrue(reply.endswith("[클라우드로 이음]"))
+        self.assertEqual(calls, [('session', '개발 작업(/dev-auto)', '둘 다 고쳐')])
+        self.script, self.instructions[:] = [self.WRONG, self.SECOND], []
+        self.mode.start('jarvis/a.py, jarvis/b.py', 'tests/test_ab.py', '둘 다 고쳐')
+        reply, _keep, _sid = handle_command(self.core, 'session', '/dev-auto')
+        self.assertIn('통과', reply)
+        self.assertEqual(len(calls), 1)                       # 통과하면 넘기지 않는다
 
     # 독립 풀이(ADR-077): 한 풀이가 3회차 안에 통과하지 못하면 복사본을 처음 상태로 되돌려 새로 푼다.
     A15 = "FILE: jarvis/a.py\n<<<<<<< SEARCH\na = 1\n=======\na = 5\n>>>>>>> REPLACE\n"
@@ -613,7 +629,7 @@ class AutoLoopTests(TwoFileProject, unittest.TestCase):
     def test_a_second_independent_attempt_starts_from_the_original(self):
         self.script = [self.WRONG, self.A15, self.A56, self.FIX]  # FIX 의 찾을 부분은 원본(a = 0, b = 0)에만 맞는다
         self.mode.start('jarvis/a.py, jarvis/b.py', 'tests/test_ab.py', '둘 다 고쳐')
-        reply = self.mode.auto('session', attempts=2)
+        reply = self.mode.auto('session', max_rounds=3, attempts=2)  # 독립 풀이를 보는 시험 — 회차는 3으로 고정
         self.assertIn('2번째 독립 풀이', reply)
         # 앞 풀이의 실패·피드백 없이 같은 출발점 — 실행 시간 줄('Ran 1 test in 0.002s')은 CPU 부하마다 달라 빼고 비교한다
         timing = re.compile(r"Ran \d+ tests? in [\d.]+s")
@@ -630,7 +646,7 @@ class AutoLoopTests(TwoFileProject, unittest.TestCase):
                   "FILE: jarvis/a.py\n<<<<<<< SEARCH\na = 0\n=======\na = 5\n>>>>>>> REPLACE\n")
         self.script = [helper, self.A56, "FILE: jarvis/a.py\n<<<<<<< SEARCH\na = 6\n=======\na = 7\n>>>>>>> REPLACE\n", self.FIX]
         self.mode.start('jarvis/a.py, jarvis/b.py', 'tests/test_ab.py', '둘 다 고쳐')
-        self.mode.auto('session', attempts=2)
+        self.mode.auto('session', max_rounds=3, attempts=2)
         final = self.editor.get_bundle(DeveloperRun.load(self.store).proposal_id)
         self.assertEqual(sorted(c.relative_path.replace(os.sep, '/') for c in final.changes), ['jarvis/a.py', 'jarvis/b.py'])
 
@@ -638,9 +654,9 @@ class AutoLoopTests(TwoFileProject, unittest.TestCase):
         self.script = [self.WRONG, self.A15, self.A56] * 2
         self.mode.start('jarvis/a.py, jarvis/b.py', 'tests/test_ab.py', '둘 다 고쳐')
         self.core.coding_auto_attempts = 2
-        reply = self.mode.auto('session')
+        reply = self.mode.auto('session', max_rounds=3)
         self.assertIn('독립 풀이 2번 모두', reply)
-        self.assertEqual(len(self.instructions), 6)  # 풀이마다 최대 3번
+        self.assertEqual(len(self.instructions), 6)  # 풀이마다 최대 3번(회차를 3으로 준 시험)
         self.assertEqual(DeveloperRun.load(self.store).phase, 'needs_test')
         self.assertEqual((self.read('a.py'), self.read('b.py')), ('a = 0\n', 'b = 0\n'))
 

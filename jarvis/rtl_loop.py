@@ -6,7 +6,7 @@ AutoChip(arXiv 2311.04887)의 피드백 순환을 참고한다: 생성 → 컴�
 
 프로젝트 폴더(rtl_root 아래)에 사람이 둔 것:
   rtl.json   {"top": "rv32i_cpu", "file": "rv32i_cpu.v", "spec": "spec.md",
-              "test": ["{python}", "verify/run_tests.py", "{file}", "--json", "{report}"], "max_rounds": 6}
+              "test": ["{python}", "verify/run_tests.py", "{file}", "--json", "{report}"], "max_rounds": 5}
   spec.md    설계 규격
   verify/    시험기(사람이 쓴 것) — 결과 JSON: {"시험이름": {"ok": bool, "problems": [...], "about": "...", "source": "..."}}
   (선택) "deps": ["fifo3-growth", …]  — 같은 rtl_root 의 **검증된** 다른 프로젝트 설계(2026-10-22, ADR-103). 읽기 전용으로
@@ -37,7 +37,7 @@ from .providers import GenerationCancelled, Message
 from .rtl_repair import apply_repair, code_tokens, repair_messages
 
 PROJECT_FILE = "rtl.json"
-MAX_ROUNDS = 6
+MAX_ROUNDS = 5  # 2026-11-08 사용자 규칙(ADR-129): 로컬로 5회까지, 그 뒤는 클라우드(core.after_local_failure). 6 → 5
 MAX_ALLOWED_ROUNDS = 20
 FORBIDDEN = re.compile(r"\$(system|fopen|fwrite|fdisplay|fstrobe|fmonitor|fclose|writemem[bh]|dumpfile|dumpvars|readmem[bh]|value\$plusargs)\b")
 BLOCK = re.compile(r"```(?:verilog|systemverilog|v|sv)?[ \t]*\n(.*?)```", re.S | re.I)

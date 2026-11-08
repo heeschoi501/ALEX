@@ -40,7 +40,7 @@ from .storage import OWNER, Storage, StorageError
 from .tools import SafeFileReadTool, SafeFileSearchTool, SafeProjectContextTool, SafeProjectTreeTool, ToolError
 from .webread import WebReader
 from .workspace import SafeWorkspaceEditor
-from .developer import DeveloperMode
+from .developer import AUTO_MAX_ROUNDS, DeveloperMode
 from .opencode_worker import OpenCodeWorker
 from .cloudagent import CloudAgents
 from .imagegen import ComfyImageGenerator
@@ -149,7 +149,8 @@ HELP_TEXT = """사용 가능한 명령
                            (채팅의 '~ 만들어줘' 는 코드를 답으로 주고 뒤에서 실행만 확인)
   /dev-start 파일[, 파일2…] :: 테스트[, 테스트2…] :: 목표   개발 작업 시작 (여러 파일이면 묶음 수정안, 테스트는 모두 통과해야 함)
   /dev-next                테스트 → 실패 분석 → 수정안 생성 (최대 3회)
-  /dev-auto                격리 복사본에서 테스트→수정→재시험 최대 3회, 통과하면 최종 묶음 수정안만 제시
+  /dev-auto                격리 복사본에서 테스트→수정→재시험 최대 5회, 통과하면 최종 묶음 수정안만 제시
+                           (5회로도 못 하면 클라우드(Claude Code·Codex)에 이어서 맡김 — coding_cloud_after_local 로 끔)
                            (coding_auto_attempts 가 2 이상이면 실패 때 처음 상태에서 새로 풀기를 그 횟수까지,
                             coding_regression_check 를 켜면 통과 뒤 전체 테스트로 다른 테스트를 깨뜨렸는지도 본다)
   /dev-propose             통과한 기준 테스트 뒤 목표에 따른 수정안 생성
@@ -725,6 +726,7 @@ def build_core(
         except (ToolError, StorageError) as exc:
             notes.append(f"Saved project root restore skipped: {exc}")
     core.cloud_agents = CloudAgents(settings.cloud_agent, settings.cloud_agent_timeout)
+    core.cloud_after_local = settings.coding_cloud_after_local  # ADR-129
     return core, notes
 
 
@@ -1069,6 +1071,8 @@ def handle_command(core: JarvisCore, session_id: str, text: str) -> tuple[str, b
                 output = mode.history()
             elif text == "/dev-auto":
                 output = mode.auto(session_id)
+                if getattr(mode, "last_result", "") == "not_passed":  # ADR-129: 로컬 회차를 다 쓴 뒤 클라우드로 잇기
+                    output += core.after_local_failure(session_id, "개발 작업(/dev-auto)", getattr(mode, "last_goal", ""), output)
             else:
                 output = mode.next(session_id)
             return output, True, session_id
@@ -1153,7 +1157,7 @@ def handle_command(core: JarvisCore, session_id: str, text: str) -> tuple[str, b
                     f"{key}={value}" for key, value in runtime.items() if key != "model"
                 ))
         if getattr(core, "coding_auto_attempts", 1) > 1:  # ADR-077
-            lines.append(f"dev_auto: 독립 풀이 최대 {core.coding_auto_attempts}번(풀이마다 최대 3회차)")
+            lines.append(f"dev_auto: 독립 풀이 최대 {core.coding_auto_attempts}번(풀이마다 최대 {AUTO_MAX_ROUNDS}회차)")
         if getattr(core, "coding_regression_check", False):  # ADR-078
             lines.append("dev_auto: 회귀 검사 켬(합격 테스트 통과 뒤 전체 테스트)")
         if getattr(core, "coding_diagnostic_context", False):  # ADR-080
@@ -1805,6 +1809,9 @@ def main() -> None:
         if text.startswith("/"):
             output, keep_going, session_id = handle_command(core, session_id, text)
             print(output)
+            followup = core.take_cloud_followup(session_id)
+            if followup:  # ADR-129: 로컬이 회차를 다 쓴 일을 클라우드에 이어서 — 터미널은 끝날 때까지 기다린다
+                print(core.handle_cloud(session_id, followup))
             if not keep_going:
                 break
             continue

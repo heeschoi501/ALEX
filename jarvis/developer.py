@@ -49,7 +49,9 @@ _TEST_NAME = re.compile(r"test_[A-Za-z0-9_]+\.py\Z")
 # unittest -v 의 통과 줄. 모델에게는 빼고 준다 — 지시 예산을 먹어 정작 트레이스백이 잘렸다(2026-09-26 claude, ADR-067).
 _PASSING_LINE = re.compile(r"^(?:.* \.\.\. (?:ok|skipped\b.*|expected failure)|test\w* \([\w.]+\))$")
 # /dev-auto (2026-09-26 claude): 격리된 복사본에서 테스트 → 수정 → 재시험을 이 횟수까지 자동으로 한다.
-AUTO_MAX_ROUNDS = 3
+# 2026-11-08 사용자 규칙(ADR-129): "기본적으로 5회까진 스스로 하고 이후에 클라우드llm요청하는방식" — 3 → 5.
+# 이 회차를 다 쓰고도 통과하지 못하면 core.after_local_failure 가 클라우드 넘기기(ADR-102)로 잇는다.
+AUTO_MAX_ROUNDS = 5
 # 독립 풀이(ADR-077, 2026-10-03 claude): 한 풀이(최대 AUTO_MAX_ROUNDS 회차)가 통과하지 못하면 처음 상태에서 새로 푼다. 설정 coding_auto_attempts.
 MAX_AUTO_ATTEMPTS = 5
 # 전체 테스트(회귀 검사·/dev-verify) 시간 상한. 테스트 하나는 120초로 묶지만, ALEX 전체 검사는 2026-10-03 에 131초가 걸렸다.
@@ -1046,6 +1048,7 @@ class DeveloperMode:
         if attempts is None:
             attempts = int(getattr(self.core, "coding_auto_attempts", 1) or 1)
         self._verification: dict = {}
+        self.last_result = ""
         try:
             return self._auto(session_id, max_rounds, rounds, notes, attempts)
         except Exception as exc:
@@ -1056,6 +1059,7 @@ class DeveloperMode:
                 run = DeveloperRun.load(self.core.storage)
                 result = ("stopped" if error else "copy_passed" if run and run.phase == "awaiting_approval"
                           else "already_passing" if run and run.phase == "passed" else "not_passed")
+                self.last_result, self.last_goal = result, run.goal if run else ""
                 record_outcome(self.core.storage, {
                     "type": "auto", "run_id": run.run_id if run else "", "goal": run.goal[:300] if run else "",
                     "files": run.files() if run else [], "tests": run.tests() if run else [], "model": self._model_label(),

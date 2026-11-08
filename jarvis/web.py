@@ -1336,6 +1336,10 @@ class WebAppState:
                     self.set_current(viewer, new_session)
                 if not keep_running:  # Web server 자체를 /exit 로 종료하지 않는다.
                     output = "Web UI에서는 /exit로 서버를 종료하지 않습니다. 터미널에서 Ctrl+C를 사용하세요."
+                followup = self.core.take_cloud_followup(sid)
+                if followup and viewer.is_admin and not self.shutting_down:
+                    # ADR-129: 로컬이 5회차로 못 한 일을 같은 대화의 클라우드 뒤 작업으로 잇는다 — 이 답이 끝난 뒤 차례가 온다
+                    self.start_job(viewer, sid, followup, None)
                 result = {"response": output, "route": "command", "session_id": new_session}
             else:
                 response, decision = self.core.handle(sid, text)

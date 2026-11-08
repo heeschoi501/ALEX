@@ -186,7 +186,9 @@ class CoreTests(unittest.TestCase):
     def test_alex_knows_it_can_hand_off_when_asked(self):
         line = self.core._environment_line(next(k for k in self.core.providers if k.value == "local_general"))
         self.assertIn("클라우드로 넘겨줘", line)
-        self.assertIn("ALEX 가 스스로 넘기지 않는다", line)
+        # ADR-129: 요청할 때와, 로컬 5회차로 못 했을 때만 — ALEX 가 먼저 스스로 고친다고 알고 있어야 한다
+        self.assertIn("로컬로 5회차까지 고쳐도 통과하지 못했을 때", line)
+        self.assertIn("ALEX 가 먼저 최대한 스스로 고친다", line)
 
 
 class WebTests(unittest.TestCase):

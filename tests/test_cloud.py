@@ -271,3 +271,105 @@ class WebTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LocalFirstTests(unittest.TestCase):
+    """ADR-129(2026-11-08 사용자: "기본적으로 5회까진 스스로 하고 이후에 클라우드llm요청하는방식", "ALEX가 스스로 수정은
+    최대한해야하니까") — /dev-auto·/rtl 이 로컬 회차를 다 쓰고도 못 하면 같은 일을 클라우드 넘기기로 잇는다."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.base = Path(self.temp.name)
+        self.project = self.base / "project"
+        (self.project / "sub").mkdir(parents=True)
+        (self.project / "calc.py").write_text("def add(a, b):\n    return a - b\n", encoding="utf-8")
+        self.core = make_core(self.base, self.project)
+        self.core.cloud_agents = agents(self.base, "fix")
+        self.sid = self.core.get_or_create_session(False)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    REPORT = "1회차 테스트: 실패\n…\n5회차 테스트: 실패(종료 코드 1)\nAssertionError: 3 != 5"
+
+    def test_a_failed_local_loop_books_one_cloud_handoff_for_the_same_room(self):
+        note = self.core.after_local_failure(self.sid, "개발 작업(/dev-auto)", "더하기 고쳐", self.REPORT)
+        self.assertIn("클라우드(Claude Code)에 이어서 맡깁니다", note)
+        self.assertIn("승인해야 바뀝니다", note)
+        self.assertIsNone(self.core.take_cloud_followup("other-room"))   # 다른 방으로는 보내지 않고 버린다
+        self.core.after_local_failure(self.sid, "개발 작업(/dev-auto)", "더하기 고쳐", self.REPORT)
+        message = self.core.take_cloud_followup(self.sid)
+        self.assertIsNone(self.core.take_cloud_followup(self.sid))       # 한 번만
+        self.assertIsNotNone(parse_request(message))
+        self.assertIn("목표: 더하기 고쳐", message)
+        self.assertIn("AssertionError: 3 != 5", message)
+        reply = self.core.handle_cloud(self.sid, message)
+        self.assertTrue(reply.startswith(CLOUD_HEADER))
+        self.assertIn("편집 제안 ID", reply)                               # 적용은 여전히 승인
+        self.assertIn("return a - b", (self.project / "calc.py").read_text(encoding="utf-8"))
+        asked = self.core.storage.message_page(self.sid)["messages"][0]["content"]  # 무엇을 보냈는지 대화에 남는다
+        self.assertIn("[ALEX 의 마지막 보고]", asked)
+
+    def test_nothing_is_booked_when_off_read_only_or_no_agent(self):
+        self.core.cloud_after_local = False
+        self.assertEqual(self.core.after_local_failure(self.sid, "x", "y", self.REPORT), "")
+        self.core.cloud_after_local = True
+        self.core.permission_mode = "read"
+        self.assertEqual(self.core.after_local_failure(self.sid, "x", "y", self.REPORT), "")
+        self.core.permission_mode = "ask"
+        self.core.cloud_agents = CloudAgents("claude", commands={})
+        self.assertIn("Claude Code·Codex 가 없습니다", self.core.after_local_failure(self.sid, "x", "y", self.REPORT))
+        self.assertIsNone(self.core.take_cloud_followup(self.sid))
+
+    def test_a_folder_is_sent_only_from_inside_the_project(self):
+        self.core.after_local_failure(self.sid, "Verilog", "y", self.REPORT, folder=self.project / "sub")
+        self.assertTrue(self.core.take_cloud_followup(self.sid).startswith("/cloud @sub ALEX"))
+        (self.project / "my rtl").mkdir()
+        self.assertIn("빈칸", self.core.after_local_failure(self.sid, "Verilog", "y", self.REPORT, folder=self.project / "my rtl"))
+        self.assertIsNone(self.core.take_cloud_followup(self.sid))
+        outside = self.base / "fabless"
+        outside.mkdir()
+        note = self.core.after_local_failure(self.sid, "Verilog", "y", self.REPORT, folder=outside)
+        self.assertIn("프로젝트 폴더가 이 폴더를 품어야 합니다", note)
+        self.assertIsNone(self.core.take_cloud_followup(self.sid))
+
+    def test_a_failed_rtl_loop_hands_over_but_a_cancelled_one_does_not(self):
+        from unittest.mock import patch
+        from jarvis import rtl_loop
+        from scripts.rtl_design_tasks import prepare
+        folder = prepare(self.project / "rtl")[0]
+        self.core.rtl_root, self.core.rtl_tools_dir = self.project / "rtl", self.base / "tools"
+        for stopped, booked in (("5회 안에 모든 시험을 통과하지 못함", True), ("사용자 취소", False)):
+            with self.subTest(stopped=stopped), \
+                    patch.object(rtl_loop, "run_rtl", lambda *a, **k: rtl_loop.RtlResult(folder, False, [object()], stopped)), \
+                    patch.object(rtl_loop, "answer_text", lambda result, project: f"RTL 보고: {result.stopped}"):
+                reply = self.core.handle_rtl(self.sid, folder.name)
+                message = self.core.take_cloud_followup(self.sid)
+                self.assertEqual(message is not None, booked)
+                if booked:
+                    self.assertTrue(message.startswith(f"/cloud @rtl/{folder.name} "))
+                    self.assertIn("이어서 맡깁니다", reply)
+
+    def test_the_web_runs_the_handoff_as_a_background_job_after_the_answer(self):
+        from unittest.mock import patch
+        state = WebAppState(self.core, self.sid, token="t")
+        viewer = state.owner_viewer()
+
+        def failing_dev_auto(core, sid, text):
+            return "5회차 테스트: 실패" + core.after_local_failure(sid, "개발 작업(/dev-auto)", "더하기", self.REPORT), True, sid
+        try:
+            with patch("jarvis.web.handle_command", failing_dev_auto):
+                result = state.process("/dev-auto", viewer=viewer, session_id=self.sid)
+            self.assertIn("이어서 맡깁니다", result["response"])
+            job = next(j for j in state.jobs.values() if j["request"].startswith("/cloud ALEX"))
+            deadline = time.monotonic() + 30
+            while state.jobs[job["id"]]["status"] in ("queued", "running") and time.monotonic() < deadline:
+                time.sleep(0.05)
+            for thread in threading.enumerate():  # 뒤 작업 스레드의 마무리(기록 저장)까지 기다린다 — 다음 시험에 새지 않게
+                if thread.name == f"alex-job-{job['id'][:6]}":
+                    thread.join(10)
+            self.assertEqual(state.jobs[job["id"]]["status"], "done")
+            last = self.core.storage.message_page(self.sid)["messages"][-1]["content"]
+            self.assertTrue(last.startswith(CLOUD_HEADER))
+        finally:
+            state.shutting_down = True
